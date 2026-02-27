@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+app.db
 
 # Virtual env
 .venv/
