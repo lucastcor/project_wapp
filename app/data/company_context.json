@@ -1,0 +1,204 @@
+{
+  "company_name": "Atende+ Soluções",
+  "brand_tone": {
+    "style": "profissional, cordial e objetiva",
+    "language": "pt-BR",
+    "formality_level": "media",
+    "response_length": "curta a moderada",
+    "emoji_policy": "usar com moderação apenas se fizer sentido para a marca"
+  },
+  "enabled_modules": {
+    "catalog": true,
+    "services": true,
+    "products": true,
+    "scheduling": true,
+    "staff_selection": true,
+    "rentals": true,
+    "inventory": true,
+    "delivery": false,
+    "pickup": false,
+    "subscriptions": true,
+    "custom_orders": true,
+    "quotes": true,
+    "support": true,
+    "financial_handoff": true
+  },
+  "business_identity": {
+    "business_type": "hybrid",
+    "business_model": [
+      "services",
+      "products",
+      "rentals",
+      "scheduling",
+      "subscription",
+      "custom_orders"
+    ],
+    "segment": "Atendimento e suporte digital",
+    "company_description": "Empresa fictícia usada para testes de atendimento conversacional com suporte a serviços, produtos, aluguel, agendamento, atendimento recorrente e operações híbridas.",
+    "service_area": "Atendimento online para todo o Brasil",
+    "has_physical_store": true,
+    "store_type": "showroom e atendimento por agendamento",
+    "attends_online": true,
+    "attends_in_person": true,
+    "onsite_service_available": false,
+    "works_with_scheduling": true,
+    "works_with_rentals": true,
+    "works_with_custom_orders": true,
+    "works_with_subscription": true,
+    "works_with_sales": true,
+    "works_with_after_sales": true
+  },
+  "contact_channels": {
+    "primary_channel": "whatsapp",
+    "secondary_channels": [
+      "instagram",
+      "email"
+    ],
+    "phone": "+55 62 99999-9999",
+    "email": "contato@atendemais.com.br",
+    "instagram": "@atendemais",
+    "website": "https://www.atendemais.com.br"
+  },
+  "business_hours": {
+    "timezone": "America/Sao_Paulo",
+    "weekdays": "08:00-18:00",
+    "saturday": "09:00-12:00",
+    "sunday": "fechado",
+    "holiday_policy": "Atendimento sujeito a confirmação em feriados.",
+    "after_hours_intake_allowed": true,
+    "scheduling_window": "Agendamentos com antecedência mínima de 2 horas, conforme disponibilidade."
+  },
+  "response_policy": {
+    "response_time": "Até 2 horas em horário comercial",
+    "after_hours_behavior": "Registrar a mensagem e informar que o retorno ocorrerá no próximo período de atendimento.",
+    "auto_reply_allowed_for": [
+      "lead_novo",
+      "cliente_existente",
+      "suporte"
+    ],
+    "handoff_required_for": [
+      "financeiro",
+      "fornecedor"
+    ],
+    "human_review_required_for": [
+      "custom_orders",
+      "complex_quotes",
+      "rental_availability_conflicts"
+    ]
+  },
+  "commercial_policy": {
+    "currency": "BRL",
+    "budget_policy": "Os valores finais dependem do escopo, necessidade do cliente e disponibilidade operacional.",
+    "payment_methods": [
+      "pix",
+      "cartao_credito",
+      "boleto"
+    ],
+    "installments_available": true,
+    "minimum_order_value": null,
+    "proposal_required_for_custom_cases": true,
+    "discount_policy": "Descontos podem existir em condições promocionais ou contratos recorrentes, mediante análise.",
+    "cancellation_policy": "Cancelamentos e remarcações dependem do tipo de serviço, locação ou contrato e devem ser confirmados com a equipe.",
+    "refund_policy": "Reembolso sujeito à política comercial vigente e à análise do caso.",
+    "quote_validity": "Orçamentos podem ter validade definida conforme a natureza do serviço ou produto."
+  },
+  "catalog": {
+    "categories": [
+      {
+        "name": "consultoria",
+        "type": "service"
+      },
+      {
+        "name": "planos",
+        "type": "subscription_service"
+      },
+      {
+        "name": "produtos_digitais",
+        "type": "product"
+      },
+      {
+        "name": "locacoes",
+        "type": "rental"
+      }
+    ],
+    "items": [
+      {
+        "sku": "CONS-001",
+        "name": "Consultoria inicial",
+        "category": "consultoria",
+        "type": "service",
+        "transaction_modes": [
+          "service",
+          "scheduling"
+        ],
+        "description": "Diagnóstico inicial para entender a necessidade do cliente e orientar a solução adequada.",
+        "price_mode": "range",
+        "price_range": "R$ 150 a R$ 300",
+        "starting_price": 150,
+        "schedule_required": true,
+        "professional_selection_allowed": true,
+        "duration": "60 minutos",
+        "availability": "sob agendamento",
+        "delivery_mode": "online",
+        "customizable": true,
+        "subscription_details": null,
+        "rental_details": null,
+        "stock_info": null,
+        "variants": []
+      }
+    ]
+  },
+  "customer_intake": {
+    "quote": {
+      "required_fields": [
+        "nome",
+        "necessidade",
+        "prazo desejado",
+        "formato de atendimento"
+      ]
+    },
+    "scheduling": {
+      "required_fields": [
+        "nome",
+        "data desejada",
+        "horario desejado",
+        "servico"
+      ]
+    },
+    "order": {
+      "required_fields": [
+        "nome",
+        "item_interessado",
+        "forma de pagamento"
+      ]
+    },
+    "rental": {
+      "required_fields": [
+        "nome",
+        "item desejado",
+        "data de uso",
+        "periodo desejado"
+      ]
+    },
+    "support": {
+      "required_fields": [
+        "nome",
+        "descricao do problema"
+      ]
+    }
+  },
+  "business_rules": [
+    "Não inventar preços fora das faixas informadas.",
+    "Quando faltar contexto, pedir mais detalhes antes de confirmar valores."
+  ],
+  "llm_guidelines": {
+    "must_not_do": [
+      "inventar estoque",
+      "inventar disponibilidade"
+    ],
+    "should_do": [
+      "responder com objetividade",
+      "usar o contexto da empresa"
+    ]
+  }
+}

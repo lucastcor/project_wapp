@@ -23,3 +23,8 @@ Thumbs.db
 # Local DB / logs
 *.db
 *.log
+
+.env
+.env.*
+__pycache__/
+*.pyc
