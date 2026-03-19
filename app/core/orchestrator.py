@@ -14,8 +14,16 @@ def _process_contact_message(
     contact_id: str,
     contact_name: str | None,
     message: str,
+    company_id: int | None = None,
+    company_slug: str | None = None,
 ) -> dict[str, str | float | bool | int | None]:
-    repository.save_contact(contact_id, contact_name)
+    resolved_company_id = repository.resolve_company_id(
+        company_id=company_id,
+        company_slug=company_slug,
+    )
+    if resolved_company_id is None:
+        resolved_company_id = repository.ensure_default_company()
+    repository.save_contact(contact_id, contact_name, company_id=resolved_company_id)
     contact = repository.get_contact(contact_id)
     previous_summary = contact["conversation_summary"] if contact else None
     previous_classification = contact["last_classification"] if contact else None
@@ -63,6 +71,7 @@ def _process_contact_message(
 
     repository.save_message(
         contact_id=contact_id,
+        company_id=resolved_company_id,
         message=message,
         classification=classification,
         reply=reply,
@@ -78,6 +87,7 @@ def _process_contact_message(
     if handoff_decision["should_handoff"] and not latest_customer_clarification:
         pending_question_id = repository.create_pending_question(
             contact_id=contact_id,
+            company_id=resolved_company_id,
             customer_message=message,
             question_type=handoff_decision["question_type"],
             question_for_owner=handoff_decision["question_for_owner"],
@@ -107,6 +117,8 @@ def _process_contact_message(
 
     return {
         "contact_id": contact_id,
+        "company_id": resolved_company_id,
+        "company_slug": company_slug,
         "classification": classification,
         "classification_reason": reason,
         "classification_confidence": confidence,
@@ -129,11 +141,15 @@ def process_incoming_message(
     contact_id: str,
     contact_name: str | None,
     message: str,
+    company_id: int | None = None,
+    company_slug: str | None = None,
 ) -> dict[str, str | float | bool | int | None]:
     return _process_contact_message(
         contact_id=contact_id,
         contact_name=contact_name,
         message=message,
+        company_id=company_id,
+        company_slug=company_slug,
     )
 
 
@@ -141,9 +157,13 @@ def process_whatsapp_webhook(
     from_number: str,
     from_name: str | None,
     text: str,
+    company_id: int | None = None,
+    company_slug: str | None = None,
 ) -> dict[str, str | float | bool | int | None]:
     return _process_contact_message(
         contact_id=from_number,
         contact_name=from_name,
         message=text,
+        company_id=company_id,
+        company_slug=company_slug,
     )

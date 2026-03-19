@@ -1,6 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from app.api.schemas import (
     CompanyContextPayload,
+    CompanyCreatePayload,
+    CompanyResponse,
     MessageExampleCreatePayload,
     PendingQuestionAnswerPayload,
 )
@@ -65,15 +67,52 @@ def read_contact(contact_id: str) -> dict:
     return contact
 
 
+@admin_router.post("/companies", response_model=CompanyResponse)
+def create_company(payload: CompanyCreatePayload) -> CompanyResponse:
+    existing_company = repository.get_company_by_slug(payload.slug)
+    if existing_company:
+        raise HTTPException(status_code=400, detail="Company slug already exists.")
+
+    company_id = repository.create_company(
+        slug=payload.slug,
+        name=payload.name,
+        business_type=payload.business_type,
+        active=payload.active,
+    )
+    company = repository.get_company(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found after creation.")
+    return CompanyResponse(**company)
+
+
+@admin_router.get("/companies", response_model=list[CompanyResponse])
+def read_companies() -> list[CompanyResponse]:
+    return [CompanyResponse(**company) for company in repository.get_companies()]
+
+
+@admin_router.get("/companies/{company_id}", response_model=CompanyResponse)
+def read_company(company_id: int) -> CompanyResponse:
+    company = repository.get_company(company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found.")
+    return CompanyResponse(**company)
+
+
 @admin_router.get("/company-context")
-def read_company_context() -> dict:
-    return get_company_context()
+def read_company_context(company_slug: str | None = Query(default=None)) -> dict:
+    try:
+        return get_company_context(company_slug=company_slug)
+    except CompanyContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @admin_router.put("/company-context")
-def update_company_context(payload: CompanyContextPayload) -> dict:
+def update_company_context(
+    payload: CompanyContextPayload,
+    company_slug: str | None = Query(default=None),
+) -> dict:
     try:
-        return save_company_context(payload.data)
+        return save_company_context(payload.data, company_slug=company_slug)
     except CompanyContextError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -98,10 +137,16 @@ def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayl
         raise HTTPException(status_code=404, detail="Pending question not found.")
 
     try:
+        company_slug = None
+        if pending_question.get("company_id") is not None:
+            company = repository.get_company(int(pending_question["company_id"]))
+            if company:
+                company_slug = company.get("slug")
+
         normalized_resolution = normalize_owner_resolution(
             {
                 **payload.model_dump(),
-                "company_context": get_company_context(),
+                "company_context": get_company_context(company_slug=company_slug),
             }
         )
     except ValueError as exc:
@@ -125,6 +170,7 @@ def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayl
         if outbound_text:
             outbound_message_id = repository.create_outbound_message(
                 contact_id=pending_question["contact_id"],
+                company_id=pending_question.get("company_id"),
                 pending_question_id=question_id,
                 message=outbound_text,
                 source="owner_resolution",
@@ -155,8 +201,14 @@ def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayl
 
 
 @admin_router.get("/knowledge-entries")
-def read_knowledge_entries() -> list[dict]:
-    return repository.get_knowledge_entries()
+def read_knowledge_entries(company_id: int | None = Query(default=None)) -> list[dict]:
+    if company_id is None:
+        return repository.get_knowledge_entries()
+    return [
+        entry
+        for entry in repository.get_knowledge_entries()
+        if entry.get("company_id") == company_id
+    ]
 
 
 @admin_router.get("/knowledge-entries/{knowledge_entry_id}")
@@ -168,8 +220,12 @@ def read_knowledge_entry(knowledge_entry_id: int) -> dict:
 
 
 @admin_router.post("/message-examples")
-def create_message_example(payload: MessageExampleCreatePayload) -> dict:
+def create_message_example(
+    payload: MessageExampleCreatePayload,
+    company_id: int | None = Query(default=None),
+) -> dict:
     message_example_id = repository.create_message_example(
+        company_id=company_id,
         profile_name=payload.profile_name,
         scenario_type=payload.scenario_type,
         customer_message=payload.customer_message,
@@ -187,8 +243,14 @@ def create_message_example(payload: MessageExampleCreatePayload) -> dict:
 
 
 @admin_router.get("/message-examples")
-def read_message_examples() -> list[dict]:
-    return repository.get_message_examples()
+def read_message_examples(company_id: int | None = Query(default=None)) -> list[dict]:
+    if company_id is None:
+        return repository.get_message_examples()
+    return [
+        example
+        for example in repository.get_message_examples()
+        if example.get("company_id") == company_id
+    ]
 
 
 @admin_router.get("/message-examples/{message_example_id}")
@@ -200,39 +262,39 @@ def read_message_example(message_example_id: int) -> dict:
 
 
 @admin_router.get("/training-dataset/json")
-def read_training_dataset_json() -> dict:
-    return {"dataset": export_training_records_as_json()}
+def read_training_dataset_json(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_training_records_as_json(company_id=company_id)}
 
 
 @admin_router.get("/training-dataset/jsonl")
-def read_training_dataset_jsonl() -> dict:
-    return {"dataset": export_training_records_as_jsonl()}
+def read_training_dataset_jsonl(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_training_records_as_jsonl(company_id=company_id)}
 
 
 
 @admin_router.get("/training-dataset/split")
-def read_training_dataset_split() -> dict:
-    return {"dataset": export_training_split_as_json()}
+def read_training_dataset_split(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_training_split_as_json(company_id=company_id)}
 
 
 @admin_router.get("/training-dataset/review")
-def read_training_dataset_review() -> dict:
-    return {"dataset": export_training_review_report_as_json()}
+def read_training_dataset_review(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_training_review_report_as_json(company_id=company_id)}
 
 
 @admin_router.get("/finetuning-dataset/train-jsonl")
-def read_finetuning_train_jsonl() -> dict:
-    return {"dataset": export_finetuning_train_jsonl()}
+def read_finetuning_train_jsonl(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_finetuning_train_jsonl(company_id=company_id)}
 
 
 @admin_router.get("/finetuning-dataset/validation-jsonl")
-def read_finetuning_validation_jsonl() -> dict:
-    return {"dataset": export_finetuning_validation_jsonl()}
+def read_finetuning_validation_jsonl(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_finetuning_validation_jsonl(company_id=company_id)}
 
 
 @admin_router.get("/finetuning-dataset/bundle")
-def read_finetuning_dataset_bundle() -> dict:
-    return {"dataset": export_finetuning_bundle_as_json()}
+def read_finetuning_dataset_bundle(company_id: int | None = Query(default=None)) -> dict:
+    return {"dataset": export_finetuning_bundle_as_json(company_id=company_id)}
 
 
 @admin_router.get("/outbound-messages")

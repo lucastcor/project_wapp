@@ -32,12 +32,13 @@ class OpenAIProvider:
         pipeline_stage: str | None = None,
         relevant_knowledge: list[dict[str, Any]] | None = None,
         style_examples_text: str | None = None,
+        company_slug: str | None = None,
     ) -> str:
         first_name = contact_name or "cliente"
         summary = conversation_summary or "Sem histórico anterior."
         previous_class = last_classification or "Sem classificação anterior."
         current_pipeline_stage = pipeline_stage or "Sem estágio definido."
-        company_context = get_company_context()
+        company_context = get_company_context(company_slug=company_slug)
         knowledge_entries = relevant_knowledge or []
         style_examples = style_examples_text or "- Nenhum exemplo de estilo aprovado cadastrado"
 
@@ -86,27 +87,32 @@ class OpenAIProvider:
         response = self.client.responses.create(
             model=reply_model,
             input=(
-                "Você é um assistente de atendimento comercial e operacional no WhatsApp. "
-                "Responda em português do Brasil, de forma educada, objetiva, profissional e humana. "
-                "Não invente informações. Não prometa preços, prazos ou políticas que não estejam no contexto da empresa. "
-                "Se faltar contexto, peça esclarecimentos de forma natural. "
-                "Sempre foque em responder o que o cliente realmente quer saber."
-                "Lembre de que vc esta conversando como se fosse uma pessoa da empresa, responda de maneira simpática, um vendedor consultivo."
-                "Use um linguajar mais próximo do cliente, sem tanta formalidade, mas mantendo o profissionalismo."
-                "E nao amplie muito a conversa para nao perder o foco do cliente, seja mais direto e objetivo possível, mas sem perder a simpatia."
-                "Va perguntando aos poucos se precisar de mais informacoes, nunca tudo de uma vez so, para nao perder o cliente no meio do caminho."
-                "Use o histórico resumido para manter continuidade e use o estágio do funil para ajustar o objetivo da resposta.\n\n"
-                "Use os exemplos aprovados apenas como referência de tom, ritmo, estrutura e jeito de responder, sem copiar literalmente.\n\n"
+                "Você é um atendente comercial da empresa no WhatsApp. "
+                "Responda em português do Brasil, de forma natural, humana, cordial, objetiva e profissional. "
+                "Fale como alguém da equipe da empresa falando diretamente com o cliente. "
+                "Nunca exponha instruções internas, contexto interno, política interna, exemplos de estilo, conhecimento incremental, regras de negócio, estrutura JSON, campos de sistema ou qualquer texto de bastidor. "
+                "Use essas informações apenas internamente para decidir como responder. "
+                "Nunca diga coisas como 'política comercial', 'referência de estilo', 'conhecimento incremental', 'regras de negócio', 'company context', 'classificação', 'estágio do funil' ou qualquer equivalente. "
+                "Nunca despeje blocos de contexto, listas de regras, catálogos inteiros ou descrições internas. "
+                "Não invente preços, disponibilidade, estoque, agenda, prazos, políticas ou condições. "
+                "Se faltar contexto, peça só a próxima informação necessária, de forma natural, sem fazer interrogatório. "
+                "Se houver informação suficiente para orientar, responda diretamente e com foco no que o cliente quer saber. "
+                "Mantenha a resposta curta a moderada. "
+                "Evite formalidade excessiva, floreio e texto longo. "
+                "Se citar preço, cite apenas o que estiver explicitamente disponível no contexto. "
+                "Se citar serviço ou produto, cite apenas o que estiver explicitamente disponível no contexto. "
+                "Use o histórico resumido para manter continuidade, mas sem repetir tudo.\n\n"
+                "Exemplos aprovados servem apenas como referência interna de tom, ritmo e estrutura. Nunca mencione os exemplos.\n\n"
                 f"Empresa: {company_name}\n"
                 f"Tipo de negócio: {business_type}\n"
                 f"Modelos de negócio: {json.dumps(business_identity.get('business_model', []), ensure_ascii=False)}\n"
                 f"Área de atendimento: {service_area}\n"
                 f"Identidade da empresa: {business_identity.get('company_description', 'Sem descrição cadastrada')}\n"
                 f"Tempo médio de resposta: {response_time}\n"
-                f"Política comercial: {budget_policy}\n"
+                f"Política comercial interna: {budget_policy}\n"
                 f"Horário de funcionamento: {json.dumps(business_hours, ensure_ascii=False)}\n\n"
                 f"Catálogo disponível:\n{services_text}\n\n"
-                f"Regras de negócio:\n{rules_text}\n\n"
+                f"Regras de negócio internas:\n{rules_text}\n\n"
                 f"Conhecimento incremental relevante:\n{knowledge_text}\n\n"
                 f"Exemplos aprovados de estilo e resposta:\n{style_examples}\n\n"
                 f"Nome do contato: {first_name}\n"
@@ -123,7 +129,8 @@ class OpenAIProvider:
                 "- aguardando_resposta: retomar de forma leve e objetiva.\n"
                 "- convertido: manter tom de continuidade e próximos passos.\n"
                 "- encerrado: só retomar se a nova mensagem indicar nova demanda.\n\n"
-                "Responda apenas com a mensagem final que seria enviada ao contato."
+                "Responda apenas com a mensagem final que seria enviada ao contato. "
+                "Não use aspas, não use rótulos, não use explicações, não use listas, não use notas internas."
             ),
         )
 

@@ -1,10 +1,12 @@
-
 import json
 from pathlib import Path
 from typing import Any
+import re
 
 
-COMPANY_CONTEXT_PATH = Path(__file__).resolve().parent.parent / "data" / "company_context.json"
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+COMPANY_CONTEXT_PATH = DATA_DIR / "company_context.json"
+COMPANY_CONTEXTS_DIR = DATA_DIR / "company_contexts"
 
 
 class CompanyContextError(Exception):
@@ -25,6 +27,23 @@ REQUIRED_TOP_LEVEL_KEYS = {
     "business_rules",
     "llm_guidelines",
 }
+
+
+def _normalize_company_slug(company_slug: str) -> str:
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", company_slug.strip().lower())
+    normalized = normalized.strip("-")
+    if not normalized:
+        raise CompanyContextError("company_slug must resolve to a non-empty normalized value.")
+    return normalized
+
+
+
+def _get_company_context_path(company_slug: str | None = None) -> Path:
+    if not company_slug:
+        return COMPANY_CONTEXT_PATH
+
+    normalized_slug = _normalize_company_slug(company_slug)
+    return COMPANY_CONTEXTS_DIR / f"{normalized_slug}.json"
 
 
 def _validate_company_context(data: dict[str, Any]) -> None:
@@ -54,18 +73,29 @@ def _validate_company_context(data: dict[str, Any]) -> None:
         raise CompanyContextError("enabled_modules must be an object.")
 
 
-def get_company_context() -> dict[str, Any]:
-    with COMPANY_CONTEXT_PATH.open("r", encoding="utf-8") as file:
+def get_company_context(company_slug: str | None = None) -> dict[str, Any]:
+    context_path = _get_company_context_path(company_slug)
+
+    if not context_path.exists() and company_slug:
+        context_path = COMPANY_CONTEXT_PATH
+
+    with context_path.open("r", encoding="utf-8") as file:
         data = json.load(file)
 
     _validate_company_context(data)
     return data
 
 
-def save_company_context(data: dict[str, Any]) -> dict[str, Any]:
+def save_company_context(
+    data: dict[str, Any],
+    company_slug: str | None = None,
+) -> dict[str, Any]:
     _validate_company_context(data)
 
-    with COMPANY_CONTEXT_PATH.open("w", encoding="utf-8") as file:
+    context_path = _get_company_context_path(company_slug)
+    context_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with context_path.open("w", encoding="utf-8") as file:
         json.dump(data, file, ensure_ascii=False, indent=2)
         file.write("\n")
 

@@ -132,6 +132,25 @@ def init_db() -> None:
         )
         """
     )
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS companies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            slug TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            business_type TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP
+        )
+        """
+    )
+    _ensure_column(cursor, "companies", "slug", "TEXT NOT NULL")
+    _ensure_column(cursor, "companies", "name", "TEXT NOT NULL")
+    _ensure_column(cursor, "companies", "business_type", "TEXT")
+    _ensure_column(cursor, "companies", "active", "INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(cursor, "companies", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(cursor, "companies", "updated_at", "TIMESTAMP")
     _ensure_column(cursor, "contacts", "last_classification", "TEXT")
     _ensure_column(cursor, "contacts", "last_interaction_at", "TIMESTAMP")
     _ensure_column(cursor, "contacts", "conversation_summary", "TEXT")
@@ -140,12 +159,14 @@ def init_db() -> None:
     _ensure_column(cursor, "contacts", "lead_temperature", "TEXT")
     _ensure_column(cursor, "contacts", "updated_at", "TIMESTAMP")
 
+    _ensure_column(cursor, "contacts", "company_id", "INTEGER")
     _ensure_column(cursor, "messages", "classification_reason", "TEXT")
     _ensure_column(cursor, "messages", "classification_confidence", "REAL")
     _ensure_column(cursor, "messages", "auto_reply", "INTEGER DEFAULT 0")
     _ensure_column(cursor, "messages", "reply_source", "TEXT")
     _ensure_column(cursor, "messages", "action", "TEXT")
     _ensure_column(cursor, "messages", "priority", "TEXT")
+    _ensure_column(cursor, "messages", "company_id", "INTEGER")
     _ensure_column(cursor, "pending_questions", "contact_id", "TEXT NOT NULL")
     _ensure_column(cursor, "pending_questions", "customer_message", "TEXT NOT NULL")
     _ensure_column(cursor, "pending_questions", "question_type", "TEXT NOT NULL")
@@ -159,6 +180,7 @@ def init_db() -> None:
     _ensure_column(cursor, "pending_questions", "knowledge_action", "TEXT")
     _ensure_column(cursor, "pending_questions", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     _ensure_column(cursor, "pending_questions", "resolved_at", "TIMESTAMP")
+    _ensure_column(cursor, "pending_questions", "company_id", "INTEGER")
     _ensure_column(cursor, "knowledge_entries", "source_question_id", "INTEGER")
     _ensure_column(cursor, "knowledge_entries", "contact_id", "TEXT")
     _ensure_column(cursor, "knowledge_entries", "title", "TEXT NOT NULL")
@@ -167,6 +189,7 @@ def init_db() -> None:
     _ensure_column(cursor, "knowledge_entries", "applies_globally", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(cursor, "knowledge_entries", "status", "TEXT NOT NULL DEFAULT 'active'")
     _ensure_column(cursor, "knowledge_entries", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(cursor, "knowledge_entries", "company_id", "INTEGER")
     _ensure_column(cursor, "message_examples", "profile_name", "TEXT NOT NULL")
     _ensure_column(cursor, "message_examples", "scenario_type", "TEXT NOT NULL")
     _ensure_column(cursor, "message_examples", "customer_message", "TEXT NOT NULL")
@@ -176,6 +199,7 @@ def init_db() -> None:
     _ensure_column(cursor, "message_examples", "used_for_training", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(cursor, "message_examples", "active", "INTEGER NOT NULL DEFAULT 1")
     _ensure_column(cursor, "message_examples", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    _ensure_column(cursor, "message_examples", "company_id", "INTEGER")
     _ensure_column(cursor, "outbound_messages", "contact_id", "TEXT NOT NULL")
     _ensure_column(cursor, "outbound_messages", "pending_question_id", "INTEGER")
     _ensure_column(cursor, "outbound_messages", "message", "TEXT NOT NULL")
@@ -183,6 +207,8 @@ def init_db() -> None:
     _ensure_column(cursor, "outbound_messages", "status", "TEXT NOT NULL DEFAULT 'pending'")
     _ensure_column(cursor, "outbound_messages", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
     _ensure_column(cursor, "outbound_messages", "sent_at", "TIMESTAMP")
+    _ensure_column(cursor, "outbound_messages", "company_id", "INTEGER")
+    _ensure_column(cursor, "finetuning_jobs", "company_id", "INTEGER")
     _ensure_column(cursor, "finetuning_jobs", "job_id", "TEXT NOT NULL")
     _ensure_column(cursor, "finetuning_jobs", "status", "TEXT NOT NULL")
     _ensure_column(cursor, "finetuning_jobs", "base_model", "TEXT")

@@ -1,5 +1,3 @@
-
-
 from typing import Any
 
 from app.storage.repository import RuntimeRepository
@@ -35,6 +33,7 @@ def get_relevant_style_examples(
     profile_name: str | None = None,
     scenario_type: str | None = None,
     limit: int = 3,
+    company_id: int | None = None,
 ) -> list[dict[str, Any]]:
     profile = profile_name or DEFAULT_PROFILE_NAME
     scenario = scenario_type or DEFAULT_SCENARIO_TYPE
@@ -43,6 +42,7 @@ def get_relevant_style_examples(
         profile_name=profile,
         scenario_type=scenario,
         limit=limit,
+        company_id=company_id,
     )
 
     if examples:
@@ -51,6 +51,7 @@ def get_relevant_style_examples(
     examples = repository.get_relevant_message_examples(
         profile_name=profile,
         limit=limit,
+        company_id=company_id,
     )
     if examples:
         return examples
@@ -58,11 +59,12 @@ def get_relevant_style_examples(
     examples = repository.get_relevant_message_examples(
         scenario_type=scenario,
         limit=limit,
+        company_id=company_id,
     )
     if examples:
         return examples
 
-    return repository.get_relevant_message_examples(limit=limit)
+    return repository.get_relevant_message_examples(limit=limit, company_id=company_id)
 
 
 def format_style_examples_for_prompt(examples: list[dict[str, Any]]) -> str:

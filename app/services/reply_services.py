@@ -22,9 +22,10 @@ def _fallback_business_reply(
     pipeline_stage: str | None = None,
     relevant_knowledge: list[dict[str, Any]] | None = None,
     style_examples_text: str | None = None,
+    company_slug: str | None = None,
 ) -> dict[str, Any]:
     first_name = contact_name or "você"
-    company_context = get_company_context()
+    company_context = get_company_context(company_slug=company_slug)
 
     business_identity = company_context.get("business_identity", {})
     business_hours = company_context.get("business_hours", {})
@@ -36,10 +37,6 @@ def _fallback_business_reply(
     weekday_hours = business_hours.get("weekdays", "horário comercial")
     budget_policy = commercial_policy.get("budget_policy", "valores sob consulta")
 
-    knowledge_entries = relevant_knowledge or []
-    knowledge_hint = knowledge_entries[0]["content"] if knowledge_entries else None
-    style_hint = style_examples_text or None
-
     if classification == "lead_novo":
         first_item = items[0] if items else {}
         first_service = first_item.get("name", "nossos serviços")
@@ -48,12 +45,10 @@ def _fallback_business_reply(
         return {
             "reply": (
                 f"Olá, {first_name}. Obrigado pelo contato. "
-                f"Atendemos {service_area} e nosso horário comercial é {weekday_hours}. "
-                f"Um dos itens disponíveis é {first_service}, com faixa de valor {first_price}. "
-                f"Os valores finais seguem a política comercial: {budget_policy} "
-                f"{f' Informação adicional: {knowledge_hint}' if knowledge_hint else ''} "
-                f"{f' Referência de estilo: {style_hint}' if style_hint else ''} "
-                "Se quiser, posso te orientar sobre a melhor opção para a sua necessidade."
+                f"Atendemos {service_area}. "
+                f"Um dos serviços disponíveis é {first_service}, com faixa de valor {first_price}. "
+                f"Os valores finais seguem nossa política comercial: {budget_policy} "
+                "Para eu te orientar melhor, me diga qual serviço você está buscando e qual é a sua necessidade."
             ),
             "source": "template",
         }
@@ -61,8 +56,8 @@ def _fallback_business_reply(
     if classification == "cliente_existente":
         return {
             "reply": (
-                f"Olá, {first_name}. Recebi sua mensagem. "
-                "Vou analisar sua solicitação e seguir com o atendimento."
+                f"Olá, {first_name}. Recebi sua mensagem e vou te ajudar com isso. "
+                "Se quiser, me envie mais detalhes para eu direcionar da forma mais adequada."
             ),
             "source": "template",
         }
@@ -90,8 +85,13 @@ def generate_business_reply(
     last_classification: str | None = None,
     pipeline_stage: str | None = None,
     contact_id: str | None = None,
+    company_id: int | None = None,
+    company_slug: str | None = None,
 ) -> dict[str, Any]:
-    relevant_knowledge = repository.get_relevant_knowledge_entries(contact_id=contact_id)
+    relevant_knowledge = repository.get_relevant_knowledge_entries(
+        contact_id=contact_id,
+        company_id=company_id,
+    )
     scenario_type = infer_style_scenario_type(
         classification=classification,
         pipeline_stage=pipeline_stage,
@@ -99,6 +99,7 @@ def generate_business_reply(
     style_examples = get_relevant_style_examples(
         scenario_type=scenario_type,
         limit=3,
+        company_id=company_id,
     )
     style_examples_text = format_style_examples_for_prompt(style_examples)
     if settings.classification_provider != "openai":
@@ -111,6 +112,7 @@ def generate_business_reply(
             pipeline_stage=pipeline_stage,
             relevant_knowledge=relevant_knowledge,
             style_examples_text=style_examples_text,
+            company_slug=company_slug,
         )
 
     try:
@@ -129,6 +131,7 @@ def generate_business_reply(
             pipeline_stage=pipeline_stage,
             relevant_knowledge=relevant_knowledge,
             style_examples_text=style_examples_text,
+            company_slug=company_slug,
         )
         return {
             "reply": reply,
@@ -145,4 +148,5 @@ def generate_business_reply(
             pipeline_stage=pipeline_stage,
             relevant_knowledge=relevant_knowledge,
             style_examples_text=style_examples_text,
+            company_slug=company_slug,
         )

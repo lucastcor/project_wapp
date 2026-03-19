@@ -1,4 +1,3 @@
-
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -76,6 +75,23 @@ class PendingQuestionAnswerPayload(BaseModel):
     customer_followup_question: str | None = None
     applies_globally: bool = False
     knowledge_action: str | None = None
+
+
+class CompanyCreatePayload(BaseModel):
+    slug: str = Field(..., min_length=1)
+    name: str = Field(..., min_length=1)
+    business_type: str | None = None
+    active: bool = True
+
+
+class CompanyResponse(BaseModel):
+    id: int
+    slug: str
+    name: str
+    business_type: str | None
+    active: int
+    created_at: str
+    updated_at: str | None
 
 
 # Schemas for approved message examples (used in style retrieval and fine-tuning preparation)

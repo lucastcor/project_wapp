@@ -1,5 +1,3 @@
-
-
 from typing import Any
 
 
@@ -74,12 +72,15 @@ def build_knowledge_entry_from_resolution(
         f"Orientação do responsável: {owner_answer}"
     )
 
+    company_id = pending_question.get("company_id")
+
     return {
         "title": title,
         "content": content,
         "knowledge_type": knowledge_type,
         "source_question_id": pending_question.get("id"),
         "contact_id": pending_question.get("contact_id"),
+        "company_id": company_id,
         "applies_globally": bool(resolution.get("applies_globally", False)),
         "status": "active",
     }

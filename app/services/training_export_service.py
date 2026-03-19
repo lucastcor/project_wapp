@@ -118,8 +118,8 @@ def is_example_eligible_for_training(example: dict[str, Any]) -> bool:
     return True
 
 
-def get_curated_training_examples() -> list[dict[str, Any]]:
-    examples = repository.get_exportable_message_examples()
+def get_curated_training_examples(company_id: int | None = None) -> list[dict[str, Any]]:
+    examples = repository.get_exportable_message_examples(company_id=company_id)
     eligible_examples = [example for example in examples if is_example_eligible_for_training(example)]
     deduplicated_examples = deduplicate_examples(eligible_examples)
     curated_examples = limit_examples_per_scenario(deduplicated_examples)
@@ -127,8 +127,8 @@ def get_curated_training_examples() -> list[dict[str, Any]]:
 
 
 
-def summarize_curated_training_examples() -> dict[str, Any]:
-    curated_examples = get_curated_training_examples()
+def summarize_curated_training_examples(company_id: int | None = None) -> dict[str, Any]:
+    curated_examples = get_curated_training_examples(company_id=company_id)
 
     scenario_counter = Counter(
         str(example.get("scenario_type") or "general").strip().lower()
@@ -158,10 +158,12 @@ def summarize_curated_training_examples() -> dict[str, Any]:
 def summarize_finetuning_split(
     validation_ratio: float = VALIDATION_RATIO,
     seed: int = 42,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
     split_records = get_finetuning_split_records(
         validation_ratio=validation_ratio,
         seed=seed,
+        company_id=company_id,
     )
 
     train_count = len(split_records["train"])
@@ -177,8 +179,8 @@ def summarize_finetuning_split(
     }
 
 
-def get_finetuning_readiness_report() -> dict[str, Any]:
-    curated_examples = get_curated_training_examples()
+def get_finetuning_readiness_report(company_id: int | None = None) -> dict[str, Any]:
+    curated_examples = get_curated_training_examples(company_id=company_id)
     curated_count = len(curated_examples)
     missing_examples_count = max(0, MINIMUM_REQUIRED_FINETUNING_EXAMPLES - curated_count)
 
@@ -276,8 +278,8 @@ def build_finetuning_record(example: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def get_exportable_training_records() -> list[dict[str, Any]]:
-    curated_examples = get_curated_training_examples()
+def get_exportable_training_records(company_id: int | None = None) -> list[dict[str, Any]]:
+    curated_examples = get_curated_training_examples(company_id=company_id)
     return [build_training_record(example) for example in curated_examples]
 
 
@@ -302,18 +304,21 @@ def split_training_records(
     }
 
 
-def export_training_records_as_json() -> str:
-    records = get_exportable_training_records()
+def export_training_records_as_json(company_id: int | None = None) -> str:
+    records = get_exportable_training_records(company_id=company_id)
     return json.dumps(records, ensure_ascii=False, indent=2)
 
 
-def export_training_records_as_jsonl() -> str:
-    records = get_exportable_training_records()
+def export_training_records_as_jsonl(company_id: int | None = None) -> str:
+    records = get_exportable_training_records(company_id=company_id)
     return "\n".join(json.dumps(record, ensure_ascii=False) for record in records)
 
 
-def export_training_split_as_json(validation_ratio: float = VALIDATION_RATIO) -> str:
-    records = get_exportable_training_records()
+def export_training_split_as_json(
+    validation_ratio: float = VALIDATION_RATIO,
+    company_id: int | None = None,
+) -> str:
+    records = get_exportable_training_records(company_id=company_id)
     split_records = split_training_records(records, validation_ratio=validation_ratio)
     return json.dumps(split_records, ensure_ascii=False, indent=2)
 
@@ -321,8 +326,9 @@ def export_training_split_as_json(validation_ratio: float = VALIDATION_RATIO) ->
 def get_finetuning_split_records(
     validation_ratio: float = VALIDATION_RATIO,
     seed: int = 42,
+    company_id: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
-    curated_examples = get_curated_training_examples()
+    curated_examples = get_curated_training_examples(company_id=company_id)
     split_curated_examples = split_examples(
         curated_examples,
         validation_ratio=validation_ratio,
@@ -339,10 +345,12 @@ def get_finetuning_split_records(
 def export_finetuning_train_jsonl(
     validation_ratio: float = VALIDATION_RATIO,
     seed: int = 42,
+    company_id: int | None = None,
 ) -> str:
     split_records = get_finetuning_split_records(
         validation_ratio=validation_ratio,
         seed=seed,
+        company_id=company_id,
     )
     return "\n".join(json.dumps(record, ensure_ascii=False) for record in split_records["train"])
 
@@ -351,10 +359,12 @@ def export_finetuning_train_jsonl(
 def export_finetuning_validation_jsonl(
     validation_ratio: float = VALIDATION_RATIO,
     seed: int = 42,
+    company_id: int | None = None,
 ) -> str:
     split_records = get_finetuning_split_records(
         validation_ratio=validation_ratio,
         seed=seed,
+        company_id=company_id,
     )
     return "\n".join(json.dumps(record, ensure_ascii=False) for record in split_records["validation"])
 
@@ -363,10 +373,12 @@ def export_finetuning_validation_jsonl(
 def export_finetuning_bundle_as_json(
     validation_ratio: float = VALIDATION_RATIO,
     seed: int = 42,
+    company_id: int | None = None,
 ) -> str:
     split_records = get_finetuning_split_records(
         validation_ratio=validation_ratio,
         seed=seed,
+        company_id=company_id,
     )
     return json.dumps(split_records, ensure_ascii=False, indent=2)
 
@@ -374,13 +386,15 @@ def export_finetuning_bundle_as_json(
 def export_training_review_report_as_json(
     validation_ratio: float = VALIDATION_RATIO,
     seed: int = 42,
+    company_id: int | None = None,
 ) -> str:
     report = {
-        "curation_summary": summarize_curated_training_examples(),
+        "curation_summary": summarize_curated_training_examples(company_id=company_id),
         "split_summary": summarize_finetuning_split(
             validation_ratio=validation_ratio,
             seed=seed,
+            company_id=company_id,
         ),
-        "readiness_summary": get_finetuning_readiness_report(),
+        "readiness_summary": get_finetuning_readiness_report(company_id=company_id),
     }
     return json.dumps(report, ensure_ascii=False, indent=2)

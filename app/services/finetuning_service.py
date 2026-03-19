@@ -20,6 +20,7 @@ TRANSIENT_PROVIDER_ERROR_CODES = {"server_error", "internal_error"}
 MAX_FINETUNING_JOB_RETRIES = 2
 RETRY_DELAY_SECONDS = 3
 repository = RuntimeRepository()
+DEFAULT_COMPANY_ID = 1
 
 
 class FineTuningService:
@@ -91,6 +92,7 @@ class FineTuningService:
                 "Fine-tuning pipeline is disabled. Set ENABLE_FINETUNING_PIPELINE=true to enable it."
             )
 
+        company_id = DEFAULT_COMPANY_ID
         train_jsonl = export_finetuning_train_jsonl()
         validation_jsonl = export_finetuning_validation_jsonl()
 
@@ -119,6 +121,7 @@ class FineTuningService:
                 )
                 repository.create_finetuning_job_record(
                     job_id=job.id,
+                    company_id=company_id,
                     status=job.status,
                     base_model=self.base_model,
                     suffix=self.suffix,
@@ -171,6 +174,7 @@ class FineTuningService:
         except Exception as exc:
             raise FineTuningError(f"Failed to retrieve fine-tuning job: {exc}") from exc
 
+        company_id = DEFAULT_COMPANY_ID
         error_payload = getattr(job, "error", None)
         provider_error_code = None
         provider_error_message = None
@@ -185,6 +189,7 @@ class FineTuningService:
         if existing_record is None:
             repository.create_finetuning_job_record(
                 job_id=job.id,
+                company_id=company_id,
                 status=job.status,
                 base_model=getattr(job, "model", None),
                 training_file_id=getattr(job, "training_file", None),
@@ -240,6 +245,7 @@ class FineTuningService:
         except Exception as exc:
             raise FineTuningError(f"Failed to list fine-tuning jobs: {exc}") from exc
 
+        company_id = DEFAULT_COMPANY_ID
         results: list[dict[str, Any]] = []
         for job in jobs.data:
             error_payload = getattr(job, "error", None)
@@ -256,6 +262,7 @@ class FineTuningService:
             if existing_record is None:
                 repository.create_finetuning_job_record(
                     job_id=job.id,
+                    company_id=company_id,
                     status=job.status,
                     base_model=getattr(job, "model", None),
                     training_file_id=getattr(job, "training_file", None),
