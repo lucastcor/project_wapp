@@ -117,3 +117,32 @@ class MessageExampleResponse(BaseModel):
     used_for_training: int
     active: int
     created_at: str
+
+
+class CalendarIntegrationPayload(BaseModel):
+    provider: str = Field(..., min_length=1)
+    external_calendar_id: str | None = None
+    config: dict[str, Any] = Field(default_factory=dict)
+    active: bool = True
+
+
+class CalendarAvailabilityQueryPayload(BaseModel):
+    start_date: str = Field(..., min_length=10)
+    end_date: str = Field(..., min_length=10)
+    duration_minutes: int = Field(..., gt=0)
+    limit: int = Field(default=12, gt=0, le=100)
+
+
+class AppointmentBookingPayload(BaseModel):
+    contact_id: str | None = None
+    title: str = Field(..., min_length=1)
+    starts_at: str = Field(..., min_length=10)
+    ends_at: str = Field(..., min_length=10)
+    timezone: str | None = None
+    description: str | None = None
+
+
+class InternalReminderPayload(BaseModel):
+    owner_contact_id: str = Field(..., min_length=1)
+    message_text: str = Field(..., min_length=1)
+    timezone: str | None = None

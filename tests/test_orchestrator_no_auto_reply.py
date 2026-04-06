@@ -6,20 +6,54 @@ class FakeRepository:
         self.saved_contact = None
         self.saved_message = None
         self.updated_memory = None
+        self.default_company_id = 1
 
-    def save_contact(self, contact_id: str, contact_name: str | None) -> None:
+    def resolve_company_id(
+        self,
+        company_id: int | None = None,
+        company_slug: str | None = None,
+    ) -> int | None:
+        return company_id
+
+    def ensure_default_company(self) -> int:
+        return self.default_company_id
+
+    def get_company(self, company_id: int) -> dict:
+        return {
+            "id": company_id,
+            "slug": "default",
+            "name": "Default Company",
+        }
+
+    def save_contact(
+        self,
+        contact_id: str,
+        contact_name: str | None,
+        company_id: int | None = None,
+    ) -> None:
         self.saved_contact = {
             "contact_id": contact_id,
             "contact_name": contact_name,
+            "company_id": company_id,
         }
 
     def get_contact(self, contact_id: str) -> dict:
         return {
             "contact_id": contact_id,
             "contact_name": "Cliente Teste",
+            "company_id": self.default_company_id,
             "conversation_summary": "Contato fez pergunta anterior.",
             "last_classification": "financeiro",
         }
+
+    def get_latest_customer_clarification(self, contact_id: str) -> None:
+        return None
+
+    def create_pending_question(self, **kwargs) -> int:
+        raise AssertionError("Pending question should not be created in this flow.")
+
+    def mark_clarification_consumed(self, question_id: int) -> None:
+        raise AssertionError("Clarification should not be consumed in this flow.")
 
     def save_message(self, **kwargs) -> None:
         self.saved_message = kwargs
@@ -31,6 +65,11 @@ class FakeRepository:
 def test_process_contact_message_without_auto_reply(monkeypatch) -> None:
     fake_repository = FakeRepository()
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    monkeypatch.setattr(
+        orchestrator,
+        "handle_conversation_workflow",
+        lambda **kwargs: type("WorkflowStub", (), {"handled": False})(),
+    )
 
     monkeypatch.setattr(
         orchestrator,
@@ -80,3 +119,5 @@ def test_process_contact_message_without_auto_reply(monkeypatch) -> None:
     assert result["auto_reply"] is False
     assert result["action"] == "handoff_human"
     assert result["pipeline_stage"] == "encerrado"
+    assert result["company_id"] == 1
+    assert result["company_slug"] == "default"

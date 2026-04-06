@@ -7,6 +7,24 @@ from app.llm.providers.openai_provider import OpenAIProvider
 def fallback_classification(message: str) -> dict[str, Any]:
     normalized = message.lower()
 
+    scheduling_keywords = [
+        "agendar",
+        "agendamento",
+        "marcar horário",
+        "marcar horario",
+        "disponibilidade",
+        "consulta",
+        "reunião",
+        "reuniao",
+    ]
+    reminder_keywords = [
+        "me lembra",
+        "me lembre",
+        "lembrete",
+        "me avisa",
+        "me avise",
+    ]
+
     commercial_keywords = [
         "preço",
         "valor",
@@ -15,6 +33,20 @@ def fallback_classification(message: str) -> dict[str, Any]:
         "serviço",
         "produto",
     ]
+
+    if any(keyword in normalized for keyword in scheduling_keywords):
+        return {
+            "classification": "agendamento",
+            "confidence": 0.82,
+            "reason": "Heurística detectou intenção de agendamento.",
+        }
+
+    if any(keyword in normalized for keyword in reminder_keywords):
+        return {
+            "classification": "lembrete",
+            "confidence": 0.84,
+            "reason": "Heurística detectou intenção de lembrete.",
+        }
 
     if any(keyword in normalized for keyword in commercial_keywords):
         return {

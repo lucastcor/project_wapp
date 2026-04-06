@@ -37,6 +37,20 @@ def decide_message_action(classification: str, confidence: float) -> dict[str, A
             "priority": "high" if classification == "lead_novo" else "medium",
         }
 
+    if classification == "agendamento":
+        return {
+            "auto_reply": True,
+            "action": "workflow",
+            "priority": "high",
+        }
+
+    if classification == "lembrete":
+        return {
+            "auto_reply": False,
+            "action": "review",
+            "priority": "medium",
+        }
+
     return {
         "auto_reply": False,
         "action": "review",

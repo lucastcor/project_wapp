@@ -27,14 +27,16 @@ A arquitetura foi organizada para manter separação clara entre:
 - Histórico e observabilidade de jobs de fine-tuning
 - Outbound persistido com dispatch desacoplado do canal
 - Provider real de WhatsApp preparado
+- Agenda operacional com bookings persistidos e integrações preparadas
 - Testes automatizados para fluxos críticos
 
 ## Stack principal
-- Python 3.14
+- Python 3.13+
 - FastAPI
 - Pydantic
 - Uvicorn
-- SQLite
+- Postgres com psycopg
+- SQLite como fallback local/testes
 - Pytest
 - OpenAI Python SDK
 
@@ -105,8 +107,21 @@ O projeto já possui:
 - criação e acompanhamento de jobs de fine-tuning
 - persistência local do histórico de jobs
 
+### 6. Agenda, lembretes e disponibilidade
+O projeto agora possui:
+- integrações de calendário persistidas por empresa
+- agenda e lembretes ativados por contexto da empresa
+- fluxo conversacional natural para agendamento com o cliente
+- consulta de disponibilidade com provider `mock`
+- reservas persistidas em banco com resumo útil para a equipe
+- lembretes internos criados por dono ou funcionário em fluxo operacional separado
+- lembretes do cliente gerados automaticamente a partir do agendamento e das regras da empresa
+- preparação para Google Calendar e CalDAV/iCloud
+- worker recorrente para processar lembretes vencidos
+- painel admin para disponibilidade, integrações e bookings
+
 ## Banco de dados
-Atualmente o projeto usa SQLite e já possui tabelas para:
+O runtime agora suporta SQLite e Postgres, com foco operacional em Postgres. As tabelas atuais são:
 - `contacts`
 - `messages`
 - `pending_questions`
@@ -114,6 +129,18 @@ Atualmente o projeto usa SQLite e já possui tabelas para:
 - `message_examples`
 - `outbound_messages`
 - `finetuning_jobs`
+- `audit_events`
+- `schema_migrations`
+- `calendar_integrations`
+- `appointment_bookings`
+- `conversation_flows`
+- `customer_reminders`
+
+O projeto também já possui:
+- configuração explícita via `DATABASE_URL`;
+- `POSTGRES_DATABASE_URL` para probe/validação dedicada;
+- índices operacionais adicionais para crescimento multiempresa;
+- inspeção administrativa de migrações, readiness e onboarding.
 
 ## Configuração por ambiente
 O projeto depende de variáveis de ambiente. Não suba segredos reais para o repositório.
@@ -128,14 +155,51 @@ ENABLE_FINETUNING_PIPELINE=false
 OPENAI_FINETUNED_MODEL=
 USE_FINETUNED_MODEL_FOR_REPLIES=false
 
+DATABASE_URL=postgresql://project_wapp:project_wapp@127.0.0.1:5432/project_wapp
+POSTGRES_DATABASE_URL=postgresql://project_wapp:project_wapp@127.0.0.1:5432/project_wapp
+DATABASE_POOL_SIZE=10
+DATABASE_STATEMENT_TIMEOUT_MS=5000
+ENABLE_ADMIN_AUTH=false
+ADMIN_API_TOKEN=
+ADMIN_VIEWER_TOKEN=
+ADMIN_OPERATOR_TOKEN=
+ADMIN_SUPERADMIN_TOKEN=
+ADMIN_ACTOR=streamlit-admin
+ADMIN_APP_API_BASE_URL=http://127.0.0.1:8000
+AUDIT_RETENTION_DAYS=90
+REMINDER_WORKER_ENABLED=true
+REMINDER_WORKER_POLL_SECONDS=60
+REMINDER_WORKER_DISPATCH_IMMEDIATELY=true
+REMINDER_WORKER_CHANNEL=
+REMINDER_WORKER_AUDIENCES=customer,internal
+
 CLASSIFICATION_PROVIDER=mock
 
 OUTBOUND_PROVIDER=mock
 OUTBOUND_DEFAULT_CHANNEL=whatsapp
+CALENDAR_PROVIDER=mock
+CALENDAR_TIMEZONE=America/Sao_Paulo
+CALENDAR_DEFAULT_WORKDAY_START=09:00
+CALENDAR_DEFAULT_WORKDAY_END=18:00
+CALENDAR_SLOT_INCREMENT_MINUTES=30
+GOOGLE_CALENDAR_CLIENT_ID=
+GOOGLE_CALENDAR_CLIENT_SECRET=
+GOOGLE_CALENDAR_REFRESH_TOKEN=
+GOOGLE_CALENDAR_ID=
+CALDAV_URL=
+CALDAV_USERNAME=
+CALDAV_PASSWORD=
+CALDAV_CALENDAR_NAME=
 
 WHATSAPP_API_BASE_URL=
 WHATSAPP_API_TOKEN=
 WHATSAPP_PHONE_NUMBER_ID=
+POSTGRES_DB=project_wapp
+POSTGRES_USER=project_wapp
+POSTGRES_PASSWORD=project_wapp
+POSTGRES_PORT=5432
+APP_PORT=8000
+ADMIN_PORT=8501
 ```
 
 ## Como rodar localmente
@@ -158,11 +222,86 @@ Crie um arquivo `.env` com base no exemplo acima.
 uvicorn app.main:app --reload
 ```
 
+### 4.1. Subir stack com Postgres
+O caminho mais profissional para ambiente local e homologação é usar a imagem oficial do Postgres via Compose:
+```bash
+docker compose up -d postgres
+```
+
+Para subir API + Postgres:
+```bash
+docker compose up --build
+```
+
+Serviços esperados:
+
+- API em `http://127.0.0.1:8000`
+- Admin em `http://127.0.0.1:8501`
+- Worker recorrente de lembretes em container separado
+
 ### 5. Acessar documentação interativa
 Abra no navegador:
 ```text
 http://127.0.0.1:8000/docs
 ```
+
+### 5.1. Readiness probe
+Para orquestração e deploy:
+```text
+http://127.0.0.1:8000/health/ready
+```
+
+### 6. Rodar o painel administrativo
+```bash
+streamlit run app/admin_app.py
+```
+
+### 7. Migrar dados do SQLite atual para Postgres
+Se você já tiver dados em `project_wapp.db`, pode migrar assim:
+```bash
+python3 -m app.tools.migrate_sqlite_to_postgres \
+  --sqlite-path project_wapp.db \
+  --postgres-url postgresql://project_wapp:project_wapp@127.0.0.1:5432/project_wapp
+```
+
+### 8. Rodar preflight antes de publicar
+```bash
+python3 -m app.tools.preflight_check
+```
+
+Se o comando retornar `blocked`, ainda há item crítico a resolver antes do deploy.
+
+## Documentação complementar
+- `docs/architecture.md`
+- `docs/api_spec.md`
+- `docs/knowledge_base.md`
+- `.env.example`
+
+## Observabilidade
+- logs estruturados em JSON por padrão
+- correlação por `X-Request-ID` nas respostas HTTP
+- resumo operacional em `GET /admin/observability/summary`
+- métricas exportáveis em `GET /admin/observability/metrics`
+- configuração via `LOG_LEVEL` e `LOG_JSON`
+
+## Hardening Operacional
+- autenticação administrativa configurável por `ENABLE_ADMIN_AUTH` e `ADMIN_API_TOKEN`
+- trilha de auditoria persistida para ações administrativas críticas
+- suporte a identificação de operador via `X-Admin-Actor`
+
+## Maturidade Operacional
+- RBAC administrativo com papéis `viewer`, `operator` e `superadmin`
+- migrações formais versionadas em `schema_migrations`
+- limpeza de auditoria por retenção configurável via `AUDIT_RETENTION_DAYS`
+- inspeção de migrações em `GET /admin/system/migrations`
+
+## Escalabilidade e Onboarding
+- perfil de implantação em `GET /admin/system/profile`
+- readiness operacional em `GET /admin/system/readiness`
+- onboarding por empresa ou escopo global em `GET /admin/system/onboarding`
+- suporte real a Postgres via `DATABASE_URL`
+- stack local com `compose.yaml` e imagem oficial do Postgres
+- painel Streamlit com visão de readiness, auditoria, migrações, contatos, knowledge base e message examples
 
 ## Rotas administrativas importantes
 ### Dataset e fine-tuning
@@ -189,6 +328,25 @@ http://127.0.0.1:8000/docs
 ### Pending questions
 - leitura e resposta das dúvidas abertas para o responsável
 
+### Sistema e operação
+- `GET /admin/system/profile`
+- `GET /admin/system/readiness`
+- `GET /admin/system/onboarding`
+- `GET /admin/system/migrations`
+- `GET /admin/knowledge-entries`
+- `GET /admin/message-examples`
+- `GET /admin/contacts`
+- `GET /admin/calendar/providers`
+- `GET /admin/calendar/profile`
+- `GET /admin/calendar/integrations`
+- `POST /admin/calendar/integrations`
+- `POST /admin/calendar/availability/query`
+- `GET /admin/calendar/bookings`
+- `POST /admin/calendar/bookings`
+- `GET /admin/reminders`
+- `POST /admin/reminders`
+- `POST /admin/reminders/dispatch-due`
+
 ## Testes
 Para rodar a suíte completa:
 ```bash
@@ -209,14 +367,17 @@ O backend já está em um estágio avançado de base de produto. Os pontos mais 
 - separação entre automação e decisão humana
 - outbound multicanal com provider mock e provider real de WhatsApp preparado
 - pipeline de fine-tuning com persistência de histórico
-- observabilidade mínima para operação e evolução
+- observabilidade, auditoria e readiness para operação e evolução
+- onboarding/admin UX mínimo porém funcional para multiempresa
+- agenda operacional com conversa natural para o cliente e lembretes consistentes para operação
 
 ## Próximos passos naturais
 - integrar envio real em produção com provider de WhatsApp
 - adicionar provider futuro para Instagram
 - concluir um job de fine-tuning com sucesso e plugar o modelo no runtime
-- construir interface administrativa além do `/docs`
-- ampliar observabilidade operacional e métricas
+- conectar credenciais reais de Google Calendar ou CalDAV/iCloud
+- automatizar o disparo recorrente de lembretes vencidos
+- endurecer identidade centralizada e RBAC com usuário real
 
 ## Boas práticas
 - nunca versionar `.env` com segredos reais

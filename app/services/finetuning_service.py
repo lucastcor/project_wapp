@@ -1,10 +1,12 @@
 import io
+import logging
 import time
 from typing import Any
 
 from openai import APIError, OpenAI
 
 from app.core.config import settings
+from app.core.logging import get_logger, log_event
 from app.storage.repository import RuntimeRepository
 from app.services.training_export_service import (
     export_finetuning_train_jsonl,
@@ -21,6 +23,7 @@ MAX_FINETUNING_JOB_RETRIES = 2
 RETRY_DELAY_SECONDS = 3
 repository = RuntimeRepository()
 DEFAULT_COMPANY_ID = 1
+logger = get_logger(__name__)
 
 
 class FineTuningService:
@@ -93,6 +96,14 @@ class FineTuningService:
             )
 
         company_id = DEFAULT_COMPANY_ID
+        log_event(
+            logger,
+            logging.INFO,
+            "finetuning.job.creation.started",
+            company_id=company_id,
+            base_model=self.base_model,
+            suffix=self.suffix,
+        )
         train_jsonl = export_finetuning_train_jsonl()
         validation_jsonl = export_finetuning_validation_jsonl()
 
@@ -128,6 +139,15 @@ class FineTuningService:
                     training_file_id=training_file_id,
                     validation_file_id=validation_file_id,
                 )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "finetuning.job.creation.completed",
+                    company_id=company_id,
+                    job_id=job.id,
+                    status=job.status,
+                    attempts_used=attempt,
+                )
                 return {
                     "job_id": job.id,
                     "status": job.status,
@@ -141,6 +161,15 @@ class FineTuningService:
                 }
             except APIError as exc:
                 last_error_code, last_error_message = self._extract_provider_error_details(exc)
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "finetuning.job.creation.retryable_error",
+                    company_id=company_id,
+                    attempt=attempt,
+                    provider_error_code=last_error_code,
+                    provider_error_message=last_error_message,
+                )
                 if attempt < MAX_FINETUNING_JOB_RETRIES and self._is_transient_provider_error(exc):
                     time.sleep(RETRY_DELAY_SECONDS)
                     continue
@@ -216,7 +245,7 @@ class FineTuningService:
                 "param": getattr(error_payload, "param", None),
             }
 
-        return {
+        result = {
             "job_id": job.id,
             "status": job.status,
             "base_model": getattr(job, "model", None),
@@ -228,6 +257,15 @@ class FineTuningService:
             "trained_tokens": getattr(job, "trained_tokens", None),
             "error": serialized_error,
         }
+        log_event(
+            logger,
+            logging.INFO,
+            "finetuning.job.retrieved",
+            job_id=job.id,
+            status=job.status,
+            fine_tuned_model=getattr(job, "fine_tuned_model", None),
+        )
+        return result
 
     def list_finetuning_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
         if limit <= 0:
@@ -291,4 +329,11 @@ class FineTuningService:
                 }
             )
 
+        log_event(
+            logger,
+            logging.INFO,
+            "finetuning.jobs.listed",
+            limit=limit,
+            results_count=len(results),
+        )
         return results

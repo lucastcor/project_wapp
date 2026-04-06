@@ -86,6 +86,42 @@ def get_company_context(company_slug: str | None = None) -> dict[str, Any]:
     return data
 
 
+def get_company_context_status(company_slug: str | None = None) -> dict[str, Any]:
+    requested_path = _get_company_context_path(company_slug)
+    fallback_used = False
+    resolved_path = requested_path
+
+    if company_slug and not requested_path.exists():
+        resolved_path = COMPANY_CONTEXT_PATH
+        fallback_used = True
+
+    context_exists = resolved_path.exists()
+    status = {
+        "company_slug": company_slug,
+        "requested_path": str(requested_path),
+        "resolved_path": str(resolved_path),
+        "exists": context_exists,
+        "fallback_used": fallback_used,
+        "is_valid": False,
+        "top_level_keys": [],
+        "error": None,
+    }
+
+    if not context_exists:
+        status["error"] = "Company context file does not exist."
+        return status
+
+    try:
+        context = get_company_context(company_slug=company_slug)
+    except (CompanyContextError, json.JSONDecodeError, FileNotFoundError) as exc:
+        status["error"] = str(exc)
+        return status
+
+    status["is_valid"] = True
+    status["top_level_keys"] = sorted(context.keys())
+    return status
+
+
 def save_company_context(
     data: dict[str, Any],
     company_slug: str | None = None,

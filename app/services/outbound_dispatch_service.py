@@ -1,11 +1,14 @@
+import logging
 from typing import Any
 
 from app.core.config import settings
+from app.core.logging import get_logger, log_event, mask_identifier
 from app.services.whatsapp_provider import WhatsAppProvider, WhatsAppProviderError
 from app.storage.repository import RuntimeRepository
 
 
 repository = RuntimeRepository()
+logger = get_logger(__name__)
 
 VALID_OUTBOUND_CHANNELS = {"whatsapp", "instagram", "generic"}
 
@@ -81,12 +84,27 @@ def dispatch_outbound_message(
     channel: str | None = None,
 ) -> dict[str, Any]:
     normalized_channel = _normalize_channel(channel)
+    log_event(
+        logger,
+        logging.INFO,
+        "outbound.dispatch.started",
+        outbound_message_id=outbound_message_id,
+        channel=normalized_channel,
+    )
     outbound_message = repository.get_outbound_message(outbound_message_id)
 
     if not outbound_message:
         raise OutboundDispatchError("Outbound message not found.")
 
     if outbound_message.get("status") == "sent":
+        log_event(
+            logger,
+            logging.INFO,
+            "outbound.dispatch.skipped",
+            outbound_message_id=outbound_message_id,
+            channel=normalized_channel,
+            reason="already_sent",
+        )
         return _build_dispatch_result(
             outbound_message=outbound_message,
             channel=normalized_channel,
@@ -103,6 +121,15 @@ def dispatch_outbound_message(
     if not updated_outbound_message:
         raise OutboundDispatchError("Outbound message not found after dispatch update.")
 
+    log_event(
+        logger,
+        logging.INFO,
+        "outbound.dispatch.completed",
+        outbound_message_id=outbound_message_id,
+        channel=normalized_channel,
+        contact_id=mask_identifier(str(updated_outbound_message["contact_id"])),
+        source=updated_outbound_message.get("source"),
+    )
     return _build_dispatch_result(
         outbound_message=updated_outbound_message,
         channel=normalized_channel,
@@ -130,4 +157,12 @@ def dispatch_pending_outbound_messages(
             )
         )
 
+    log_event(
+        logger,
+        logging.INFO,
+        "outbound.dispatch_bulk.completed",
+        channel=normalized_channel,
+        pending_count=len(pending_messages),
+        dispatched_count=len(results),
+    )
     return results

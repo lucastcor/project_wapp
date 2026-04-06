@@ -27,6 +27,12 @@ def _fallback_pipeline_state(
     combined = f"{summary} {normalized}".strip()
 
     if latest_classification != "lead_novo":
+        if latest_classification == "agendamento":
+            return {
+                "pipeline_stage": "aguardando_confirmacao",
+                "next_action": "Conduzir confirmação do horário e próximos dados operacionais do agendamento.",
+                "lead_temperature": "hot",
+            }
         return {
             "pipeline_stage": "encerrado",
             "next_action": "Avaliar manualmente o atendimento fora do fluxo comercial.",

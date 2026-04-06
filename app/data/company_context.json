@@ -21,7 +21,8 @@
     "custom_orders": true,
     "quotes": true,
     "support": true,
-    "financial_handoff": true
+    "financial_handoff": true,
+    "reminders": true
   },
   "business_identity": {
     "business_type": "hybrid",
@@ -186,6 +187,29 @@
         "descricao do problema"
       ]
     }
+  },
+  "scheduling_policy": {
+    "enabled": true,
+    "natural_booking_enabled": true,
+    "minimum_notice_minutes": 120,
+    "default_slot_duration_minutes": 60,
+    "max_suggestions": 3,
+    "require_service_selection": true,
+    "confirmation_required": true,
+    "allow_customer_notes": true
+  },
+  "reminder_policy": {
+    "enabled": true,
+    "internal_manual_reminders_enabled": true,
+    "appointment_customer_reminders_enabled": true,
+    "customer_reminder_offsets_days": [
+      5,
+      2,
+      1
+    ],
+    "default_channel": "whatsapp",
+    "customer_default_channel": "whatsapp",
+    "internal_default_channel": "whatsapp"
   },
   "business_rules": [
     "Não inventar preços fora das faixas informadas.",

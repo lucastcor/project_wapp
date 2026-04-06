@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from app.storage.db import get_connection
@@ -20,6 +21,302 @@ class RuntimeRepository:
             "messages_processed": messages_count,
             "contacts_count": contacts_count,
         }
+
+    def get_observability_summary(self) -> dict[str, Any]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        def fetch_count(query: str) -> int:
+            cursor.execute(query)
+            row = cursor.fetchone()
+            return int(row["count"]) if row else 0
+
+        def fetch_grouped_counts(query: str) -> dict[str, int]:
+            cursor.execute(query)
+            rows = cursor.fetchall()
+            result: dict[str, int] = {}
+            for row in rows:
+                group_key = row["group_key"] if row["group_key"] is not None else "unknown"
+                result[str(group_key)] = int(row["count"])
+            return result
+
+        summary = {
+            "totals": {
+                "messages": fetch_count("SELECT COUNT(*) AS count FROM messages"),
+                "contacts": fetch_count("SELECT COUNT(*) AS count FROM contacts"),
+                "pending_questions": fetch_count("SELECT COUNT(*) AS count FROM pending_questions"),
+                "knowledge_entries": fetch_count("SELECT COUNT(*) AS count FROM knowledge_entries"),
+                "message_examples": fetch_count("SELECT COUNT(*) AS count FROM message_examples"),
+                "outbound_messages": fetch_count("SELECT COUNT(*) AS count FROM outbound_messages"),
+                "finetuning_jobs": fetch_count("SELECT COUNT(*) AS count FROM finetuning_jobs"),
+                "companies": fetch_count("SELECT COUNT(*) AS count FROM companies"),
+                "audit_events": fetch_count("SELECT COUNT(*) AS count FROM audit_events"),
+            },
+            "pending_questions_by_status": fetch_grouped_counts(
+                """
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM pending_questions
+                GROUP BY status
+                """
+            ),
+            "outbound_by_status": fetch_grouped_counts(
+                """
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM outbound_messages
+                GROUP BY status
+                """
+            ),
+            "knowledge_by_status": fetch_grouped_counts(
+                """
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM knowledge_entries
+                GROUP BY status
+                """
+            ),
+            "messages_by_classification": fetch_grouped_counts(
+                """
+                SELECT classification AS group_key, COUNT(*) AS count
+                FROM messages
+                GROUP BY classification
+                """
+            ),
+            "messages_by_action": fetch_grouped_counts(
+                """
+                SELECT action AS group_key, COUNT(*) AS count
+                FROM messages
+                GROUP BY action
+                """
+            ),
+            "messages_by_reply_source": fetch_grouped_counts(
+                """
+                SELECT reply_source AS group_key, COUNT(*) AS count
+                FROM messages
+                GROUP BY reply_source
+                """
+            ),
+            "companies_by_status": {
+                "active": fetch_count("SELECT COUNT(*) AS count FROM companies WHERE active = 1"),
+                "inactive": fetch_count("SELECT COUNT(*) AS count FROM companies WHERE active = 0"),
+            },
+            "audit_events_by_status": fetch_grouped_counts(
+                """
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM audit_events
+                GROUP BY status
+                """
+            ),
+        }
+
+        connection.close()
+        return summary
+
+    def get_operational_snapshot(self, company_id: int | None = None) -> dict[str, Any]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        def fetch_count(query: str, params: tuple[Any, ...] | None = None) -> int:
+            cursor.execute(query, params or ())
+            row = cursor.fetchone()
+            return int(row["count"]) if row else 0
+
+        def fetch_grouped_counts(query: str, params: tuple[Any, ...] | None = None) -> dict[str, int]:
+            cursor.execute(query, params or ())
+            rows = cursor.fetchall()
+            result: dict[str, int] = {}
+            for row in rows:
+                group_key = row["group_key"] if row["group_key"] is not None else "unknown"
+                result[str(group_key)] = int(row["count"])
+            return result
+
+        base_filter = "" if company_id is None else " WHERE company_id = ?"
+        company_params = () if company_id is None else (company_id,)
+
+        snapshot = {
+            "company_id": company_id,
+            "counts": {
+                "contacts": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM contacts{base_filter}",
+                    company_params,
+                ),
+                "messages": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM messages{base_filter}",
+                    company_params,
+                ),
+                "pending_questions": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM pending_questions{base_filter}",
+                    company_params,
+                ),
+                "knowledge_entries": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM knowledge_entries{base_filter}",
+                    company_params,
+                ),
+                "message_examples": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM message_examples{base_filter}",
+                    company_params,
+                ),
+                "outbound_messages": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM outbound_messages{base_filter}",
+                    company_params,
+                ),
+                "finetuning_jobs": fetch_count(
+                    f"SELECT COUNT(*) AS count FROM finetuning_jobs{base_filter}",
+                    company_params,
+                ),
+            },
+            "pending_questions_by_status": fetch_grouped_counts(
+                f"""
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM pending_questions{base_filter}
+                GROUP BY status
+                """,
+                company_params,
+            ),
+            "outbound_by_status": fetch_grouped_counts(
+                f"""
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM outbound_messages{base_filter}
+                GROUP BY status
+                """,
+                company_params,
+            ),
+            "knowledge_by_status": fetch_grouped_counts(
+                f"""
+                SELECT status AS group_key, COUNT(*) AS count
+                FROM knowledge_entries{base_filter}
+                GROUP BY status
+                """,
+                company_params,
+            ),
+        }
+
+        connection.close()
+        return snapshot
+
+    def create_audit_event(
+        self,
+        actor_id: str,
+        action: str,
+        resource_type: str,
+        resource_id: str | None = None,
+        company_id: int | None = None,
+        status: str = "success",
+        request_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO audit_events (
+                actor_id,
+                action,
+                resource_type,
+                resource_id,
+                company_id,
+                status,
+                request_id,
+                metadata_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                actor_id,
+                action,
+                resource_type,
+                resource_id,
+                company_id,
+                status,
+                request_id,
+                json.dumps(metadata or {}, ensure_ascii=False),
+            ),
+        )
+
+        audit_event_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+
+        return int(audit_event_id)
+
+    def get_audit_events(
+        self,
+        limit: int = 100,
+        action: str | None = None,
+        resource_type: str | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        query = """
+            SELECT
+                id,
+                actor_id,
+                action,
+                resource_type,
+                resource_id,
+                company_id,
+                status,
+                request_id,
+                metadata_json,
+                created_at
+            FROM audit_events
+            WHERE (? IS NULL OR action = ?)
+              AND (? IS NULL OR resource_type = ?)
+            ORDER BY id DESC
+            LIMIT ?
+        """
+        cursor.execute(
+            query,
+            (action, action, resource_type, resource_type, limit),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            metadata_json = item.get("metadata_json")
+            try:
+                item["metadata"] = json.loads(metadata_json) if metadata_json else {}
+            except json.JSONDecodeError:
+                item["metadata"] = {"raw": metadata_json}
+            item.pop("metadata_json", None)
+            result.append(item)
+
+        return result
+
+    def purge_audit_events_older_than(self, older_than_days: int) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        retention_modifier = f"-{older_than_days} days"
+        cursor.execute(
+            """
+            DELETE FROM audit_events
+            WHERE created_at < datetime('now', ?)
+            """,
+            (retention_modifier,),
+        )
+        deleted_rows = cursor.rowcount
+        connection.commit()
+        connection.close()
+
+        return int(deleted_rows)
+
+    def get_schema_migrations(self) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT version, name, applied_at
+            FROM schema_migrations
+            ORDER BY version ASC
+            """
+        )
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
 
     def save_contact(
         self,
@@ -1299,3 +1596,684 @@ class RuntimeRepository:
             business_type="general",
             active=True,
         )
+
+    def create_calendar_integration(
+        self,
+        provider: str,
+        company_id: int | None = None,
+        external_calendar_id: str | None = None,
+        config: dict[str, Any] | None = None,
+        active: bool = True,
+    ) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO calendar_integrations (
+                company_id,
+                provider,
+                external_calendar_id,
+                config_json,
+                active,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                company_id,
+                provider,
+                external_calendar_id,
+                json.dumps(config or {}, ensure_ascii=False),
+                int(active),
+            ),
+        )
+
+        integration_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+        return int(integration_id)
+
+    def get_calendar_integrations(
+        self,
+        company_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        if company_id is None:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    company_id,
+                    provider,
+                    external_calendar_id,
+                    config_json,
+                    active,
+                    created_at,
+                    updated_at
+                FROM calendar_integrations
+                ORDER BY id DESC
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    company_id,
+                    provider,
+                    external_calendar_id,
+                    config_json,
+                    active,
+                    created_at,
+                    updated_at
+                FROM calendar_integrations
+                WHERE company_id = ?
+                ORDER BY id DESC
+                """,
+                (company_id,),
+            )
+
+        rows = cursor.fetchall()
+        connection.close()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            config_json = item.get("config_json")
+            try:
+                item["config"] = json.loads(config_json) if config_json else {}
+            except json.JSONDecodeError:
+                item["config"] = {"raw": config_json}
+            item.pop("config_json", None)
+            result.append(item)
+        return result
+
+    def get_calendar_integration(self, integration_id: int) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                provider,
+                external_calendar_id,
+                config_json,
+                active,
+                created_at,
+                updated_at
+            FROM calendar_integrations
+            WHERE id = ?
+            """,
+            (integration_id,),
+        )
+
+        row = cursor.fetchone()
+        connection.close()
+        if not row:
+            return None
+
+        item = dict(row)
+        config_json = item.get("config_json")
+        try:
+            item["config"] = json.loads(config_json) if config_json else {}
+        except json.JSONDecodeError:
+            item["config"] = {"raw": config_json}
+        item.pop("config_json", None)
+        return item
+
+    def get_active_calendar_integration(self, company_id: int | None = None) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        if company_id is None:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    company_id,
+                    provider,
+                    external_calendar_id,
+                    config_json,
+                    active,
+                    created_at,
+                    updated_at
+                FROM calendar_integrations
+                WHERE active = 1
+                ORDER BY company_id DESC, id DESC
+                LIMIT 1
+                """
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    company_id,
+                    provider,
+                    external_calendar_id,
+                    config_json,
+                    active,
+                    created_at,
+                    updated_at
+                FROM calendar_integrations
+                WHERE active = 1
+                  AND company_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (company_id,),
+            )
+
+        row = cursor.fetchone()
+        connection.close()
+        if not row:
+            return None
+
+        item = dict(row)
+        config_json = item.get("config_json")
+        try:
+            item["config"] = json.loads(config_json) if config_json else {}
+        except json.JSONDecodeError:
+            item["config"] = {"raw": config_json}
+        item.pop("config_json", None)
+        return item
+
+    def create_appointment_booking(
+        self,
+        provider: str,
+        title: str,
+        starts_at: str,
+        ends_at: str,
+        timezone: str,
+        company_id: int | None = None,
+        contact_id: str | None = None,
+        integration_id: int | None = None,
+        external_event_id: str | None = None,
+        description: str | None = None,
+        status: str = "confirmed",
+    ) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO appointment_bookings (
+                company_id,
+                contact_id,
+                integration_id,
+                provider,
+                external_event_id,
+                title,
+                description,
+                starts_at,
+                ends_at,
+                timezone,
+                status,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                company_id,
+                contact_id,
+                integration_id,
+                provider,
+                external_event_id,
+                title,
+                description,
+                starts_at,
+                ends_at,
+                timezone,
+                status,
+            ),
+        )
+
+        booking_id = cursor.lastrowid
+        connection.commit()
+        connection.close()
+        return int(booking_id)
+
+    def get_appointment_bookings(
+        self,
+        company_id: int | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                integration_id,
+                provider,
+                external_event_id,
+                title,
+                description,
+                starts_at,
+                ends_at,
+                timezone,
+                status,
+                created_at,
+                updated_at
+            FROM appointment_bookings
+            WHERE (? IS NULL OR company_id = ?)
+              AND (? IS NULL OR status = ?)
+            ORDER BY starts_at ASC, id ASC
+            """,
+            (company_id, company_id, status, status),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def get_appointment_bookings_between(
+        self,
+        starts_at: str,
+        ends_at: str,
+        company_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                integration_id,
+                provider,
+                external_event_id,
+                title,
+                description,
+                starts_at,
+                ends_at,
+                timezone,
+                status,
+                created_at,
+                updated_at
+            FROM appointment_bookings
+            WHERE (? IS NULL OR company_id = ?)
+              AND status IN ('confirmed', 'pending')
+              AND starts_at < ?
+              AND ends_at > ?
+            ORDER BY starts_at ASC, id ASC
+            """,
+            (company_id, company_id, ends_at, starts_at),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def get_active_conversation_flow(
+        self,
+        contact_id: str,
+        company_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                flow_type,
+                status,
+                state_json,
+                created_at,
+                updated_at
+            FROM conversation_flows
+            WHERE contact_id = ?
+              AND (? IS NULL OR company_id = ?)
+              AND status = 'active'
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+            """,
+            (contact_id, company_id, company_id),
+        )
+
+        row = cursor.fetchone()
+        connection.close()
+        if not row:
+            return None
+
+        item = dict(row)
+        state_json = item.get("state_json")
+        try:
+            item["state"] = json.loads(state_json) if state_json else {}
+        except json.JSONDecodeError:
+            item["state"] = {"raw": state_json}
+        item.pop("state_json", None)
+        return item
+
+    def upsert_conversation_flow(
+        self,
+        *,
+        contact_id: str,
+        flow_type: str,
+        state: dict[str, Any],
+        company_id: int | None = None,
+        status: str = "active",
+    ) -> int:
+        existing = self.get_active_conversation_flow(contact_id=contact_id, company_id=company_id)
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        if existing:
+            cursor.execute(
+                """
+                UPDATE conversation_flows
+                SET
+                    flow_type = ?,
+                    status = ?,
+                    state_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    flow_type,
+                    status,
+                    json.dumps(state, ensure_ascii=False),
+                    existing["id"],
+                ),
+            )
+            flow_id = int(existing["id"])
+        else:
+            cursor.execute(
+                """
+                INSERT INTO conversation_flows (
+                    company_id,
+                    contact_id,
+                    flow_type,
+                    status,
+                    state_json,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    company_id,
+                    contact_id,
+                    flow_type,
+                    status,
+                    json.dumps(state, ensure_ascii=False),
+                ),
+            )
+            flow_id = int(cursor.lastrowid)
+
+        connection.commit()
+        connection.close()
+        return flow_id
+
+    def close_conversation_flow(
+        self,
+        flow_id: int,
+        *,
+        status: str = "completed",
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        if state is None:
+            cursor.execute(
+                """
+                UPDATE conversation_flows
+                SET
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, flow_id),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE conversation_flows
+                SET
+                    status = ?,
+                    state_json = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    json.dumps(state, ensure_ascii=False),
+                    flow_id,
+                ),
+            )
+
+        connection.commit()
+        connection.close()
+
+    def create_customer_reminder(
+        self,
+        *,
+        company_id: int | None,
+        contact_id: str,
+        reminder_text: str,
+        reminder_summary: str | None,
+        remind_at: str,
+        timezone: str,
+        status: str = "pending",
+        outbound_message_id: int | None = None,
+        audience: str = "customer",
+        source: str = "manual",
+        appointment_booking_id: int | None = None,
+    ) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO customer_reminders (
+                company_id,
+                contact_id,
+                reminder_text,
+                reminder_summary,
+                remind_at,
+                timezone,
+                status,
+                outbound_message_id,
+                audience,
+                source,
+                appointment_booking_id,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                company_id,
+                contact_id,
+                reminder_text,
+                reminder_summary,
+                remind_at,
+                timezone,
+                status,
+                outbound_message_id,
+                audience,
+                source,
+                appointment_booking_id,
+            ),
+        )
+
+        reminder_id = int(cursor.lastrowid)
+        connection.commit()
+        connection.close()
+        return reminder_id
+
+    def get_customer_reminders(
+        self,
+        company_id: int | None = None,
+        status: str | None = None,
+        audience: str | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                reminder_text,
+                reminder_summary,
+                remind_at,
+                timezone,
+                status,
+                outbound_message_id,
+                audience,
+                source,
+                appointment_booking_id,
+                created_at,
+                updated_at
+            FROM customer_reminders
+            WHERE (? IS NULL OR company_id = ?)
+              AND (? IS NULL OR status = ?)
+              AND (? IS NULL OR audience = ?)
+            ORDER BY remind_at ASC, id ASC
+            """,
+            (company_id, company_id, status, status, audience, audience),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def get_customer_reminder(self, reminder_id: int) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                reminder_text,
+                reminder_summary,
+                remind_at,
+                timezone,
+                status,
+                outbound_message_id,
+                audience,
+                source,
+                appointment_booking_id,
+                created_at,
+                updated_at
+            FROM customer_reminders
+            WHERE id = ?
+            """,
+            (reminder_id,),
+        )
+
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
+
+    def get_due_customer_reminders(self, reference_time: str) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                reminder_text,
+                reminder_summary,
+                remind_at,
+                timezone,
+                status,
+                outbound_message_id,
+                audience,
+                source,
+                appointment_booking_id,
+                created_at,
+                updated_at
+            FROM customer_reminders
+            WHERE status = 'pending'
+              AND remind_at <= ?
+            ORDER BY remind_at ASC, id ASC
+            """,
+            (reference_time,),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def get_customer_reminders_for_booking(
+        self,
+        appointment_booking_id: int,
+        audience: str = "customer",
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                reminder_text,
+                reminder_summary,
+                remind_at,
+                timezone,
+                status,
+                outbound_message_id,
+                audience,
+                source,
+                appointment_booking_id,
+                created_at,
+                updated_at
+            FROM customer_reminders
+            WHERE appointment_booking_id = ?
+              AND audience = ?
+            ORDER BY remind_at ASC, id ASC
+            """,
+            (appointment_booking_id, audience),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def mark_customer_reminder_sent(
+        self,
+        reminder_id: int,
+        *,
+        outbound_message_id: int | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE customer_reminders
+            SET
+                status = 'sent',
+                outbound_message_id = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (outbound_message_id, reminder_id),
+        )
+
+        connection.commit()
+        connection.close()

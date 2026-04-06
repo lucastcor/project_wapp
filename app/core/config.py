@@ -10,6 +10,27 @@ class Settings:
     app_version: str = os.getenv("APP_VERSION", "1.0.0")
     environment: str = os.getenv("ENVIRONMENT", "development")
     debug: bool = os.getenv("DEBUG", "true").lower() == "true"
+    log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_json: bool = os.getenv("LOG_JSON", "true").lower() == "true"
+    database_url: str = os.getenv("DATABASE_URL", "sqlite:///project_wapp.db")
+    postgres_database_url: str | None = os.getenv("POSTGRES_DATABASE_URL")
+    database_pool_size: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
+    database_statement_timeout_ms: int = int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "5000"))
+    enable_admin_auth: bool = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"
+    admin_api_token: str | None = os.getenv("ADMIN_API_TOKEN")
+    admin_viewer_token: str | None = os.getenv("ADMIN_VIEWER_TOKEN")
+    admin_operator_token: str | None = os.getenv("ADMIN_OPERATOR_TOKEN")
+    admin_superadmin_token: str | None = os.getenv("ADMIN_SUPERADMIN_TOKEN")
+    audit_retention_days: int = int(os.getenv("AUDIT_RETENTION_DAYS", "90"))
+    reminder_worker_enabled: bool = os.getenv("REMINDER_WORKER_ENABLED", "false").lower() == "true"
+    reminder_worker_poll_seconds: int = int(os.getenv("REMINDER_WORKER_POLL_SECONDS", "60"))
+    reminder_worker_dispatch_immediately: bool = os.getenv(
+        "REMINDER_WORKER_DISPATCH_IMMEDIATELY",
+        "true",
+    ).lower() == "true"
+    reminder_worker_channel: str | None = os.getenv("REMINDER_WORKER_CHANNEL")
+    reminder_worker_audiences: str = os.getenv("REMINDER_WORKER_AUDIENCES", "customer,internal")
+    admin_app_api_base_url: str = os.getenv("ADMIN_APP_API_BASE_URL", "http://127.0.0.1:8000")
 
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5")
@@ -21,6 +42,19 @@ class Settings:
     classification_provider: str = os.getenv("CLASSIFICATION_PROVIDER", "mock")
     outbound_provider: str = os.getenv("OUTBOUND_PROVIDER", "mock")
     outbound_default_channel: str = os.getenv("OUTBOUND_DEFAULT_CHANNEL", "whatsapp")
+    calendar_provider: str = os.getenv("CALENDAR_PROVIDER", "mock")
+    calendar_timezone: str = os.getenv("CALENDAR_TIMEZONE", "America/Sao_Paulo")
+    calendar_default_workday_start: str = os.getenv("CALENDAR_DEFAULT_WORKDAY_START", "09:00")
+    calendar_default_workday_end: str = os.getenv("CALENDAR_DEFAULT_WORKDAY_END", "18:00")
+    calendar_slot_increment_minutes: int = int(os.getenv("CALENDAR_SLOT_INCREMENT_MINUTES", "30"))
+    google_calendar_client_id: str | None = os.getenv("GOOGLE_CALENDAR_CLIENT_ID")
+    google_calendar_client_secret: str | None = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET")
+    google_calendar_refresh_token: str | None = os.getenv("GOOGLE_CALENDAR_REFRESH_TOKEN")
+    google_calendar_id: str | None = os.getenv("GOOGLE_CALENDAR_ID")
+    caldav_url: str | None = os.getenv("CALDAV_URL")
+    caldav_username: str | None = os.getenv("CALDAV_USERNAME")
+    caldav_password: str | None = os.getenv("CALDAV_PASSWORD")
+    caldav_calendar_name: str | None = os.getenv("CALDAV_CALENDAR_NAME")
 
     whatsapp_api_base_url: str | None = os.getenv("WHATSAPP_API_BASE_URL")
     whatsapp_api_token: str | None = os.getenv("WHATSAPP_API_TOKEN")

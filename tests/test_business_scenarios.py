@@ -6,12 +6,37 @@ class FakeRepository:
     def __init__(self) -> None:
         self.contacts: dict[str, dict] = {}
         self.messages: list[dict] = []
+        self.pending_questions: list[dict] = []
+        self.default_company_id = 1
 
-    def save_contact(self, contact_id: str, contact_name: str | None) -> None:
+    def resolve_company_id(
+        self,
+        company_id: int | None = None,
+        company_slug: str | None = None,
+    ) -> int | None:
+        return company_id
+
+    def ensure_default_company(self) -> int:
+        return self.default_company_id
+
+    def get_company(self, company_id: int) -> dict:
+        return {
+            "id": company_id,
+            "slug": "default",
+            "name": "Default Company",
+        }
+
+    def save_contact(
+        self,
+        contact_id: str,
+        contact_name: str | None,
+        company_id: int | None = None,
+    ) -> None:
         existing = self.contacts.get(contact_id, {})
         self.contacts[contact_id] = {
             "contact_id": contact_id,
             "contact_name": contact_name,
+            "company_id": company_id if company_id is not None else existing.get("company_id"),
             "conversation_summary": existing.get("conversation_summary"),
             "last_classification": existing.get("last_classification"),
             "pipeline_stage": existing.get("pipeline_stage"),
@@ -28,6 +53,7 @@ class FakeRepository:
         return {
             "contact_id": contact.get("contact_id"),
             "contact_name": contact.get("contact_name"),
+            "company_id": contact.get("company_id"),
             "conversation_summary": contact.get("conversation_summary"),
             "last_classification": contact.get("last_classification"),
             "pipeline_stage": contact.get("pipeline_stage"),
@@ -35,6 +61,17 @@ class FakeRepository:
             "lead_temperature": contact.get("lead_temperature"),
             **contact,
         }
+
+    def get_latest_customer_clarification(self, contact_id: str) -> dict | None:
+        return None
+
+    def create_pending_question(self, **kwargs) -> int:
+        question_id = len(self.pending_questions) + 1
+        self.pending_questions.append({"id": question_id, **kwargs})
+        return question_id
+
+    def mark_clarification_consumed(self, question_id: int) -> None:
+        return None
 
     def save_message(self, **kwargs) -> None:
         self.messages.append(kwargs)
@@ -229,6 +266,11 @@ def test_business_conversation_scenarios(monkeypatch) -> None:
     fake_engine = FakeConversationEngine()
 
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    monkeypatch.setattr(
+        orchestrator,
+        "handle_conversation_workflow",
+        lambda **kwargs: type("WorkflowStub", (), {"handled": False})(),
+    )
     # monkeypatch.setattr(orchestrator, "classify_message", fake_engine.classify_message)  # REMOVE this line
     monkeypatch.setattr(orchestrator, "decide_message_action", fake_engine.decide_message_action)
     monkeypatch.setattr(orchestrator, "generate_business_reply", fake_engine.generate_business_reply)
@@ -307,6 +349,8 @@ def test_business_conversation_scenarios(monkeypatch) -> None:
         assert "reply" in last_result
         assert "pipeline_stage" in last_result
         assert "lead_temperature" in last_result
+        assert last_result["company_id"] == 1
+        assert last_result["company_slug"] == "default"
         assert fake_repository.get_contact(contact_id) is not None
 
         expected_classifications = EXPECTED_ALLOWED_CLASSIFICATIONS.get(scenario_name)

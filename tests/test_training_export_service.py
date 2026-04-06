@@ -6,7 +6,7 @@ from app.services import training_export_service
 
 
 class FakeRepository:
-    def get_exportable_message_examples(self) -> list[dict]:
+    def get_exportable_message_examples(self, company_id: int | None = None) -> list[dict]:
         return [
             {
                 "id": 1,

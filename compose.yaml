@@ -1,0 +1,144 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: project_wapp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-project_wapp}
+      POSTGRES_USER: ${POSTGRES_USER:-project_wapp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-project_wapp}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  api:
+    build:
+      context: .
+    container_name: project_wapp_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      POSTGRES_DATABASE_URL: ${POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
+      LOG_JSON: ${LOG_JSON:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ENABLE_ADMIN_AUTH: ${ENABLE_ADMIN_AUTH:-false}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      ADMIN_VIEWER_TOKEN: ${ADMIN_VIEWER_TOKEN:-}
+      ADMIN_OPERATOR_TOKEN: ${ADMIN_OPERATOR_TOKEN:-}
+      ADMIN_SUPERADMIN_TOKEN: ${ADMIN_SUPERADMIN_TOKEN:-}
+      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
+      REMINDER_WORKER_ENABLED: ${REMINDER_WORKER_ENABLED:-true}
+      REMINDER_WORKER_POLL_SECONDS: ${REMINDER_WORKER_POLL_SECONDS:-60}
+      REMINDER_WORKER_DISPATCH_IMMEDIATELY: ${REMINDER_WORKER_DISPATCH_IMMEDIATELY:-true}
+      REMINDER_WORKER_CHANNEL: ${REMINDER_WORKER_CHANNEL:-}
+      REMINDER_WORKER_AUDIENCES: ${REMINDER_WORKER_AUDIENCES:-customer,internal}
+      ADMIN_APP_API_BASE_URL: ${ADMIN_APP_API_BASE_URL:-http://api:8000}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5}
+      OPENAI_FINETUNED_MODEL: ${OPENAI_FINETUNED_MODEL:-}
+      USE_FINETUNED_MODEL_FOR_REPLIES: ${USE_FINETUNED_MODEL_FOR_REPLIES:-false}
+      OPENAI_FINETUNING_BASE_MODEL: ${OPENAI_FINETUNING_BASE_MODEL:-gpt-4.1-mini}
+      OPENAI_FINETUNING_SUFFIX: ${OPENAI_FINETUNING_SUFFIX:-project-wapp-style}
+      ENABLE_FINETUNING_PIPELINE: ${ENABLE_FINETUNING_PIPELINE:-false}
+      CLASSIFICATION_PROVIDER: ${CLASSIFICATION_PROVIDER:-mock}
+      OUTBOUND_PROVIDER: ${OUTBOUND_PROVIDER:-mock}
+      OUTBOUND_DEFAULT_CHANNEL: ${OUTBOUND_DEFAULT_CHANNEL:-whatsapp}
+      CALENDAR_PROVIDER: ${CALENDAR_PROVIDER:-mock}
+      CALENDAR_TIMEZONE: ${CALENDAR_TIMEZONE:-America/Sao_Paulo}
+      CALENDAR_DEFAULT_WORKDAY_START: ${CALENDAR_DEFAULT_WORKDAY_START:-09:00}
+      CALENDAR_DEFAULT_WORKDAY_END: ${CALENDAR_DEFAULT_WORKDAY_END:-18:00}
+      CALENDAR_SLOT_INCREMENT_MINUTES: ${CALENDAR_SLOT_INCREMENT_MINUTES:-30}
+      GOOGLE_CALENDAR_CLIENT_ID: ${GOOGLE_CALENDAR_CLIENT_ID:-}
+      GOOGLE_CALENDAR_CLIENT_SECRET: ${GOOGLE_CALENDAR_CLIENT_SECRET:-}
+      GOOGLE_CALENDAR_REFRESH_TOKEN: ${GOOGLE_CALENDAR_REFRESH_TOKEN:-}
+      GOOGLE_CALENDAR_ID: ${GOOGLE_CALENDAR_ID:-}
+      CALDAV_URL: ${CALDAV_URL:-}
+      CALDAV_USERNAME: ${CALDAV_USERNAME:-}
+      CALDAV_PASSWORD: ${CALDAV_PASSWORD:-}
+      CALDAV_CALENDAR_NAME: ${CALDAV_CALENDAR_NAME:-}
+      WHATSAPP_API_BASE_URL: ${WHATSAPP_API_BASE_URL:-}
+      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5).read()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+    container_name: project_wapp_worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.tools.reminder_worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      POSTGRES_DATABASE_URL: ${POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
+      LOG_JSON: ${LOG_JSON:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      OUTBOUND_PROVIDER: ${OUTBOUND_PROVIDER:-mock}
+      OUTBOUND_DEFAULT_CHANNEL: ${OUTBOUND_DEFAULT_CHANNEL:-whatsapp}
+      WHATSAPP_API_BASE_URL: ${WHATSAPP_API_BASE_URL:-}
+      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      REMINDER_WORKER_ENABLED: ${REMINDER_WORKER_ENABLED:-true}
+      REMINDER_WORKER_POLL_SECONDS: ${REMINDER_WORKER_POLL_SECONDS:-60}
+      REMINDER_WORKER_DISPATCH_IMMEDIATELY: ${REMINDER_WORKER_DISPATCH_IMMEDIATELY:-true}
+      REMINDER_WORKER_CHANNEL: ${REMINDER_WORKER_CHANNEL:-}
+      REMINDER_WORKER_AUDIENCES: ${REMINDER_WORKER_AUDIENCES:-customer,internal}
+
+  admin:
+    build:
+      context: .
+    container_name: project_wapp_admin
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    command:
+      [
+        "streamlit",
+        "run",
+        "app/admin_app.py",
+        "--server.address=0.0.0.0",
+        "--server.port=8501",
+      ]
+    environment:
+      ADMIN_APP_API_BASE_URL: ${ADMIN_APP_API_BASE_URL:-http://api:8000}
+      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
+      ADMIN_ACTOR: ${ADMIN_ACTOR:-streamlit-admin}
+    ports:
+      - "${ADMIN_PORT:-8501}:8501"
+
+volumes:
+  postgres_data:
