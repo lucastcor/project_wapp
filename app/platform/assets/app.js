@@ -1,4 +1,42 @@
 const STORAGE_KEY = "project-wapp-platform-config-v1"
+const STUDIO_SESSIONS_KEY = "project-wapp-studio-sessions-v1"
+
+function loadStudioSessions() {
+  try {
+    const raw = window.localStorage.getItem(STUDIO_SESSIONS_KEY)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === "object" ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function persistStudioSessions() {
+  try {
+    window.localStorage.setItem(STUDIO_SESSIONS_KEY, JSON.stringify(state.studio.sessionsByCompany || {}))
+  } catch {
+    // ignore quota errors
+  }
+}
+
+function studioCompanyKey() {
+  return state.config.companySlug || state.config.companyId || "__default__"
+}
+
+function getStudioSessions() {
+  const key = studioCompanyKey()
+  if (!state.studio.sessionsByCompany[key]) {
+    state.studio.sessionsByCompany[key] = []
+  }
+  return state.studio.sessionsByCompany[key]
+}
+
+function getActiveStudioSession() {
+  const sessions = getStudioSessions()
+  const activeId = state.studio.activeSessionId
+  return sessions.find((s) => s.id === activeId) || null
+}
 
 const ICONS = {
   dashboard: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>',
@@ -134,6 +172,13 @@ const state = {
   simulator: {
     transcript: [],
     lastResult: null,
+  },
+  studio: {
+    sessionsByCompany: loadStudioSessions(),
+    activeSessionId: null,
+    draftMessage: "",
+    newSession: { label: "", contactId: "", contactName: "" },
+    showNewForm: false,
   },
   flowEditor: {
     selectedPipelineKey: "lead_capture",
@@ -890,99 +935,174 @@ function renderDashboardView() {
   `
 }
 
+function formatSessionTimestamp(iso) {
+  if (!iso) return ""
+  try {
+    const date = new Date(iso)
+    if (Number.isNaN(date.getTime())) return ""
+    return date.toLocaleString("pt-BR", { hour: "2-digit", minute: "2-digit", day: "2-digit", month: "2-digit" })
+  } catch {
+    return ""
+  }
+}
+
 function renderStudioView() {
-  const transcript = state.simulator.transcript
   const context = state.companyContext
   const operatorContacts = Array.isArray(context?.internal_operation?.operator_contact_ids)
     ? context.internal_operation.operator_contact_ids
     : []
+  const sessions = getStudioSessions()
+  const activeSession = getActiveStudioSession()
+  const showNewForm = state.studio.showNewForm || sessions.length === 0
+  const draftNew = state.studio.newSession
+
+  const sessionItems = sessions
+    .slice()
+    .sort((a, b) => String(b.updated_at || b.created_at).localeCompare(String(a.updated_at || a.created_at)))
+    .map((session) => {
+      const isActive = activeSession && activeSession.id === session.id
+      const lastMsg = session.messages[session.messages.length - 1]
+      const preview = lastMsg ? lastMsg.text : "Nenhuma mensagem ainda."
+      return `
+        <button class="card card-muted studio-session-item ${isActive ? "is-active" : ""}" data-studio-session="${escapeHtml(session.id)}" style="display:block;text-align:left;cursor:pointer;margin-bottom:10px;padding:12px;${isActive ? "border-color: var(--brand);" : ""}">
+          <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">
+            <strong style="font-size:13px;">${escapeHtml(session.label || session.contact_id)}</strong>
+            <span class="meta-chip">${escapeHtml(formatSessionTimestamp(session.updated_at || session.created_at))}</span>
+          </div>
+          <div class="card-copy" style="font-size:12px;margin-top:4px;">${escapeHtml(session.contact_id)}</div>
+          <div class="card-copy" style="font-size:11px;margin-top:6px;opacity:0.75;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${escapeHtml(preview.slice(0, 80))}</div>
+          <div style="margin-top:8px;display:flex;gap:6px;">
+            <span class="chip" style="font-size:10px;">${session.messages.length} msgs</span>
+            <span class="chip chip-danger" data-studio-delete-session="${escapeHtml(session.id)}" style="font-size:10px;cursor:pointer;">Remover</span>
+          </div>
+        </button>
+      `
+    })
+    .join("")
+
+  const newSessionForm = showNewForm
+    ? `
+        <form id="studio-new-session-form" class="form-grid" style="margin-top:12px;gap:10px;">
+          <div class="field">
+            <label for="studio-new-label">Rótulo da sessão</label>
+            <input id="studio-new-label" name="label" value="${escapeHtml(draftNew.label)}" placeholder="Ex.: Cliente Premium" />
+          </div>
+          <div class="field">
+            <label for="studio-new-contact-id">Contact ID</label>
+            <input id="studio-new-contact-id" name="contactId" value="${escapeHtml(draftNew.contactId)}" placeholder="5511999999999" />
+          </div>
+          <div class="field">
+            <label for="studio-new-contact-name">Nome exibido</label>
+            <input id="studio-new-contact-name" name="contactName" value="${escapeHtml(draftNew.contactName)}" placeholder="Opcional" />
+          </div>
+          <div class="toolbar-row">
+            <button class="button" type="submit">Criar sessão</button>
+            ${sessions.length ? '<button class="button-ghost" type="button" id="studio-cancel-new">Cancelar</button>' : ""}
+            ${
+              operatorContacts.length
+                ? `<button class="button-ghost" type="button" id="studio-use-operator">Usar operador ${escapeHtml(operatorContacts[0])}</button>`
+                : ""
+            }
+          </div>
+        </form>
+      `
+    : ""
+
+  const chatPane = activeSession
+    ? `
+        <article class="card chat-shell">
+          <div class="section-header">
+            <div>
+              <h3 class="section-title">${escapeHtml(activeSession.label || activeSession.contact_id)}</h3>
+              <p class="section-copy">Contact ID: ${escapeHtml(activeSession.contact_id)}${activeSession.contact_name ? " · " + escapeHtml(activeSession.contact_name) : ""}</p>
+            </div>
+            ${
+              activeSession.last_result
+                ? `<span class="tag ${getReadinessTone(activeSession.last_result.action === "auto_reply" ? "ready" : "warning")}">${escapeHtml(activeSession.last_result.action)}</span>`
+                : ""
+            }
+          </div>
+          <div class="chip-row">
+            <button class="chip" data-studio-prompt="Quero agendar uma consultoria inicial para amanhã às 10h">Agendamento</button>
+            <button class="chip" data-studio-prompt="Preciso remarcar meu horário de amanhã para sexta à tarde">Reagendamento</button>
+            <button class="chip" data-studio-prompt="Vou cancelar meu atendimento de amanhã">Cancelamento</button>
+            <button class="chip" data-studio-prompt="Marque a Maria Silva amanhã às 10h para consultoria inicial">Operação interna</button>
+          </div>
+          <div class="chat-log" id="studio-chat-log">
+            ${
+              activeSession.messages.length
+                ? activeSession.messages
+                    .map((item) => {
+                      const ts = formatSessionTimestamp(item.at)
+                      if (item.role === "user") {
+                        return `
+                          <div class="bubble bubble-user">
+                            ${escapeHtml(item.text)}
+                            ${ts ? `<div class="bubble-meta"><span class="meta-chip">${escapeHtml(ts)}</span></div>` : ""}
+                          </div>
+                        `
+                      }
+                      const meta = item.meta || {}
+                      return `
+                        <div class="bubble bubble-assistant">
+                          ${escapeHtml(item.text)}
+                          <div class="bubble-meta">
+                            ${ts ? `<span class="meta-chip">${escapeHtml(ts)}</span>` : ""}
+                            <span class="meta-chip">Classificação: ${escapeHtml(meta.classification || "—")}</span>
+                            <span class="meta-chip">Ação: ${escapeHtml(meta.action || "—")}</span>
+                            <span class="meta-chip">Pipeline: ${escapeHtml(meta.pipeline_stage || "—")}</span>
+                            <span class="meta-chip">Fonte: ${escapeHtml(meta.source || "—")}</span>
+                          </div>
+                        </div>
+                      `
+                    })
+                    .join("")
+                : '<div class="empty-state">Envie uma mensagem para ver o comportamento do bot dentro do runtime real.</div>'
+            }
+          </div>
+          <form id="studio-form" class="form-grid" style="margin-top:12px;">
+            <div class="field">
+              <label for="studio-message">Mensagem como ${escapeHtml(activeSession.label || activeSession.contact_id)}</label>
+              <textarea id="studio-message" name="message" placeholder="Ex.: Quero remarcar meu atendimento para sexta às 15h">${escapeHtml(state.studio.draftMessage)}</textarea>
+            </div>
+            <div class="toolbar-row">
+              <button class="button" type="submit">${ICONS.send}<span>Enviar para o runtime</span></button>
+              <button class="button-ghost" type="button" id="clear-studio-log">Limpar histórico</button>
+            </div>
+          </form>
+        </article>
+      `
+    : `
+        <article class="card chat-shell">
+          <div class="empty-state">Selecione uma sessão na lista ou crie uma nova para começar a testar.</div>
+        </article>
+      `
 
   return `
     <section class="hero">
       <span class="brand-eyebrow">Bot Studio</span>
       <h2 class="hero-title">Teste conversa real antes de colocar para rodar.</h2>
       <p class="hero-copy">
-        O simulador usa a mesma entrada pública do produto. Isso significa que você consegue validar fluxo natural de cliente, operador, cancelamento, reagendamento e agenda interna no mesmo runtime.
+        Crie sessões de teste por contato, mantenha o histórico e valide o fluxo natural sem reinformar telefone a cada mensagem. Toda troca passa pelo mesmo runtime público (/messages/incoming).
       </p>
-      <div class="chip-row">
-        <button class="chip" data-studio-prompt="Quero agendar uma consultoria inicial para amanhã às 10h">Agendamento</button>
-        <button class="chip" data-studio-prompt="Preciso remarcar meu horário de amanhã para sexta à tarde">Reagendamento</button>
-        <button class="chip" data-studio-prompt="Vou cancelar meu atendimento de amanhã">Cancelamento</button>
-        <button class="chip" data-studio-prompt="Marque a Maria Silva amanhã às 10h para consultoria inicial">Operação interna</button>
-      </div>
     </section>
 
     <section class="two-pane">
       <article class="card">
         <div class="section-header">
           <div>
-            <h3 class="section-title">Contexto de simulação</h3>
-            <p class="section-copy">Escolha quem está falando e em qual empresa o fluxo será testado.</p>
+            <h3 class="section-title">Sessões de teste</h3>
+            <p class="section-copy">${sessions.length} ${sessions.length === 1 ? "sessão salva" : "sessões salvas"} neste navegador.</p>
           </div>
+          ${!showNewForm ? '<button class="button" type="button" id="studio-start-new">Nova sessão</button>' : ""}
         </div>
-        <form id="studio-form" class="form-grid">
-          <div class="field">
-            <label for="studio-contact-id">Contact ID</label>
-            <input id="studio-contact-id" name="contactId" value="${escapeHtml(state.drafts.studio.contactId)}" />
-          </div>
-          <div class="field">
-            <label for="studio-contact-name">Nome exibido</label>
-            <input id="studio-contact-name" name="contactName" value="${escapeHtml(state.drafts.studio.contactName)}" />
-          </div>
-          <div class="field">
-            <label for="studio-message">Mensagem para o bot</label>
-            <textarea id="studio-message" name="message" placeholder="Ex.: Quero remarcar meu atendimento para sexta às 15h">${escapeHtml(state.drafts.studio.message)}</textarea>
-          </div>
-          <div class="toolbar-row">
-            <button class="button" type="submit">${ICONS.send}<span>Enviar para o runtime</span></button>
-            ${
-              operatorContacts.length
-                ? `<button class="button-ghost" type="button" id="use-operator-contact">Usar contato interno ${escapeHtml(operatorContacts[0])}</button>`
-                : ""
-            }
-            <button class="button-ghost" type="button" id="clear-studio-log">Limpar conversa</button>
-          </div>
-        </form>
+        <div class="studio-sessions-list">
+          ${sessionItems || '<div class="empty-state" style="padding:12px;">Nenhuma sessão ainda. Crie a primeira abaixo.</div>'}
+        </div>
+        ${newSessionForm}
       </article>
 
-      <article class="card chat-shell">
-        <div class="section-header">
-          <div>
-            <h3 class="section-title">Transcript</h3>
-            <p class="section-copy">A resposta mostra classificação, pipeline e ação aplicada.</p>
-          </div>
-          ${
-            state.simulator.lastResult
-              ? `<span class="tag ${getReadinessTone(state.simulator.lastResult.action === "auto_reply" ? "ready" : "warning")}">${escapeHtml(state.simulator.lastResult.action)}</span>`
-              : ""
-          }
-        </div>
-        <div class="chat-log">
-          ${
-            transcript.length
-              ? transcript
-                  .map((item) => {
-                    if (item.role === "user") {
-                      return `<div class="bubble bubble-user">${escapeHtml(item.text)}</div>`
-                    }
-                    const meta = item.meta || {}
-                    return `
-                      <div class="bubble bubble-assistant">
-                        ${escapeHtml(item.text)}
-                        <div class="bubble-meta">
-                          <span class="meta-chip">Classificação: ${escapeHtml(meta.classification || "—")}</span>
-                          <span class="meta-chip">Ação: ${escapeHtml(meta.action || "—")}</span>
-                          <span class="meta-chip">Pipeline: ${escapeHtml(meta.pipeline_stage || "—")}</span>
-                          <span class="meta-chip">Fonte: ${escapeHtml(meta.source || "—")}</span>
-                        </div>
-                      </div>
-                    `
-                  })
-                  .join("")
-              : '<div class="empty-state">Envie uma mensagem para ver o comportamento do bot dentro do runtime real.</div>'
-          }
-        </div>
-      </article>
+      ${chatPane}
     </section>
   `
 }
@@ -2477,19 +2597,38 @@ function bindEvents() {
 }
 
 function bindStudioEvents() {
+  const messageField = document.getElementById("studio-message")
+  if (messageField) {
+    messageField.addEventListener("input", (event) => {
+      state.studio.draftMessage = event.target.value
+    })
+  }
+
+  const chatLog = document.getElementById("studio-chat-log")
+  if (chatLog) {
+    chatLog.scrollTop = chatLog.scrollHeight
+  }
+
   const studioForm = document.getElementById("studio-form")
   if (studioForm) {
     studioForm.addEventListener("submit", async (event) => {
       event.preventDefault()
-      const formData = new FormData(studioForm)
-      state.drafts.studio.contactId = String(formData.get("contactId") || "").trim()
-      state.drafts.studio.contactName = String(formData.get("contactName") || "").trim()
-      state.drafts.studio.message = String(formData.get("message") || "").trim()
-
-      if (!state.drafts.studio.contactId || !state.drafts.studio.message) {
-        pushToast("Informe contact_id e mensagem para testar o runtime.", "error")
+      const session = getActiveStudioSession()
+      if (!session) {
+        pushToast("Selecione uma sessão antes de enviar mensagens.", "error")
         return
       }
+      const message = String(state.studio.draftMessage || "").trim()
+      if (!message) {
+        pushToast("Digite uma mensagem antes de enviar.", "error")
+        return
+      }
+
+      const outgoing = { role: "user", text: message, at: new Date().toISOString() }
+      session.messages.push(outgoing)
+      session.updated_at = outgoing.at
+      state.studio.draftMessage = ""
+      persistStudioSessions()
 
       state.loading = true
       state.loadingMessage = "Enviando mensagem para o runtime..."
@@ -2500,18 +2639,33 @@ function bindStudioEvents() {
           admin: false,
           params: getCompanyParams(),
           body: {
-            contact_id: state.drafts.studio.contactId,
-            contact_name: state.drafts.studio.contactName || null,
-            message: state.drafts.studio.message,
+            contact_id: session.contact_id,
+            contact_name: session.contact_name || null,
+            message,
           },
         })
-        state.simulator.transcript.push(
-          { role: "user", text: state.drafts.studio.message },
-          { role: "assistant", text: result.reply || "(sem resposta)", meta: result }
-        )
-        state.simulator.lastResult = result
-        state.drafts.studio.message = ""
-        pushToast("Simulação concluída com o runtime real.")
+        const incoming = {
+          role: "assistant",
+          text: result.reply || "(sem resposta)",
+          at: new Date().toISOString(),
+          meta: {
+            classification: result.classification,
+            action: result.action,
+            pipeline_stage: result.pipeline_stage,
+            source: result.source,
+            next_action: result.next_action,
+            lead_temperature: result.lead_temperature,
+          },
+        }
+        session.messages.push(incoming)
+        session.updated_at = incoming.at
+        session.last_result = {
+          action: result.action,
+          classification: result.classification,
+          pipeline_stage: result.pipeline_stage,
+        }
+        persistStudioSessions()
+        pushToast("Mensagem processada pelo runtime real.")
       } catch (error) {
         pushToast(summarizeError(error), "error")
       } finally {
@@ -2524,29 +2678,120 @@ function bindStudioEvents() {
 
   document.querySelectorAll("[data-studio-prompt]").forEach((button) => {
     button.addEventListener("click", () => {
-      state.drafts.studio.message = button.dataset.studioPrompt || ""
+      state.studio.draftMessage = button.dataset.studioPrompt || ""
       renderApp()
     })
   })
 
-  const clearStudioLog = document.getElementById("clear-studio-log")
-  if (clearStudioLog) {
-    clearStudioLog.addEventListener("click", () => {
-      state.simulator.transcript = []
-      state.simulator.lastResult = null
+  document.querySelectorAll("[data-studio-session]").forEach((element) => {
+    element.addEventListener("click", (event) => {
+      if (event.target.closest("[data-studio-delete-session]")) return
+      const id = element.dataset.studioSession
+      state.studio.activeSessionId = id
+      state.studio.draftMessage = ""
+      state.studio.showNewForm = false
+      renderApp()
+    })
+  })
+
+  document.querySelectorAll("[data-studio-delete-session]").forEach((element) => {
+    element.addEventListener("click", (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      const id = element.dataset.studioDeleteSession
+      if (!id) return
+      if (!window.confirm("Remover esta sessão de teste?")) return
+      const key = studioCompanyKey()
+      state.studio.sessionsByCompany[key] = (state.studio.sessionsByCompany[key] || []).filter((s) => s.id !== id)
+      if (state.studio.activeSessionId === id) {
+        state.studio.activeSessionId = null
+      }
+      persistStudioSessions()
+      renderApp()
+    })
+  })
+
+  const startNewBtn = document.getElementById("studio-start-new")
+  if (startNewBtn) {
+    startNewBtn.addEventListener("click", () => {
+      state.studio.showNewForm = true
       renderApp()
     })
   }
 
-  const useOperatorContact = document.getElementById("use-operator-contact")
-  if (useOperatorContact) {
-    useOperatorContact.addEventListener("click", () => {
+  const cancelNewBtn = document.getElementById("studio-cancel-new")
+  if (cancelNewBtn) {
+    cancelNewBtn.addEventListener("click", () => {
+      state.studio.showNewForm = false
+      renderApp()
+    })
+  }
+
+  const newSessionForm = document.getElementById("studio-new-session-form")
+  if (newSessionForm) {
+    const labelInput = newSessionForm.querySelector("#studio-new-label")
+    const contactIdInput = newSessionForm.querySelector("#studio-new-contact-id")
+    const contactNameInput = newSessionForm.querySelector("#studio-new-contact-name")
+    if (labelInput) labelInput.addEventListener("input", (e) => { state.studio.newSession.label = e.target.value })
+    if (contactIdInput) contactIdInput.addEventListener("input", (e) => { state.studio.newSession.contactId = e.target.value })
+    if (contactNameInput) contactNameInput.addEventListener("input", (e) => { state.studio.newSession.contactName = e.target.value })
+
+    newSessionForm.addEventListener("submit", (event) => {
+      event.preventDefault()
+      const label = String(state.studio.newSession.label || "").trim()
+      const contactId = String(state.studio.newSession.contactId || "").trim()
+      const contactName = String(state.studio.newSession.contactName || "").trim()
+      if (!contactId) {
+        pushToast("Informe o contact_id para criar a sessão.", "error")
+        return
+      }
+      const now = new Date().toISOString()
+      const session = {
+        id: window.crypto.randomUUID(),
+        label: label || contactId,
+        contact_id: contactId,
+        contact_name: contactName,
+        created_at: now,
+        updated_at: now,
+        messages: [],
+        last_result: null,
+      }
+      const sessions = getStudioSessions()
+      sessions.push(session)
+      state.studio.activeSessionId = session.id
+      state.studio.newSession = { label: "", contactId: "", contactName: "" }
+      state.studio.showNewForm = false
+      state.studio.draftMessage = ""
+      persistStudioSessions()
+      pushToast("Sessão criada.")
+      renderApp()
+    })
+  }
+
+  const useOperatorBtn = document.getElementById("studio-use-operator")
+  if (useOperatorBtn) {
+    useOperatorBtn.addEventListener("click", () => {
       const operatorId = state.companyContext?.internal_operation?.operator_contact_ids?.[0]
       if (operatorId) {
-        state.drafts.studio.contactId = operatorId
-        state.drafts.studio.contactName = "Operador interno"
+        state.studio.newSession.contactId = operatorId
+        state.studio.newSession.contactName = "Operador interno"
+        if (!state.studio.newSession.label) state.studio.newSession.label = "Operador interno"
         renderApp()
       }
+    })
+  }
+
+  const clearStudioLog = document.getElementById("clear-studio-log")
+  if (clearStudioLog) {
+    clearStudioLog.addEventListener("click", () => {
+      const session = getActiveStudioSession()
+      if (!session) return
+      if (!window.confirm("Limpar o histórico desta sessão?")) return
+      session.messages = []
+      session.last_result = null
+      session.updated_at = new Date().toISOString()
+      persistStudioSessions()
+      renderApp()
     })
   }
 }
