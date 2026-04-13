@@ -1466,7 +1466,224 @@ function renderFlowsView() {
   `
 }
 
+const WEEKDAY_DEFS = [
+  { key: "monday", label: "Seg" },
+  { key: "tuesday", label: "Ter" },
+  { key: "wednesday", label: "Qua" },
+  { key: "thursday", label: "Qui" },
+  { key: "friday", label: "Sex" },
+  { key: "saturday", label: "Sáb" },
+  { key: "sunday", label: "Dom" },
+]
+
+function ensureSchedulingPolicy(context) {
+  if (!context.scheduling_policy || typeof context.scheduling_policy !== "object") {
+    context.scheduling_policy = {}
+  }
+  const policy = context.scheduling_policy
+  if (typeof policy.enabled !== "boolean") {
+    policy.enabled = Array.isArray(policy.profiles) && policy.profiles.length > 0
+  }
+  if (!Array.isArray(policy.profiles)) {
+    policy.profiles = []
+  }
+  policy.profiles.forEach((profile) => {
+    if (!profile || typeof profile !== "object") return
+    if (!profile.day_windows || typeof profile.day_windows !== "object") {
+      profile.day_windows = {}
+    }
+    WEEKDAY_DEFS.forEach(({ key }) => {
+      const value = profile.day_windows[key]
+      if (value == null) {
+        profile.day_windows[key] = []
+        return
+      }
+      if (Array.isArray(value)) {
+        profile.day_windows[key] = value
+          .map((item) => normalizeRangeString(item))
+          .filter(Boolean)
+        return
+      }
+      if (typeof value === "string") {
+        profile.day_windows[key] = value
+          .split(/[,;]/)
+          .map((part) => normalizeRangeString(part))
+          .filter(Boolean)
+        return
+      }
+      profile.day_windows[key] = []
+    })
+    if (!Array.isArray(profile.allowed_weekdays)) {
+      profile.allowed_weekdays = WEEKDAY_DEFS
+        .filter(({ key }) => (profile.day_windows[key] || []).length > 0)
+        .map(({ key }) => key)
+    }
+  })
+  return context
+}
+
+function normalizeRangeString(value) {
+  if (!value || typeof value !== "string") return null
+  const match = value.trim().match(/^(\d{1,2}):?(\d{2})\s*[-→–—]\s*(\d{1,2}):?(\d{2})$/)
+  if (match) {
+    const h1 = String(match[1]).padStart(2, "0")
+    const h2 = String(match[3]).padStart(2, "0")
+    return `${h1}:${match[2]}-${h2}:${match[4]}`
+  }
+  const loose = value.trim().match(/^(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})$/)
+  if (loose) {
+    const h1 = String(loose[1]).padStart(2, "0")
+    const h2 = String(loose[3]).padStart(2, "0")
+    return `${h1}:${loose[2]}-${h2}:${loose[4]}`
+  }
+  return null
+}
+
+function parseRangeString(value) {
+  const match = String(value || "").match(/^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/)
+  if (!match) return { startMin: 0, endMin: 60 }
+  const startMin = Number(match[1]) * 60 + Number(match[2])
+  const endMin = Number(match[3]) * 60 + Number(match[4])
+  return { startMin, endMin }
+}
+
+function minutesToClock(minutes) {
+  const clamped = Math.max(0, Math.min(24 * 60, Math.round(minutes / 15) * 15))
+  const h = Math.floor(clamped / 60)
+  const m = clamped % 60
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`
+}
+
+function rangeToString(startMin, endMin) {
+  return `${minutesToClock(startMin)}-${minutesToClock(endMin)}`
+}
+
+function renderSchedulingPolicyEditor(context) {
+  const policy = context.scheduling_policy || { enabled: false, profiles: [] }
+  const enabled = !!policy.enabled
+  const profiles = Array.isArray(policy.profiles) ? policy.profiles : []
+
+  const toggleCard = `
+    <section class="card">
+      <div class="section-header">
+        <div>
+          <h3 class="section-title">Política de agendamento</h3>
+          <p class="section-copy">Mestre do módulo de agenda. Quando desligado, o bot não aceita nem sugere horários.</p>
+        </div>
+        <label class="meta-chip" style="gap: 10px;">
+          <input id="scheduling-policy-enabled" type="checkbox" ${enabled ? "checked" : ""} />
+          <strong>${enabled ? "Agendamento ativo" : "Agendamento desligado"}</strong>
+        </label>
+      </div>
+      ${enabled ? "" : '<div class="empty-state">Ative a política para editar perfis, janelas semanais e antecedência mínima.</div>'}
+    </section>
+  `
+
+  if (!enabled) {
+    return toggleCard
+  }
+
+  const profilesHtml = profiles.length
+    ? profiles
+        .map((profile, profileIndex) => renderSchedulingProfileCard(profile, profileIndex))
+        .join("")
+    : '<div class="empty-state">Nenhum perfil de agendamento configurado. Use o Flow Studio ou edite o company context diretamente para criar um.</div>'
+
+  return `
+    ${toggleCard}
+    <section class="card">
+      <div class="section-header">
+        <div>
+          <h3 class="section-title">Perfis de agendamento</h3>
+          <p class="section-copy">Cada perfil define duração padrão, antecedência mínima e janelas semanais. Arraste as bordas das barras para ajustar em 15 minutos.</p>
+        </div>
+        <button class="button" id="save-scheduling-policy" type="button">${ICONS.check}<span>Salvar política</span></button>
+      </div>
+      <div class="booking-stack">
+        ${profilesHtml}
+      </div>
+    </section>
+  `
+}
+
+function renderSchedulingProfileCard(profile, profileIndex) {
+  const key = profile.key || `profile_${profileIndex}`
+  const label = profile.label || key
+  const defaultDuration = Number(profile.default_duration_minutes || profile.slot_increment_minutes || 60)
+  const minNotice = Number(profile.minimum_notice_minutes || 0)
+  const allowedSet = new Set((profile.allowed_weekdays || []).map((item) => String(item).toLowerCase()))
+
+  const weekdaysHtml = WEEKDAY_DEFS.map(({ key: wday, label: wlabel }) => {
+    const ranges = Array.isArray(profile.day_windows?.[wday]) ? profile.day_windows[wday] : []
+    const accepted = allowedSet.has(wday)
+    const rangesHtml = ranges
+      .map((range, rangeIndex) => renderRangeRow(profileIndex, wday, rangeIndex, range))
+      .join("")
+    return `
+      <div class="queue-item" data-scheduling-weekday-row="${escapeHtml(key)}:${wday}">
+        <div class="inline-actions" style="justify-content: space-between; align-items: center;">
+          <label class="meta-chip">
+            <input type="checkbox" data-scheduling-weekday-toggle="${profileIndex}:${wday}" ${accepted ? "checked" : ""} />
+            <strong>${wlabel}</strong>
+            <span class="subtle">aceita agendamento</span>
+          </label>
+          <button class="button-ghost" type="button" data-scheduling-add-range="${profileIndex}:${wday}">${ICONS.plus}<span>janela</span></button>
+        </div>
+        <div class="scheduling-range-list" style="display:flex;flex-direction:column;gap:10px;margin-top:10px;">
+          ${rangesHtml || '<p class="subtle">Sem janelas cadastradas neste dia.</p>'}
+        </div>
+      </div>
+    `
+  }).join("")
+
+  return `
+    <article class="booking-card" data-scheduling-profile-card="${profileIndex}">
+      <div class="inline-actions" style="justify-content: space-between; align-items: center;">
+        <div>
+          <strong>${escapeHtml(label)}</strong>
+          <p class="subtle">key: <span class="tag">${escapeHtml(key)}</span></p>
+        </div>
+      </div>
+      <div class="form-grid-two" style="margin-top:12px;">
+        <div class="field">
+          <label>Duração padrão (min)</label>
+          <input type="number" min="5" step="5" data-scheduling-field="${profileIndex}:default_duration_minutes" value="${escapeHtml(String(defaultDuration))}" />
+        </div>
+        <div class="field">
+          <label>Antecedência mínima (min)</label>
+          <input type="number" min="0" step="5" data-scheduling-field="${profileIndex}:minimum_notice_minutes" value="${escapeHtml(String(minNotice))}" />
+        </div>
+      </div>
+      <div class="queue-stack" style="margin-top:14px;display:flex;flex-direction:column;gap:10px;">
+        ${weekdaysHtml}
+      </div>
+    </article>
+  `
+}
+
+function renderRangeRow(profileIndex, weekday, rangeIndex, rangeValue) {
+  const { startMin, endMin } = parseRangeString(rangeValue)
+  const dayMinutes = 24 * 60
+  const leftPct = (startMin / dayMinutes) * 100
+  const widthPct = Math.max(1, ((endMin - startMin) / dayMinutes) * 100)
+  const id = `${profileIndex}:${weekday}:${rangeIndex}`
+  return `
+    <div class="scheduling-range-row" data-scheduling-range="${id}" style="display:flex;align-items:center;gap:10px;">
+      <span class="tag" data-scheduling-range-label="${id}">${minutesToClock(startMin)} → ${minutesToClock(endMin)}</span>
+      <div class="scheduling-range-bar" data-scheduling-range-bar="${id}" style="position:relative;flex:1;height:28px;background:rgba(37,211,102,0.08);border:1px solid var(--border);border-radius:8px;touch-action:none;">
+        <div class="scheduling-range-fill" data-scheduling-range-fill="${id}" style="position:absolute;top:0;bottom:0;left:${leftPct}%;width:${widthPct}%;background:rgba(37,211,102,0.45);border-radius:6px;">
+          <div data-scheduling-range-handle="${id}:start" style="position:absolute;left:-6px;top:0;bottom:0;width:12px;cursor:ew-resize;background:rgba(0,0,0,0.2);border-radius:4px;"></div>
+          <div data-scheduling-range-handle="${id}:end" style="position:absolute;right:-6px;top:0;bottom:0;width:12px;cursor:ew-resize;background:rgba(0,0,0,0.2);border-radius:4px;"></div>
+        </div>
+      </div>
+      <button class="button-danger" type="button" data-scheduling-remove-range="${id}" title="Remover janela">${ICONS.trash}</button>
+    </div>
+  `
+}
+
 function renderAgendaView() {
+  const context = ensureSchedulingPolicy(state.companyContext || {})
+  state.companyContext = context
   const profile = state.calendarProfile || {}
   const integration = profile.integration || {}
   const bookings = state.calendarBookings || []
@@ -1482,6 +1699,8 @@ function renderAgendaView() {
         A agenda não fica escondida dentro do bot. Aqui você acompanha provider, disponibilidade, bookings, reagendamento, cancelamento e a fila que reduz faltas e ocupa vagas ociosas.
       </p>
     </section>
+
+    ${renderSchedulingPolicyEditor(context)}
 
     <section class="grid-three">
       ${renderMetricCard("Provider", integration.provider || "—", "Integração ativa no escopo atual.", "default", "spark")}
@@ -2550,7 +2769,168 @@ function bindFlowEvents() {
   }
 }
 
+function bindSchedulingPolicyEditorEvents() {
+  const toggle = document.getElementById("scheduling-policy-enabled")
+  if (toggle) {
+    toggle.addEventListener("change", () => {
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      context.scheduling_policy.enabled = !!toggle.checked
+      state.companyContext = context
+      renderApp()
+    })
+  }
+
+  const saveButton = document.getElementById("save-scheduling-policy")
+  if (saveButton) {
+    saveButton.addEventListener("click", async () => {
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      state.loading = true
+      state.loadingMessage = "Salvando política de agendamento..."
+      renderApp()
+      try {
+        const saved = await apiRequest("/admin/company-context", {
+          method: "PUT",
+          params: getCompanyContextParams(),
+          body: { data: context },
+        })
+        state.companyContext = ensureSchedulingPolicy(saved || context)
+        pushToast("Política de agendamento salva.")
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  document.querySelectorAll("[data-scheduling-field]").forEach((input) => {
+    input.addEventListener("change", () => {
+      const [profileIndexStr, fieldName] = String(input.dataset.schedulingField || "").split(":")
+      const profileIndex = Number(profileIndexStr)
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      const profile = context.scheduling_policy.profiles[profileIndex]
+      if (!profile) return
+      const value = Number(input.value || 0)
+      if (Number.isFinite(value) && value >= 0) {
+        profile[fieldName] = value
+      }
+      state.companyContext = context
+    })
+  })
+
+  document.querySelectorAll("[data-scheduling-weekday-toggle]").forEach((checkbox) => {
+    checkbox.addEventListener("change", () => {
+      const [profileIndexStr, weekday] = String(checkbox.dataset.schedulingWeekdayToggle || "").split(":")
+      const profileIndex = Number(profileIndexStr)
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      const profile = context.scheduling_policy.profiles[profileIndex]
+      if (!profile) return
+      const allowed = new Set((profile.allowed_weekdays || []).map((item) => String(item).toLowerCase()))
+      if (checkbox.checked) {
+        allowed.add(weekday)
+      } else {
+        allowed.delete(weekday)
+      }
+      profile.allowed_weekdays = WEEKDAY_DEFS.filter(({ key }) => allowed.has(key)).map(({ key }) => key)
+      state.companyContext = context
+    })
+  })
+
+  document.querySelectorAll("[data-scheduling-add-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const [profileIndexStr, weekday] = String(button.dataset.schedulingAddRange || "").split(":")
+      const profileIndex = Number(profileIndexStr)
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      const profile = context.scheduling_policy.profiles[profileIndex]
+      if (!profile) return
+      if (!Array.isArray(profile.day_windows[weekday])) {
+        profile.day_windows[weekday] = []
+      }
+      profile.day_windows[weekday].push("09:00-12:00")
+      const allowed = new Set((profile.allowed_weekdays || []).map((item) => String(item).toLowerCase()))
+      allowed.add(weekday)
+      profile.allowed_weekdays = WEEKDAY_DEFS.filter(({ key }) => allowed.has(key)).map(({ key }) => key)
+      state.companyContext = context
+      renderApp()
+    })
+  })
+
+  document.querySelectorAll("[data-scheduling-remove-range]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const [profileIndexStr, weekday, rangeIndexStr] = String(button.dataset.schedulingRemoveRange || "").split(":")
+      const profileIndex = Number(profileIndexStr)
+      const rangeIndex = Number(rangeIndexStr)
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      const profile = context.scheduling_policy.profiles[profileIndex]
+      if (!profile) return
+      const ranges = profile.day_windows[weekday]
+      if (!Array.isArray(ranges)) return
+      ranges.splice(rangeIndex, 1)
+      state.companyContext = context
+      renderApp()
+    })
+  })
+
+  document.querySelectorAll("[data-scheduling-range-handle]").forEach((handle) => {
+    handle.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return
+      const [profileIndexStr, weekday, rangeIndexStr, edge] = String(handle.dataset.schedulingRangeHandle || "").split(":")
+      const profileIndex = Number(profileIndexStr)
+      const rangeIndex = Number(rangeIndexStr)
+      const context = ensureSchedulingPolicy(state.companyContext || {})
+      const profile = context.scheduling_policy.profiles[profileIndex]
+      if (!profile) return
+      const ranges = profile.day_windows[weekday]
+      if (!Array.isArray(ranges) || !ranges[rangeIndex]) return
+      const bar = document.querySelector(`[data-scheduling-range-bar="${profileIndex}:${weekday}:${rangeIndex}"]`)
+      const fill = document.querySelector(`[data-scheduling-range-fill="${profileIndex}:${weekday}:${rangeIndex}"]`)
+      const label = document.querySelector(`[data-scheduling-range-label="${profileIndex}:${weekday}:${rangeIndex}"]`)
+      if (!bar || !fill) return
+      const rect = bar.getBoundingClientRect()
+      const dayMinutes = 24 * 60
+      let { startMin, endMin } = parseRangeString(ranges[rangeIndex])
+
+      try { handle.setPointerCapture(event.pointerId) } catch (_) {}
+      event.preventDefault()
+      event.stopPropagation()
+
+      const onMove = (moveEvent) => {
+        const ratio = Math.max(0, Math.min(1, (moveEvent.clientX - rect.left) / rect.width))
+        const rawMin = Math.round((ratio * dayMinutes) / 15) * 15
+        if (edge === "start") {
+          startMin = Math.max(0, Math.min(endMin - 15, rawMin))
+        } else {
+          endMin = Math.max(startMin + 15, Math.min(dayMinutes, rawMin))
+        }
+        const leftPct = (startMin / dayMinutes) * 100
+        const widthPct = Math.max(0.5, ((endMin - startMin) / dayMinutes) * 100)
+        fill.style.left = `${leftPct}%`
+        fill.style.width = `${widthPct}%`
+        if (label) {
+          label.textContent = `${minutesToClock(startMin)} → ${minutesToClock(endMin)}`
+        }
+      }
+
+      const onUp = () => {
+        handle.removeEventListener("pointermove", onMove)
+        handle.removeEventListener("pointerup", onUp)
+        handle.removeEventListener("pointercancel", onUp)
+        try { handle.releasePointerCapture(event.pointerId) } catch (_) {}
+        ranges[rangeIndex] = rangeToString(startMin, endMin)
+        state.companyContext = context
+      }
+
+      handle.addEventListener("pointermove", onMove)
+      handle.addEventListener("pointerup", onUp)
+      handle.addEventListener("pointercancel", onUp)
+    })
+  })
+}
+
 function bindAgendaEvents() {
+  bindSchedulingPolicyEditorEvents()
   document.querySelectorAll("[data-agenda-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       const mode = button.dataset.agendaMode
