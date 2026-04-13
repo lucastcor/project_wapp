@@ -1,36 +1,37 @@
 const STORAGE_KEY = "project-wapp-platform-config-v1"
 
+const ICONS = {
+  dashboard: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>',
+  studio: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>',
+  flow: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="6" height="6" rx="1.2"/><rect x="15" y="3" width="6" height="6" rx="1.2"/><rect x="9" y="15" width="6" height="6" rx="1.2"/><path d="M6 9v3h12V9"/><path d="M12 12v3"/></svg>',
+  calendar: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/></svg>',
+  contacts: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9.5" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
+  training: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 10v6M2 10l10-5 10 5-10 5z"/><path d="M6 12v5c3 3 9 3 12 0v-5"/></svg>',
+  plus: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+  trash: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>',
+  chevronLeft: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>',
+  chevronRight: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>',
+  zoomIn: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3M11 8v6M8 11h6"/></svg>',
+  zoomOut: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3M8 11h6"/></svg>',
+  fit: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V5a1 1 0 0 1 1-1h4M20 9V5a1 1 0 0 0-1-1h-4M4 15v4a1 1 0 0 0 1 1h4M20 15v4a1 1 0 0 1-1 1h-4"/></svg>',
+  send: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4z"/></svg>',
+  refresh: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.5 9a9 9 0 0 1 14.9-3.4L23 10M1 14l4.6 4.4A9 9 0 0 0 20.5 15"/></svg>',
+  clock: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
+  check: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
+  search: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg>',
+  spark: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></svg>',
+  target: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
+  handoff: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 11V7a5 5 0 0 0-10 0v4"/><rect x="5" y="11" width="14" height="10" rx="2"/></svg>',
+  tag: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4L13.4 20.6a2 2 0 0 1-2.8 0l-8.2-8.2V2h10.4l8.2 8.2a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/></svg>',
+}
+
 const NAV_ITEMS = [
-  {
-    key: "dashboard",
-    label: "Control Tower",
-    caption: "Readiness, métricas e postura operacional",
-  },
-  {
-    key: "studio",
-    label: "Bot Studio",
-    caption: "Teste conversas antes de colocar em produção",
-  },
-  {
-    key: "flows",
-    label: "Flow Studio",
-    caption: "Pipelines, playbooks e respostas aprovadas",
-  },
-  {
-    key: "agenda",
-    label: "Agenda Console",
-    caption: "Disponibilidade, bookings e fila de remanejamento",
-  },
-  {
-    key: "contacts",
-    label: "Contacts Desk",
-    caption: "Busca, perfil do cliente e notas operacionais",
-  },
-  {
-    key: "training",
-    label: "Training Ops",
-    caption: "Importação histórica, curadoria e fine-tuning",
-  },
+  { key: "dashboard", label: "Control Tower", caption: "Readiness e postura operacional", icon: "dashboard" },
+  { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
+  { key: "flows", label: "Flow Studio", caption: "Pipelines, playbooks e respostas", icon: "flow" },
+  { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
+  { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
+  { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
 ]
 
 const DEFAULT_PIPELINES = [
@@ -671,36 +672,47 @@ function renderSidebar() {
   return `
     <aside class="sidebar">
       <div class="brand-card">
-        <span class="brand-eyebrow">Project WAPP Platform</span>
-        <h2 class="brand-title">Operação premium para um bot que parece produto.</h2>
+        <div class="brand-logo">
+          <span class="brand-logo-mark">${ICONS.spark}</span>
+          <span>WAPP Platform</span>
+        </div>
+        <span class="brand-eyebrow">Premium Ops</span>
+        <h2 class="brand-title">Controle total do bot como produto.</h2>
         <p class="brand-copy">
-          Uma interface própria para testar, controlar agenda, curar comportamento e operar o atendimento em tempo real.
+          Teste, agenda, curadoria e operação em tempo real — em uma superfície só.
         </p>
       </div>
 
+      <div class="nav-section-label">Workspace</div>
       <nav class="nav-list">
         ${NAV_ITEMS.map(
           (item) => `
             <button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">
-              <span class="nav-label">${escapeHtml(item.label)}</span>
-              <span class="nav-caption">${escapeHtml(item.caption)}</span>
+              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
+              <span>
+                <span class="nav-label">${escapeHtml(item.label)}</span>
+                <span class="nav-caption">${escapeHtml(item.caption)}</span>
+              </span>
             </button>
           `
         ).join("")}
       </nav>
 
       <div class="sidebar-footnote">
-        A camada Streamlit continua disponível para contingência, mas a plataforma dedicada em <span class="mono">/platform</span> passa a ser a superfície principal de operação.
+        Streamlit continua como contingência. Superfície principal é <span class="mono">/platform</span>.
       </div>
     </aside>
   `
 }
 
-function renderMetricCard(label, value, caption, tone = "default") {
+function renderMetricCard(label, value, caption, tone = "default", iconKey = "dashboard") {
   const classes = tone === "warm" ? "metric-card card card-muted" : "metric-card card"
   return `
     <article class="${classes}">
-      <span class="metric-label">${escapeHtml(label)}</span>
+      <div class="metric-head">
+        <span class="metric-icon">${ICONS[iconKey] || ICONS.dashboard}</span>
+        <span class="metric-label">${escapeHtml(label)}</span>
+      </div>
       <div class="metric-value">${escapeHtml(value)}</div>
       <p class="metric-caption">${escapeHtml(caption)}</p>
     </article>
@@ -730,10 +742,10 @@ function renderDashboardView() {
     </section>
 
     <section class="grid-four">
-      ${renderMetricCard("Mensagens", formatNumber(totals.messages), "Volume já tratado pelo runtime atual.")}
-      ${renderMetricCard("Contatos", formatNumber(totals.contacts), "Base viva para perfil, memória e agenda.")}
-      ${renderMetricCard("Bookings", formatNumber(state.calendarBookings.length), "Reservas carregadas na visão atual.", "warm")}
-      ${renderMetricCard("Empresas", formatNumber(companyCount), "Escopos disponíveis nesta instância.")}
+      ${renderMetricCard("Mensagens", formatNumber(totals.messages), "Volume já tratado pelo runtime atual.", "default", "studio")}
+      ${renderMetricCard("Contatos", formatNumber(totals.contacts), "Base viva para perfil, memória e agenda.", "default", "contacts")}
+      ${renderMetricCard("Bookings", formatNumber(state.calendarBookings.length), "Reservas carregadas na visão atual.", "warm", "calendar")}
+      ${renderMetricCard("Empresas", formatNumber(companyCount), "Escopos disponíveis nesta instância.", "default", "tag")}
     </section>
 
     <section class="grid-two">
@@ -802,21 +814,17 @@ function renderDashboardView() {
           </div>
         </div>
         <div class="grid-two">
-          <button class="nav-button" data-view="studio">
-            <span class="nav-label">Testar cliente ou operador</span>
-            <span class="nav-caption">Simule agendamento, cancelamento, fila e agenda interna.</span>
+          <button class="card card-muted" data-view="studio" style="cursor:pointer;text-align:left;">
+            <div class="card-header"><div><h3 class="card-title">Testar cliente ou operador</h3><p class="card-copy">Simule agendamento, cancelamento e agenda interna.</p></div><span class="metric-icon">${ICONS.studio}</span></div>
           </button>
-          <button class="nav-button" data-view="flows">
-            <span class="nav-label">Editar pipelines</span>
-            <span class="nav-caption">Desenhe a forma como o bot conduz conversa e decisão.</span>
+          <button class="card card-muted" data-view="flows" style="cursor:pointer;text-align:left;">
+            <div class="card-header"><div><h3 class="card-title">Editar pipelines</h3><p class="card-copy">Desenhe a forma como o bot conduz a conversa.</p></div><span class="metric-icon">${ICONS.flow}</span></div>
           </button>
-          <button class="nav-button" data-view="agenda">
-            <span class="nav-label">Operar agenda</span>
-            <span class="nav-caption">Controle bookings, reagendamento e fila prioritária.</span>
+          <button class="card card-muted" data-view="agenda" style="cursor:pointer;text-align:left;">
+            <div class="card-header"><div><h3 class="card-title">Operar agenda</h3><p class="card-copy">Bookings, reagendamento e fila prioritária.</p></div><span class="metric-icon">${ICONS.calendar}</span></div>
           </button>
-          <button class="nav-button" data-view="training">
-            <span class="nav-label">Importar histórico</span>
-            <span class="nav-caption">Faça dry-run antes de promover base para treino.</span>
+          <button class="card card-muted" data-view="training" style="cursor:pointer;text-align:left;">
+            <div class="card-header"><div><h3 class="card-title">Importar histórico</h3><p class="card-copy">Faça dry-run antes de promover para treino.</p></div><span class="metric-icon">${ICONS.training}</span></div>
           </button>
         </div>
       </article>
