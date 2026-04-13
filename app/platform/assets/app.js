@@ -1258,12 +1258,12 @@ function renderMonthCalendar(bookings) {
   const header = `
     <div class="calendar-month-toolbar">
       <div class="calendar-month-nav">
-        <button type="button" class="button-ghost" data-month-nav="prev" aria-label="Mês anterior">‹</button>
+        <button type="button" class="button-icon" data-month-nav="prev" aria-label="Mês anterior">${ICONS.chevronLeft}</button>
         <strong class="calendar-month-label">${MONTH_NAMES_PT[month]} de ${year}</strong>
-        <button type="button" class="button-ghost" data-month-nav="next" aria-label="Próximo mês">›</button>
+        <button type="button" class="button-icon" data-month-nav="next" aria-label="Próximo mês">${ICONS.chevronRight}</button>
         <button type="button" class="button-ghost" data-month-nav="today">Hoje</button>
       </div>
-      <div class="calendar-mode-switch">
+      <div class="segmented">
         <button type="button" class="${state.agendaCalendar.mode === "month" ? "is-active" : ""}" data-agenda-mode="month">Mês</button>
         <button type="button" class="${state.agendaCalendar.mode === "week" ? "is-active" : ""}" data-agenda-mode="week">Semana</button>
       </div>
@@ -1484,9 +1484,9 @@ function renderAgendaView() {
     </section>
 
     <section class="grid-three">
-      ${renderMetricCard("Provider", escapeHtml(integration.provider || "—"), "Integração ativa no escopo atual.")}
-      ${renderMetricCard("Bookings", formatNumber(bookings.length), "Reservas visíveis no escopo selecionado.")}
-      ${renderMetricCard("Fila ativa", formatNumber(queueEntries.length), "Clientes esperando encaixe ou antecipação.", "warm")}
+      ${renderMetricCard("Provider", integration.provider || "—", "Integração ativa no escopo atual.", "default", "spark")}
+      ${renderMetricCard("Bookings", formatNumber(bookings.length), "Reservas visíveis no escopo selecionado.", "default", "calendar")}
+      ${renderMetricCard("Fila ativa", formatNumber(queueEntries.length), "Clientes esperando encaixe ou antecipação.", "warm", "clock")}
     </section>
 
     <section class="card">
@@ -1501,7 +1501,7 @@ function renderAgendaView() {
         ? renderMonthCalendar(bookings)
         : `<div class="calendar-month-toolbar">
              <div class="calendar-month-nav"><strong class="calendar-month-label">Semana atual</strong></div>
-             <div class="calendar-mode-switch">
+             <div class="segmented">
                <button type="button" class="${state.agendaCalendar.mode === "month" ? "is-active" : ""}" data-agenda-mode="month">Mês</button>
                <button type="button" class="${state.agendaCalendar.mode === "week" ? "is-active" : ""}" data-agenda-mode="week">Semana</button>
              </div>
@@ -1726,13 +1726,20 @@ function renderAgendaView() {
   `
 }
 
+function contactInitials(contact) {
+  const name = (contact.contact_name || contact.contact_id || "?").trim()
+  const parts = name.split(/\s+/)
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase()
+  return name.slice(0, 2).toUpperCase()
+}
+
 function renderContactsView() {
   return `
     <section class="hero">
       <span class="brand-eyebrow">Contacts Desk</span>
-      <h2 class="hero-title">Contexto do contato limpo deixa o bot mais preciso e a operação menos cega.</h2>
+      <h2 class="hero-title">Base de contatos limpa deixa o bot preciso e a operação menos cega.</h2>
       <p class="hero-copy">
-        Aqui você pesquisa por nome ou telefone, corrige identificação, define customer_profile e adiciona notas úteis para decisão humana e automação.
+        Pesquise, corrija identificação, defina customer_profile e registre notas úteis para decisão humana e automação.
       </p>
     </section>
 
@@ -1740,8 +1747,9 @@ function renderContactsView() {
       <div class="section-header">
         <div>
           <h3 class="section-title">Busca e atualização</h3>
-          <p class="section-copy">Use parte do nome, número ou o contato completo.</p>
+          <p class="section-copy">Nome, número ou contato completo — o filtro é tolerante.</p>
         </div>
+        <span class="tag">${formatNumber(state.contacts.length)} contatos</span>
       </div>
       <form id="contact-search-form" class="form-grid-two">
         <div class="field">
@@ -1749,44 +1757,60 @@ function renderContactsView() {
           <input name="search" value="${escapeHtml(state.drafts.contactSearch)}" placeholder="Ex.: Maria, 5511..." />
         </div>
         <div class="inline-actions" style="align-self: end;">
-          <button class="button" type="submit">Buscar</button>
-          <button class="button-ghost" type="button" id="clear-contact-search">Limpar</button>
+          <button class="button" type="submit">${ICONS.search}<span>Buscar</span></button>
+          <button class="button-ghost" type="button" id="clear-contact-search">${ICONS.refresh}<span>Limpar</span></button>
         </div>
       </form>
     </section>
 
-    <section class="contact-stack">
+    <section class="card">
+      <div class="section-header">
+        <div>
+          <h3 class="section-title">Base de contatos</h3>
+          <p class="section-copy">Clique num contato para expandir edição inline.</p>
+        </div>
+      </div>
       ${
         state.contacts.length
-          ? state.contacts
-              .map(
-                (contact) => `
-                  <article class="contact-card">
-                    <strong>${escapeHtml(contact.contact_name || "Sem nome")} · ${escapeHtml(contact.contact_id || "—")}</strong>
-                    <p>Pipeline: ${escapeHtml(contact.pipeline_stage || "—")} · Última classificação: ${escapeHtml(contact.last_classification || "—")}</p>
-                    <form class="form-grid" data-contact-update="${escapeHtml(contact.contact_id)}" style="margin-top: 14px;">
-                      <div class="form-grid-two">
-                        <div class="field">
-                          <label>Nome do contato</label>
-                          <input name="contact_name" value="${escapeHtml(contact.contact_name || "")}" />
-                        </div>
-                        <div class="field">
-                          <label>Customer profile</label>
-                          <input name="customer_profile" value="${escapeHtml(contact.customer_profile || "")}" />
-                        </div>
-                      </div>
-                      <div class="field">
-                        <label>Notas operacionais</label>
-                        <textarea name="notes">${escapeHtml(contact.notes || "")}</textarea>
-                      </div>
-                      <div class="inline-actions">
-                        <button class="button-ghost" type="submit">Atualizar contato</button>
-                      </div>
-                    </form>
-                  </article>
-                `
-              )
-              .join("")
+          ? `<div class="contact-grid">${state.contacts.map((contact) => `
+              <details class="contact-row" data-contact-details="${escapeHtml(contact.contact_id)}">
+                <summary class="contact-row" style="display:grid;grid-template-columns:44px minmax(0,2fr) repeat(2, minmax(0,1fr)) 20px;gap:16px;align-items:center;cursor:pointer;list-style:none;padding:0;border:0;background:transparent;">
+                  <div class="contact-avatar">${escapeHtml(contactInitials(contact))}</div>
+                  <div class="contact-name">
+                    <strong>${escapeHtml(contact.contact_name || "Sem nome")}</strong>
+                    <span>${escapeHtml(contact.contact_id || "—")}</span>
+                  </div>
+                  <div class="contact-meta-cell">
+                    <span>Pipeline</span>
+                    <strong>${escapeHtml(contact.pipeline_stage || "—")}</strong>
+                  </div>
+                  <div class="contact-meta-cell">
+                    <span>Perfil</span>
+                    <strong>${escapeHtml(contact.customer_profile || "—")}</strong>
+                  </div>
+                  <span class="subtle">${ICONS.chevronRight}</span>
+                </summary>
+                <form class="form-grid" data-contact-update="${escapeHtml(contact.contact_id)}" style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--border);">
+                  <div class="form-grid-two">
+                    <div class="field">
+                      <label>Nome do contato</label>
+                      <input name="contact_name" value="${escapeHtml(contact.contact_name || "")}" />
+                    </div>
+                    <div class="field">
+                      <label>Customer profile</label>
+                      <input name="customer_profile" value="${escapeHtml(contact.customer_profile || "")}" />
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label>Notas operacionais</label>
+                    <textarea name="notes">${escapeHtml(contact.notes || "")}</textarea>
+                  </div>
+                  <div class="inline-actions">
+                    <button class="button-ghost" type="submit">${ICONS.check}<span>Atualizar contato</span></button>
+                  </div>
+                </form>
+              </details>
+            `).join("")}</div>`
           : '<div class="empty-state">Nenhum contato carregado ainda para o escopo atual.</div>'
       }
     </section>
@@ -1808,9 +1832,9 @@ function renderTrainingView() {
     </section>
 
     <section class="grid-three">
-      ${renderMetricCard("Curados", formatNumber(curation.total_curated_examples), "Exemplos aprovados e elegíveis no escopo atual.")}
-      ${renderMetricCard("Train", formatNumber(split.train_examples), "Volume atual de treino após split.")}
-      ${renderMetricCard("Ready", readiness.is_ready_for_finetuning ? "Sim" : "Não", "Situação atual de prontidão para fine-tuning.", "warm")}
+      ${renderMetricCard("Curados", formatNumber(curation.total_curated_examples), "Exemplos aprovados e elegíveis no escopo atual.", "default", "check")}
+      ${renderMetricCard("Train", formatNumber(split.train_examples), "Volume atual de treino após split.", "default", "training")}
+      ${renderMetricCard("Ready", readiness.is_ready_for_finetuning ? "Sim" : "Não", "Situação atual de prontidão para fine-tuning.", "warm", "spark")}
     </section>
 
     <section class="grid-two">
@@ -1860,8 +1884,8 @@ function renderTrainingView() {
             <label class="meta-chip"><input name="auto_promote_eligible_examples" type="checkbox" ${state.drafts.trainingImport.autoPromoteEligibleExamples ? "checked" : ""} /> Auto-promover elegíveis</label>
           </div>
           <div class="toolbar-row">
-            <button class="button" type="submit">Executar importação</button>
-            <button class="button-ghost" type="button" id="refresh-training-data">Atualizar relatório</button>
+            <button class="button" type="submit">${ICONS.send}<span>Executar importação</span></button>
+            <button class="button-ghost" type="button" id="refresh-training-data">${ICONS.refresh}<span>Atualizar relatório</span></button>
           </div>
         </form>
       </article>
@@ -1872,7 +1896,7 @@ function renderTrainingView() {
             <h3 class="section-title">Dataset review e jobs</h3>
             <p class="section-copy">Leitura rápida do que está pronto e do histórico recente de fine-tuning.</p>
           </div>
-          <button class="button-ghost" id="create-finetuning-job">Criar job</button>
+          <button class="button-ghost" id="create-finetuning-job">${ICONS.plus}<span>Criar job</span></button>
         </div>
 
         <div class="job-stack">

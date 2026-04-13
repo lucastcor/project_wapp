@@ -1,105 +1,124 @@
-# Melhorias Frontend + Agenda — 2026-04-12
+# Refactor Frontend Platform — 2026-04-12 → 2026-04-13
 
-Pass focado nas duas dores relatadas pelo produto: Flow Studio piscando ao arrastar nós e Agenda Console sem um calendário "de verdade". Tudo aplicado na plataforma dedicada em `app/platform/` (SPA vanilla servida pelo FastAPI), sem introduzir framework.
+Pass completo de UX/UI na plataforma dedicada em `app/platform/`. O objetivo era
+sair do visual utilitário e chegar em algo à altura de produtos premium de
+WhatsApp Business, mantendo o stack vanilla JS + FastAPI.
 
-## 1. Flow Studio — drag agora é estável e profissional
+## Fase A — Refactor visual completo (concluída)
 
-### Diagnóstico
-O handler de drag de nós em `bindFlowEvents()` (`app/platform/assets/app.js`) re-renderizava o SPA inteiro a cada `pointermove` (`renderApp()` dentro do `onMove`). Resultado: flicker, inputs do inspector perdendo foco, conexões tremendo, latência perceptível. Havia também um `click` separado sobrepondo o `pointerdown`, então um clique que "acontecia de ser um drag pequeno" disparava seleção duplicada.
+### 1. Novo design system (`app/platform/assets/styles.css`)
 
-### O que foi feito
-`app/platform/assets/app.js`:
-- Removido o handler de `click` redundante. O `pointerdown` agora é o único ponto de entrada.
-- Pointer capture via `setPointerCapture`, `pointermove/pointerup/pointercancel` no próprio botão — não perde o evento se o cursor sair da área.
-- Threshold de 4 px antes de considerar drag (clique "puro" continua funcionando para selecionar a etapa).
-- Durante o drag:
-  - O nó é movido **diretamente via DOM** (`button.style.left/top`) — zero re-render.
-  - As conexões SVG são atualizadas **in place** recalculando apenas o atributo `d` das paths afetadas. Para isso cada `<path>` ganhou `data-edge-source`/`data-edge-target` em `renderFlowCanvas()`, e uma função `updateEdgePathsForKey()` reescreve só as paths conectadas ao nó arrastado.
-  - O inspector (`#pipeline-inspector-form`) tem seus campos `canvas_x`/`canvas_y` sincronizados via atribuição direta — sem re-render, sem perda de foco.
-- `renderApp()` só é chamado uma vez ao final, e apenas se a seleção mudou.
-- `event.preventDefault()` no `pointerdown` evita o click fantasma depois do pointerup.
+Reescrito do zero (~1900 linhas) com:
 
-`app/platform/assets/styles.css`:
-- `.flow-node` ganhou `touch-action: none` (mobile/tablet param de agora em diante arrasta sem scroll).
-- Classe `.flow-node.dragging` adiciona sombra, `z-index`, `user-select: none` e desativa transição para feedback limpo.
-- Transições de hover/seleção mantidas fora do drag.
+- **Tokens de design** — paleta WhatsApp (`--brand: #25d366`, `--accent: #1fd2bd`),
+  surface em camadas (`--surface-2`, `--surface-3`, `--bg-0`), sistema de sombras
+  e easing curves consistentes.
+- **Tipografia** — Sora (headings) + IBM Plex Sans (body) + mono para tokens.
+- **Componentes** — shell, sidebar com ícones, topbar, pills, tags, cards,
+  hero, grids (2/3/4), metric-cards com ícone, forms, segmented, tab-bar,
+  chat bubble, timeline, spotlight, empty-state.
+- **Flow Studio** — `.flow-layout` 3 colunas (palette + canvas + inspector),
+  `.flow-canvas-inner` 2400×1600 escalável via transform, `.flow-node-head`
+  com ícone e kicker, edges SVG com filter drop-shadow.
+- **Calendário** — `.calendar-month-*` (grid mensal com chips de booking e
+  painel de detalhe) + `.calendar-board` (timeline semanal existente).
+- **Contacts** — `.contact-grid` com `.contact-row` (avatar + nome + pipeline +
+  perfil em grid responsivo).
+- **Breakpoints** — 1400px (flow compacta), 1200px (sidebar horizontal),
+  900px (single column).
 
-### Resultado
-- Drag fluido (60fps) mesmo com vários nós e conexões.
-- Inputs do inspector não perdem mais o foco durante edição.
-- Clicar no nó continua selecionando; só sai do modo seleção se o usuário realmente arrastar.
+### 2. `app/platform/assets/app.js`
 
-## 2. Agenda Console — calendário mensal de verdade + toggle Mês/Semana
+Refactorado tela por tela, preservando state shape, API layer (`apiRequest`)
+e loaders. Mudanças principais:
 
-### Diagnóstico
-A agenda só tinha a "timeline semanal" (grade horária). Faltava a visão panorâmica do mês que toda operação premium espera: "o que tenho dia X?", "quantos clientes na terça?", "quero ver a semana inteira do mês anterior".
+- **Library de ícones inline** — objeto `ICONS` com 21 SVGs usados em sidebar,
+  metric cards, toolbar, botões e flow nodes.
+- **Sidebar** — brand card com `.brand-logo` + mark, nav buttons agora com
+  `.nav-icon` no grid 36px + label.
+- **Control Tower** — metric cards ganham `.metric-head` com ícone; quick
+  actions viram cards próprios (deixam de reusar `.nav-button`).
+- **Bot Studio** — mantém a estrutura de chat bubble; botão send com ícone.
+- **Flow Studio** — refactor estrutural:
+  - `FLOW_NODE_TEMPLATES` com categorias (Entrada, Agenda, Conversão,
+    Escalonamento) e defaults pré-preenchidos.
+  - Palette à esquerda com click-to-add.
+  - Canvas em `.flow-canvas-card` com toolbar de zoom (in/out/fit) e
+    percent readout.
+  - Canvas interno fixo 2400×1600 com `transform: scale(zoom)`; drag logic
+    divide delta do pointer pelo zoom para manter 1:1 com o cursor.
+  - Nós redesenhados: `.flow-node-head` com ícone auto-selecionado pela key,
+    footer com chips de transição/triggers.
+  - Keys auto-geradas derivam do label (em vez de `stage_N`).
+- **Agenda Console** — mode switch month/week agora usa `.segmented`, nav
+  buttons viraram `.button-icon` com chevrons SVG, metric cards com ícones.
+- **Contacts Desk** — base de contatos virou `.contact-grid` de `.contact-row`
+  (avatar com iniciais + nome + pipeline + perfil em grid). Edição inline via
+  `<details>` nativo, sem precisar de state de seleção.
+- **Training Ops** — ícones nas metric cards e botões de ação.
 
-### O que foi feito
-`app/platform/assets/app.js`:
-- Novo estado `state.agendaCalendar` com `mode` (`month|week`), `monthCursor` (primeiro dia do mês, ISO) e `selectedDay`.
-- Helpers de data puros (sem dependência): `parseDateKey`, `formatDateKey`, `formatTimeHM`, `groupBookingsByDay`.
-- Nova função `renderMonthCalendar(bookings)` que desenha:
-  - **Toolbar** com navegação ‹ mês › , label "Mês de Ano" e botão **Hoje**.
-  - **Switch Mês/Semana** no canto direito.
-  - **Grade 7×N** (6 semanas na maioria dos meses) com dias fora do mês em opacidade reduzida, indicador de "hoje" e célula selecionada.
-  - Cada célula mostra até 3 chips de agendamento (hora + cliente/título) + contador "+N mais".
-  - **Painel de detalhe** abaixo do grid: ao clicar num dia, lista **todos os atendimentos daquele dia** com horário, título, contato e perfil. Esse era o pedido central: "mostrando clientes naquele dia".
-- `renderAgendaView()` agora escolhe entre `renderMonthCalendar` (padrão) e a timeline semanal existente baseado em `state.agendaCalendar.mode`.
-- `bindAgendaEvents()` recebeu três bindings novos: `data-agenda-mode`, `data-month-nav` (prev/next/today) e `data-month-day`.
+### 3. Validação
 
-`app/platform/assets/styles.css`:
-- Bloco completo `.calendar-month-*` — grid responsivo, chips, indicador de "hoje", célula selecionada, painel de detalhe.
-- Media query até 900px: células compactas, chip só com horário, lista do dia em coluna única.
+- `node --check` passa em `app.js`.
+- Commits por tela (`cb92db7` checkpoint → `4fb1c8d` shell/dashboard →
+  `ec91d5a` flow studio → commits subsequentes) — cada um revertível.
+- Feedback visual no navegador pendente (checklist abaixo).
 
-### Resultado
-- Abrindo Agenda Console, você vê imediatamente o mês inteiro com a carga de clientes por dia.
-- Um clique no dia abre a lista vertical completa (horário, título, contato, perfil).
-- Navegação por mês é instantânea (opera só sobre `state.calendarBookings` já carregado).
-- Toggle "Semana" mantém a timeline existente para quem precisa do zoom horário.
-
-## 3. Pontos de melhoria de backend recomendados (não aplicados neste pass)
-
-Identificados durante a leitura, mas deixados para decisão sua antes de mexer — alguns afetam contratos de API.
-
-1. **`GET /admin/calendar/bookings` aceitar `from`/`to`.** Hoje `loadAgendaData()` puxa a lista inteira sem recorte. Para empresas com milhares de bookings isso vai escalar mal quando a base crescer. Sugestão: parâmetros `from_date`/`to_date` (opcionais) e `limit` default 500. O frontend já estaria pronto para passar janelas alinhadas ao mês visível.
-2. **Endpoint `GET /admin/calendar/month-summary?year&month`.** Seria um colega de `/admin/calendar/timeline`, devolvendo `{ date, bookings_count, profiles_breakdown }` por dia. Permite construir heatmap de ocupação sem trazer payload completo.
-3. **`calendar_service.get_calendar_timeline` — range parameterizável.** O cliente passa `days=7` fixo. Expor `start_date`/`end_date` permitiria usar a mesma timeline como "semana do mês visível" ao navegar no calendário.
-4. **Paginação real em `/admin/contacts`.** Hoje o frontend força `limit=80`. Quando a base crescer vai faltar cursor/offset e contador total.
-5. **WebSocket / SSE para Control Tower e Agenda.** O dashboard faz fetch a cada abertura de view; um canal push (`/ws/operations`) permitiria refletir bookings novos e dispatches outbound sem o usuário recarregar.
-6. **Índice composto `(company_id, starts_at)` em `appointment_bookings`.** Valeria validar no `EXPLAIN` — crítico para o endpoint acima com `from/to`.
-7. **`conversation_pipelines` — salvamento otimista por etapa.** Hoje o Flow Studio só persiste via `PUT /admin/company-context` inteiro. Um `PATCH /admin/company-context/pipelines/{key}` evitaria race-conditions quando múltiplos operadores editarem.
-8. **Rate limit no `POST /messages/incoming` simulado do Bot Studio.** Quando subir em produção e o webhook real chegar no mesmo endpoint, operadores testando à vontade podem bater no runtime real.
-9. **Validação de `next_keys` com sugestões.** O backend já valida unicidade e referências; adicionar `409` com lista de `suggested_keys` ajudaria a UI do Flow Studio a oferecer auto-correção.
-10. **Teste E2E leve do Flow Studio e do calendário mensal.** Playwright/selenium cobrindo "arrastar nó não quebra canvas" e "clicar num dia carrega detalhe". Baratinho e impede regressão.
-
-## 4. Arquivos tocados
-
-```
-app/platform/assets/app.js      # drag Flow Studio + calendário mensal + helpers
-app/platform/assets/styles.css  # .flow-node.dragging + .calendar-month-*
-docs/frontend_improvements_2026-04-12.md  # este arquivo
-```
-
-## 5. Como validar localmente
+### Checklist para validar no navegador
 
 ```bash
-# subir a API
 uvicorn app.main:app --reload
-# abrir
 open http://127.0.0.1:8000/platform
 ```
 
-Checklist rápido:
-- [ ] Flow Studio → arrastar qualquer nó: deve deslizar sem piscar e sem perder foco do inspector.
-- [ ] Flow Studio → clicar (sem arrastar) num nó: seleciona e mostra no inspector.
-- [ ] Flow Studio → as linhas (conexões) acompanham o nó em tempo real durante o drag.
-- [ ] Agenda Console → abre no modo **Mês**, com navegação ‹/›/Hoje.
-- [ ] Agenda Console → clicar num dia abre o detalhe vertical com os clientes daquele dia.
-- [ ] Agenda Console → toggle "Semana" volta para a timeline horária existente.
-- [ ] Responsivo: em < 900px o grid mensal compacta e a lista do dia vira coluna única.
+- [ ] Sidebar com ícones, nav buttons em grid 36px+label
+- [ ] Control Tower com metric cards iconados e quick action tiles
+- [ ] Bot Studio: chat bubble funcionando, send com ícone
+- [ ] Flow Studio: palette 3-col, click em template adiciona nó, zoom in/out/fit
+- [ ] Flow Studio: drag de nó respeita zoom (sem descolar do cursor)
+- [ ] Agenda: toggle mês/semana via segmented, chevrons SVG
+- [ ] Agenda: clicar num dia do mês mostra clientes agendados
+- [ ] Contacts: linhas com avatar, clicar expande edição inline
+- [ ] Training Ops: cards iconados, botões com ícones
 
-## 6. Decisões que valem revisão
+## Fase B em diante (não executada nesta sessão)
 
-- O modo padrão da agenda virou **Mês**. Se o uso operacional do dia-a-dia for mais forte na timeline, é 1 linha para voltar ao default `week`.
-- Os chips no calendário mensal mostram `title || contact_id`. Se o contato tiver display name no futuro (`contact.display_name`), trocar para ele.
-- O calendário mensal lê `state.calendarBookings`. Se o recorte de bookings for limitado no backend, o mês pode aparecer incompleto — por isso o item #1 do backend acima é o mais importante para escalar.
+Acordadas com o usuário para sessões futuras:
+
+### Fase B — Agenda: scheduling toggle + janela de horário
+- Backend novo: `PUT /admin/calendar/scheduling-config` com
+  `{enabled, windows_by_weekday, slot_duration_minutes}`
+- Persistência: provavelmente em `company_context.scheduling` ou nova tabela
+- Validação no `calendar_service.query_availability` para respeitar a janela
+- Frontend: toggle no topo da Agenda + editor de janela por dia da semana
+
+### Fase C — Drag-to-resize da janela + booking manual com confirmação
+- Drag handles nas bordas do slot no timeline semanal
+- `POST /admin/calendar/bookings` com flag `request_bot_confirmation`
+- Reuso do outbound dispatcher para enviar mensagem de confirmação
+
+### Fase D — Bot Studio com sessões de chat
+- Tabela `platform_chat_sessions` ou reuso de contato fixo por sessão
+- Endpoints `GET/POST /admin/studio/sessions`
+- UI: lista lateral de sessões + chat persistente sem reinserir contact_id
+
+### Fase E — Contacts: busca avançada
+- Query params em `GET /admin/contacts`: filtro por pipeline_stage,
+  customer_profile, last_activity_range, search
+- UI: chips de filtro no topo
+
+### Fase F — Flow Studio fluidez + instruções, Training Ops revisão,
+fila de prioridade review
+- Otimizar redraw de edges durante drag (possivelmente usar
+  `requestAnimationFrame` ou mover SVG para camada separada)
+- Onboarding tour / tooltips no Flow Studio
+- Revisar `appointment_queue_service` e melhorar se necessário
+
+## Arquivos tocados nesta fase
+
+```
+app/platform/assets/styles.css    # reescrito completo
+app/platform/assets/app.js        # icons + refactor tela a tela
+docs/frontend_improvements_2026-04-12.md   # este arquivo
+docs/platform_frontend_guide.md   # mapeamento de telas ↔ endpoints (anterior)
+```
