@@ -1,18 +1,29 @@
 import logging
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from app.api.schemas import (
     AppointmentBookingPayload,
+    AppointmentBookingCancellationPayload,
+    AppointmentBookingReschedulePayload,
+    AppointmentQueueEntryPayload,
+    AppointmentQueueOfferResponsePayload,
     CalendarAvailabilityQueryPayload,
     CalendarIntegrationPayload,
     CompanyContextPayload,
     CompanyCreatePayload,
     CompanyResponse,
+    ContactUpdatePayload,
     InternalReminderPayload,
     MessageExampleCreatePayload,
     PendingQuestionAnswerPayload,
+    TrainingImportPayload,
 )
+from app.api.admin_security import (
+    build_require_admin_access,
+    build_require_admin_role,
+)
+from app.api.admin_support import build_prometheus_metrics, record_audit_event
 
 from app.storage.repository import RuntimeRepository
 
@@ -36,6 +47,7 @@ from app.services.training_export_service import (
     export_training_review_report_as_json,
     export_training_split_as_json,
 )
+from app.services.training_import_service import TrainingImportError, import_training_records
 
 from app.services.outbound_dispatch_service import (
     OutboundDispatchError,
@@ -49,13 +61,16 @@ from app.services.system_readiness_service import (
 )
 from app.services.calendar_service import (
     CalendarProviderError,
+    cancel_calendar_booking,
     create_calendar_booking,
     create_calendar_integration,
     get_calendar_bookings,
     get_calendar_integrations,
     get_calendar_profile,
+    get_calendar_timeline,
     list_supported_calendar_providers,
     query_calendar_availability,
+    reschedule_calendar_booking,
 )
 from app.services.reminder_service import (
     ReminderServiceError,
@@ -63,91 +78,30 @@ from app.services.reminder_service import (
     dispatch_due_reminders,
     list_reminders,
 )
+from app.services.appointment_queue_service import (
+    AppointmentQueueError,
+    create_queue_entry,
+    list_queue_entries,
+    list_queue_offers,
+    release_booking_slot,
+    respond_to_queue_offer,
+)
 
 from app.core.config import settings
 from app.services.finetuning_service import FineTuningError, FineTuningService
-from app.core.logging import get_logger, get_request_context, log_event
+from app.core.logging import get_logger, log_event
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
-ADMIN_ROLE_HIERARCHY = {
-    "viewer": 1,
-    "operator": 2,
-    "superadmin": 3,
-}
+_build_prometheus_metrics = build_prometheus_metrics
 
 
 def _get_finetuning_service() -> FineTuningService:
     return FineTuningService()
 
 
-def _extract_bearer_token(authorization: str | None) -> str | None:
-    if not authorization:
-        return None
-
-    normalized = authorization.strip()
-    if not normalized.lower().startswith("bearer "):
-        return None
-
-    token = normalized[7:].strip()
-    return token or None
-
-
-def _get_role_token_map() -> dict[str, str]:
-    role_token_map: dict[str, str] = {}
-
-    if settings.admin_viewer_token:
-        role_token_map["viewer"] = settings.admin_viewer_token.strip()
-    if settings.admin_operator_token:
-        role_token_map["operator"] = settings.admin_operator_token.strip()
-
-    superadmin_token = (
-        settings.admin_superadmin_token.strip()
-        if settings.admin_superadmin_token
-        else None
-    )
-    fallback_superadmin_token = (
-        settings.admin_api_token.strip()
-        if settings.admin_api_token
-        else None
-    )
-    if superadmin_token:
-        role_token_map["superadmin"] = superadmin_token
-    elif fallback_superadmin_token:
-        role_token_map["superadmin"] = fallback_superadmin_token
-
-    return role_token_map
-
-
-def _build_prometheus_metrics(summary: dict) -> str:
-    lines: list[str] = []
-
-    def add_metric(name: str, value: int, labels: dict[str, str] | None = None) -> None:
-        if labels:
-            label_text = ",".join(f'{key}="{value_}"' for key, value_ in labels.items())
-            lines.append(f"{name}{{{label_text}}} {value}")
-        else:
-            lines.append(f"{name} {value}")
-
-    for key, value in summary.get("totals", {}).items():
-        add_metric("project_wapp_total", int(value), {"entity": str(key)})
-
-    grouped_metric_map = {
-        "pending_questions_by_status": ("project_wapp_pending_questions", "status"),
-        "outbound_by_status": ("project_wapp_outbound_messages", "status"),
-        "knowledge_by_status": ("project_wapp_knowledge_entries", "status"),
-        "messages_by_classification": ("project_wapp_messages_by_classification", "classification"),
-        "messages_by_action": ("project_wapp_messages_by_action", "action"),
-        "messages_by_reply_source": ("project_wapp_messages_by_reply_source", "reply_source"),
-        "companies_by_status": ("project_wapp_companies", "status"),
-        "audit_events_by_status": ("project_wapp_audit_events", "status"),
-    }
-
-    for summary_key, (metric_name, label_name) in grouped_metric_map.items():
-        for group_key, count in summary.get(summary_key, {}).items():
-            add_metric(metric_name, int(count), {label_name: str(group_key)})
-
-    return "\n".join(lines) + "\n"
+def _get_repository() -> RuntimeRepository:
+    return repository
 
 
 def _record_audit_event(
@@ -160,122 +114,31 @@ def _record_audit_event(
     status: str = "success",
     metadata: dict | None = None,
 ) -> None:
-    actor_id = getattr(request.state, "admin_actor", "admin")
-    request_id = get_request_context().get("request_id")
-    repository.create_audit_event(
-        actor_id=actor_id,
+    record_audit_event(
+        request=request,
         action=action,
         resource_type=resource_type,
+        repository_getter=_get_repository,
         resource_id=resource_id,
         company_id=company_id,
         status=status,
-        request_id=str(request_id) if request_id else None,
         metadata=metadata or {},
     )
 
 
-def require_admin_access(
-    request: Request,
-    authorization: str | None = Header(default=None),
-    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
-    x_admin_actor: str | None = Header(default=None, alias="X-Admin-Actor"),
-) -> None:
-    actor = (x_admin_actor or "admin").strip() or "admin"
-    request.state.admin_actor = actor
-    request.state.admin_role = "superadmin"
-
-    if not settings.enable_admin_auth:
-        request.state.admin_auth_mode = "disabled"
-        return
-
-    role_token_map = _get_role_token_map()
-    provided_token = x_admin_token or _extract_bearer_token(authorization)
-
-    if not role_token_map:
-        log_event(
-            logger,
-            logging.ERROR,
-            "admin.auth.misconfigured",
-            actor_id=actor,
-        )
-        repository.create_audit_event(
-            actor_id=actor,
-            action="authenticate",
-            resource_type="admin_access",
-            status="misconfigured",
-            request_id=str(get_request_context().get("request_id") or ""),
-            metadata={"reason": "missing_admin_role_tokens"},
-        )
-        raise HTTPException(
-            status_code=500,
-            detail="Admin authentication is enabled but no admin tokens are configured.",
-        )
-
-    resolved_role = None
-    for role, configured_token in role_token_map.items():
-        if provided_token == configured_token:
-            resolved_role = role
-            break
-
-    if resolved_role is None:
-        log_event(
-            logger,
-            logging.WARNING,
-            "admin.auth.failed",
-            actor_id=actor,
-        )
-        repository.create_audit_event(
-            actor_id=actor,
-            action="authenticate",
-            resource_type="admin_access",
-            status="failed",
-            request_id=str(get_request_context().get("request_id") or ""),
-            metadata={"reason": "invalid_admin_credentials"},
-        )
-        raise HTTPException(status_code=401, detail="Invalid admin credentials.")
-
-    request.state.admin_auth_mode = "token"
-    request.state.admin_role = resolved_role
-    log_event(
-        logger,
-        logging.INFO,
-        "admin.auth.succeeded",
-        actor_id=actor,
-        auth_mode="token",
-        admin_role=resolved_role,
-    )
+require_admin_access = build_require_admin_access(
+    settings_obj=settings,
+    logger=logger,
+    repository_getter=_get_repository,
+)
 
 
 def require_admin_role(required_role: str):
-    def dependency(request: Request) -> None:
-        current_role = getattr(request.state, "admin_role", "viewer")
-        current_weight = ADMIN_ROLE_HIERARCHY.get(current_role, 0)
-        required_weight = ADMIN_ROLE_HIERARCHY.get(required_role, 0)
-        if current_weight >= required_weight:
-            return
-
-        log_event(
-            logger,
-            logging.WARNING,
-            "admin.authorization.denied",
-            actor_id=getattr(request.state, "admin_actor", "admin"),
-            current_role=current_role,
-            required_role=required_role,
-        )
-        repository.create_audit_event(
-            actor_id=getattr(request.state, "admin_actor", "admin"),
-            action="authorize",
-            resource_type="admin_access",
-            status="denied",
-            request_id=str(get_request_context().get("request_id") or ""),
-            metadata={
-                "current_role": current_role,
-                "required_role": required_role,
-            },
-        )
-        raise HTTPException(status_code=403, detail="Insufficient admin privileges.")
-
-    return dependency
+    return build_require_admin_role(
+        required_role,
+        logger=logger,
+        repository_getter=_get_repository,
+    )
 
 
 admin_router = APIRouter(
@@ -436,6 +299,19 @@ def read_calendar_profile(company_id: int | None = Query(default=None)) -> dict:
     return profile
 
 
+@admin_router.get("/calendar/timeline")
+def read_calendar_timeline(
+    company_id: int | None = Query(default=None),
+    start_date: str | None = Query(default=None),
+    days: int = Query(default=7, ge=1, le=14),
+) -> dict:
+    return get_calendar_timeline(
+        company_id=company_id,
+        start_date=start_date,
+        days=days,
+    )
+
+
 @admin_router.get("/calendar/integrations")
 def read_calendar_integrations(company_id: int | None = Query(default=None)) -> list[dict]:
     return get_calendar_integrations(company_id=company_id)
@@ -490,6 +366,10 @@ def query_calendar_availability_endpoint(
             end_date=payload.end_date,
             duration_minutes=payload.duration_minutes,
             limit=payload.limit,
+            scheduling_profile_key=payload.scheduling_profile_key,
+            customer_profile=payload.customer_profile,
+            service_name=payload.service_name,
+            request_context=payload.request_context,
         )
     except CalendarProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -498,6 +378,73 @@ def query_calendar_availability_endpoint(
 @admin_router.get("/calendar/bookings")
 def read_calendar_bookings(company_id: int | None = Query(default=None)) -> list[dict]:
     return get_calendar_bookings(company_id=company_id)
+
+
+@admin_router.get("/calendar/queue")
+def read_appointment_queue(company_id: int | None = Query(default=None)) -> list[dict]:
+    try:
+        return list_queue_entries(company_id=company_id)
+    except AppointmentQueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post(
+    "/calendar/queue",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def create_appointment_queue_entry_endpoint(
+    payload: AppointmentQueueEntryPayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    try:
+        entry = create_queue_entry(
+            company_id=company_id,
+            contact_id=payload.contact_id,
+            desired_title=payload.desired_title,
+            scheduling_profile_key=payload.scheduling_profile_key,
+            customer_profile=payload.customer_profile,
+            request_summary=payload.request_summary,
+            timezone=payload.timezone or settings.calendar_timezone,
+            earliest_starts_at=payload.earliest_starts_at,
+            latest_starts_at=payload.latest_starts_at,
+            preferred_periods=payload.preferred_periods,
+            priority_tier=payload.priority_tier,
+            priority_score=payload.priority_score,
+            accepts_short_notice=payload.accepts_short_notice,
+            original_booking_id=payload.original_booking_id,
+            source=payload.source,
+            notes=payload.notes,
+        )
+    except AppointmentQueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="create",
+        resource_type="appointment_queue_entry",
+        resource_id=str(entry["id"]),
+        company_id=company_id,
+        metadata={
+            "priority_tier": entry["priority_tier"],
+            "priority_score": entry["priority_score"],
+            "original_booking_id": entry.get("original_booking_id"),
+            "scheduling_profile_key": entry.get("scheduling_profile_key"),
+            "customer_profile": entry.get("customer_profile"),
+        },
+    )
+    return entry
+
+
+@admin_router.get("/calendar/queue-offers")
+def read_appointment_queue_offers(
+    company_id: int | None = Query(default=None),
+    status: str | None = Query(default=None),
+) -> list[dict]:
+    try:
+        return list_queue_offers(company_id=company_id, status=status)
+    except AppointmentQueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @admin_router.post(
@@ -518,9 +465,57 @@ def create_calendar_booking_endpoint(
             ends_at=payload.ends_at,
             timezone_name=payload.timezone,
             description=payload.description,
+            scheduling_profile_key=payload.scheduling_profile_key,
+            customer_profile=payload.customer_profile,
         )
     except CalendarProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    confirmation_outbound_id: int | None = None
+    if payload.request_bot_confirmation:
+        target_contact_id = booking.get("contact_id") or payload.contact_id
+        if target_contact_id:
+            confirmation_message = (
+                f"Olá! Queríamos confirmar seu agendamento de {payload.title} "
+                f"em {booking.get('starts_at') or payload.starts_at}. "
+                "Pode responder *SIM* para confirmar?"
+            )
+            try:
+                confirmation_outbound_id = repository.create_outbound_message(
+                    contact_id=str(target_contact_id),
+                    company_id=booking.get("company_id") or company_id,
+                    message=confirmation_message,
+                    source="manual_booking_confirmation",
+                    status="pending",
+                )
+                try:
+                    dispatch_outbound_message(confirmation_outbound_id)
+                except OutboundDispatchError as exc:
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "admin.calendar.booking.confirmation_dispatch_failed",
+                        booking_id=booking.get("id"),
+                        outbound_message_id=confirmation_outbound_id,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+            except Exception as exc:  # pragma: no cover - defensive logging
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "admin.calendar.booking.confirmation_enqueue_failed",
+                    booking_id=booking.get("id"),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+        else:
+            log_event(
+                logger,
+                logging.INFO,
+                "admin.calendar.booking.confirmation_skipped_no_contact",
+                booking_id=booking.get("id"),
+            )
 
     _record_audit_event(
         request=request,
@@ -533,9 +528,145 @@ def create_calendar_booking_endpoint(
             "starts_at": booking["starts_at"],
             "ends_at": booking["ends_at"],
             "contact_id": booking.get("contact_id"),
+            "scheduling_profile_key": booking.get("scheduling_profile_key"),
+            "customer_profile": booking.get("customer_profile"),
+            "request_bot_confirmation": payload.request_bot_confirmation,
+            "confirmation_outbound_message_id": confirmation_outbound_id,
+        },
+    )
+    if confirmation_outbound_id is not None:
+        return {**booking, "confirmation_outbound_message_id": confirmation_outbound_id}
+    return booking
+
+@admin_router.post(
+    "/calendar/bookings/{booking_id}/reschedule",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def reschedule_calendar_booking_endpoint(
+    booking_id: int,
+    payload: AppointmentBookingReschedulePayload,
+    request: Request,
+) -> dict:
+    try:
+        booking = reschedule_calendar_booking(
+            booking_id=booking_id,
+            starts_at=payload.starts_at,
+            ends_at=payload.ends_at,
+            timezone_name=payload.timezone,
+            title=payload.title,
+            description=payload.description,
+            scheduling_profile_key=payload.scheduling_profile_key,
+            customer_profile=payload.customer_profile,
+        )
+    except CalendarProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="reschedule",
+        resource_type="appointment_booking",
+        resource_id=str(booking_id),
+        company_id=booking.get("company_id"),
+        metadata={
+            "starts_at": booking.get("starts_at"),
+            "ends_at": booking.get("ends_at"),
+            "scheduling_profile_key": booking.get("scheduling_profile_key"),
+            "customer_profile": booking.get("customer_profile"),
+            "external_sync_status": booking.get("external_sync", {}).get("status"),
         },
     )
     return booking
+
+
+@admin_router.post(
+    "/calendar/bookings/{booking_id}/cancel",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def cancel_calendar_booking_endpoint(
+    booking_id: int,
+    payload: AppointmentBookingCancellationPayload,
+    request: Request,
+) -> dict:
+    try:
+        if payload.trigger_queue_recovery:
+            result = release_booking_slot(booking_id=booking_id)
+        else:
+            result = cancel_calendar_booking(booking_id=booking_id)
+            result = {
+                "booking": result["booking"],
+                "cancelled_reminders": result["cancelled_reminders"],
+                "external_sync": result["external_sync"],
+                "queue_recovery": {
+                    "released_booking_id": booking_id,
+                    "candidate_count": 0,
+                    "created_offer": None,
+                },
+            }
+    except (AppointmentQueueError, CalendarProviderError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="cancel",
+        resource_type="appointment_booking",
+        resource_id=str(booking_id),
+        company_id=result["booking"].get("company_id") if result.get("booking") else None,
+        metadata={
+            "trigger_queue_recovery": payload.trigger_queue_recovery,
+            "reason": payload.reason,
+            "external_sync_status": result.get("external_sync", {}).get("status"),
+            "created_offer_id": (
+                result["queue_recovery"]["created_offer"]["id"]
+                if result.get("queue_recovery", {}).get("created_offer")
+                else None
+            ),
+        },
+    )
+    return result
+
+
+@admin_router.post(
+    "/calendar/queue-offers/{offer_id}/respond",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def respond_to_appointment_queue_offer_endpoint(
+    offer_id: int,
+    payload: AppointmentQueueOfferResponsePayload,
+    request: Request,
+) -> dict:
+    try:
+        result = respond_to_queue_offer(
+            offer_id=offer_id,
+            response_status=payload.response_status,
+            wait_minutes=payload.wait_minutes,
+            response_notes=payload.response_notes,
+        )
+    except AppointmentQueueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalendarProviderError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="respond",
+        resource_type="appointment_queue_offer",
+        resource_id=str(offer_id),
+        company_id=result["offer"].get("company_id") if result.get("offer") else None,
+        metadata={
+            "response_status": payload.response_status,
+            "new_booking_id": (
+                result.get("new_booking", {}).get("id")
+                if isinstance(result.get("new_booking"), dict)
+                else None
+            ),
+            "next_offer_id": (
+                result.get("next_offer", {}).get("id")
+                if isinstance(result.get("next_offer"), dict)
+                else None
+            ),
+        },
+    )
+    return result
 
 
 @admin_router.get("/reminders")
@@ -615,8 +746,21 @@ def read_messages() -> list[dict]:
 
 
 @admin_router.get("/contacts")
-def read_contacts() -> list[dict]:
-    return repository.get_contacts()
+def read_contacts(
+    company_id: int | None = Query(default=None),
+    q: str | None = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> list[dict]:
+    if q:
+        return repository.search_contacts(
+            query=q,
+            company_id=company_id,
+            limit=limit,
+        )
+    contacts = repository.get_contacts()
+    if company_id is not None:
+        contacts = [contact for contact in contacts if contact.get("company_id") == company_id]
+    return contacts[:limit]
 
 
 @admin_router.get("/contacts/{contact_id}")
@@ -625,6 +769,45 @@ def read_contact(contact_id: str) -> dict:
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found.")
     return contact
+
+
+@admin_router.patch(
+    "/contacts/{contact_id}",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def update_contact_endpoint(
+    contact_id: str,
+    payload: ContactUpdatePayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    contact = repository.get_contact(contact_id)
+    if not contact:
+        raise HTTPException(status_code=404, detail="Contact not found.")
+
+    repository.update_contact(
+        contact_id,
+        contact_name=payload.contact_name,
+        company_id=company_id or contact.get("company_id"),
+        customer_profile=payload.customer_profile,
+        notes=payload.notes,
+    )
+    updated_contact = repository.get_contact(contact_id)
+    if not updated_contact:
+        raise HTTPException(status_code=404, detail="Contact not found after update.")
+
+    _record_audit_event(
+        request=request,
+        action="update",
+        resource_type="contact",
+        resource_id=contact_id,
+        company_id=updated_contact.get("company_id"),
+        metadata={
+            "customer_profile": updated_contact.get("customer_profile"),
+            "has_notes": bool(updated_contact.get("notes")),
+        },
+    )
+    return updated_contact
 
 
 @admin_router.post(
@@ -938,6 +1121,51 @@ def read_training_dataset_split(company_id: int | None = Query(default=None)) ->
 @admin_router.get("/training-dataset/review")
 def read_training_dataset_review(company_id: int | None = Query(default=None)) -> dict:
     return {"dataset": export_training_review_report_as_json(company_id=company_id)}
+
+
+@admin_router.post(
+    "/training-import",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def import_training_records_endpoint(
+    payload: TrainingImportPayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    try:
+        result = import_training_records(
+            company_id=company_id,
+            fmt=payload.format,
+            raw_text=payload.raw_text,
+            records=payload.records,
+            delimiter=payload.delimiter,
+            dry_run=payload.dry_run,
+            update_contacts=payload.update_contacts,
+            create_message_examples=payload.create_message_examples,
+            auto_promote_eligible_examples=payload.auto_promote_eligible_examples,
+            default_profile_name=payload.default_profile_name,
+            default_scenario_type=payload.default_scenario_type,
+            default_quality_score=payload.default_quality_score,
+            active_default=payload.active_default,
+        )
+    except (TrainingImportError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="import" if not payload.dry_run else "preview_import",
+        resource_type="training_records",
+        company_id=company_id,
+        metadata={
+            "format": payload.format,
+            "dry_run": payload.dry_run,
+            "parsed_records": result.get("parsed_records"),
+            "contacts_to_update": result.get("contacts_to_update"),
+            "message_examples_to_create": result.get("message_examples_to_create"),
+            "eligible_examples": result.get("eligible_examples"),
+        },
+    )
+    return result
 
 
 @admin_router.get("/finetuning-dataset/train-jsonl")

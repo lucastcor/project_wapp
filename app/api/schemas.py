@@ -36,6 +36,19 @@ class ChatResponse(BaseModel):
     source: str
 
 
+class PlatformSessionLoginPayload(BaseModel):
+    admin_token: str | None = None
+    admin_actor: str | None = None
+
+
+class PlatformSessionResponse(BaseModel):
+    authenticated: bool
+    role: str
+    actor: str
+    auth_mode: str
+    expires_at: int
+
+
 class HealthResponse(BaseModel):
     status: str
 
@@ -67,6 +80,12 @@ class WhatsAppWebhookResponse(BaseModel):
 
 class CompanyContextPayload(BaseModel):
     data: dict[str, Any]
+
+
+class ContactUpdatePayload(BaseModel):
+    contact_name: str | None = None
+    customer_profile: str | None = None
+    notes: str | None = None
 
 
 class PendingQuestionAnswerPayload(BaseModel):
@@ -119,6 +138,21 @@ class MessageExampleResponse(BaseModel):
     created_at: str
 
 
+class TrainingImportPayload(BaseModel):
+    format: str = "csv"
+    raw_text: str | None = None
+    records: list[dict[str, Any]] = Field(default_factory=list)
+    delimiter: str = ","
+    dry_run: bool = True
+    update_contacts: bool = True
+    create_message_examples: bool = True
+    auto_promote_eligible_examples: bool = False
+    default_profile_name: str = "default"
+    default_scenario_type: str = "general"
+    default_quality_score: float = 7.0
+    active_default: bool = True
+
+
 class CalendarIntegrationPayload(BaseModel):
     provider: str = Field(..., min_length=1)
     external_calendar_id: str | None = None
@@ -131,6 +165,10 @@ class CalendarAvailabilityQueryPayload(BaseModel):
     end_date: str = Field(..., min_length=10)
     duration_minutes: int = Field(..., gt=0)
     limit: int = Field(default=12, gt=0, le=100)
+    scheduling_profile_key: str | None = None
+    customer_profile: str | None = None
+    service_name: str | None = None
+    request_context: str | None = None
 
 
 class AppointmentBookingPayload(BaseModel):
@@ -140,6 +178,48 @@ class AppointmentBookingPayload(BaseModel):
     ends_at: str = Field(..., min_length=10)
     timezone: str | None = None
     description: str | None = None
+    scheduling_profile_key: str | None = None
+    customer_profile: str | None = None
+    request_bot_confirmation: bool = False
+
+
+class AppointmentBookingReschedulePayload(BaseModel):
+    starts_at: str = Field(..., min_length=10)
+    ends_at: str = Field(..., min_length=10)
+    timezone: str | None = None
+    title: str | None = None
+    description: str | None = None
+    scheduling_profile_key: str | None = None
+    customer_profile: str | None = None
+
+
+class AppointmentBookingCancellationPayload(BaseModel):
+    trigger_queue_recovery: bool = True
+    reason: str | None = None
+
+
+class AppointmentQueueEntryPayload(BaseModel):
+    contact_id: str = Field(..., min_length=1)
+    desired_title: str = Field(..., min_length=1)
+    scheduling_profile_key: str | None = None
+    customer_profile: str | None = None
+    request_summary: str | None = None
+    timezone: str | None = None
+    earliest_starts_at: str | None = None
+    latest_starts_at: str | None = None
+    preferred_periods: list[str] = Field(default_factory=list)
+    priority_tier: str = "normal"
+    priority_score: int = 0
+    accepts_short_notice: bool = True
+    original_booking_id: int | None = None
+    source: str = "manual"
+    notes: str | None = None
+
+
+class AppointmentQueueOfferResponsePayload(BaseModel):
+    response_status: str = Field(..., min_length=1)
+    wait_minutes: int | None = Field(default=None, gt=0)
+    response_notes: str | None = None
 
 
 class InternalReminderPayload(BaseModel):

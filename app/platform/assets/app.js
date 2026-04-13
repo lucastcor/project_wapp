@@ -108,6 +108,7 @@ const state = {
   loading: false,
   loadingMessage: "",
   settingsOpen: false,
+  manualBookingOpen: false,
   connected: false,
   session: null,
   errorMessage: "",
@@ -171,6 +172,13 @@ const state = {
       description: "",
       schedulingProfileKey: "",
       customerProfile: "",
+    },
+    manualBooking: {
+      contactId: "",
+      title: "",
+      startsAt: "",
+      endsAt: "",
+      description: "",
     },
     contactSearch: "",
     trainingImport: {
@@ -1681,6 +1689,53 @@ function renderRangeRow(profileIndex, weekday, rangeIndex, rangeValue) {
   `
 }
 
+function renderManualBookingModal() {
+  const draft = state.drafts.manualBooking
+  return `
+    <div class="modal-backdrop" data-manual-booking-backdrop>
+      <div class="modal">
+        <div class="section-header">
+          <div>
+            <h3 class="section-title">Agendamento manual</h3>
+            <p class="section-copy">Registre manualmente ou peça ao bot para confirmar com o cliente antes de gravar como firme.</p>
+          </div>
+          <button class="button-ghost" type="button" id="close-manual-booking">Fechar</button>
+        </div>
+        <form id="manual-booking-form" class="form-grid">
+          <div class="form-grid-two">
+            <div class="field">
+              <label>Contact ID</label>
+              <input name="contact_id" value="${escapeHtml(draft.contactId)}" placeholder="Ex.: 5511999999999" />
+            </div>
+            <div class="field">
+              <label>Título</label>
+              <input name="title" value="${escapeHtml(draft.title)}" />
+            </div>
+          </div>
+          <div class="form-grid-two">
+            <div class="field">
+              <label>Início</label>
+              <input name="starts_at" type="datetime-local" value="${escapeHtml(draft.startsAt)}" />
+            </div>
+            <div class="field">
+              <label>Fim</label>
+              <input name="ends_at" type="datetime-local" value="${escapeHtml(draft.endsAt)}" />
+            </div>
+          </div>
+          <div class="field">
+            <label>Descrição</label>
+            <textarea name="description">${escapeHtml(draft.description)}</textarea>
+          </div>
+          <div class="inline-actions" style="justify-content:flex-end;">
+            <button class="button-ghost" type="button" data-manual-booking-submit="direct">Agendar direto</button>
+            <button class="button" type="button" data-manual-booking-submit="bot">${ICONS.send}<span>Bot confirma com cliente</span></button>
+          </div>
+        </form>
+      </div>
+    </div>
+  `
+}
+
 function renderAgendaView() {
   const context = ensureSchedulingPolicy(state.companyContext || {})
   state.companyContext = context
@@ -1698,6 +1753,9 @@ function renderAgendaView() {
       <p class="hero-copy">
         A agenda não fica escondida dentro do bot. Aqui você acompanha provider, disponibilidade, bookings, reagendamento, cancelamento e a fila que reduz faltas e ocupa vagas ociosas.
       </p>
+      <div class="inline-actions" style="margin-top:16px;">
+        <button class="button" type="button" id="open-manual-booking">${ICONS.plus}<span>Agendamento manual</span></button>
+      </div>
     </section>
 
     ${renderSchedulingPolicyEditor(context)}
@@ -2277,6 +2335,7 @@ function renderApp() {
       </div>
     </div>
     ${state.settingsOpen ? renderSettingsModal() : ""}
+    ${state.manualBookingOpen ? renderManualBookingModal() : ""}
     ${renderToasts()}
     ${renderLoadingBanner()}
   `
@@ -2929,8 +2988,84 @@ function bindSchedulingPolicyEditorEvents() {
   })
 }
 
+function bindManualBookingEvents() {
+  const openButton = document.getElementById("open-manual-booking")
+  if (openButton) {
+    openButton.addEventListener("click", () => {
+      state.manualBookingOpen = true
+      renderApp()
+    })
+  }
+  const closeButton = document.getElementById("close-manual-booking")
+  if (closeButton) {
+    closeButton.addEventListener("click", () => {
+      state.manualBookingOpen = false
+      renderApp()
+    })
+  }
+  const backdrop = document.querySelector("[data-manual-booking-backdrop]")
+  if (backdrop) {
+    backdrop.addEventListener("click", (event) => {
+      if (event.target === backdrop) {
+        state.manualBookingOpen = false
+        renderApp()
+      }
+    })
+  }
+
+  document.querySelectorAll("[data-manual-booking-submit]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault()
+      const mode = button.dataset.manualBookingSubmit
+      const form = document.getElementById("manual-booking-form")
+      if (!form) return
+      const formData = new FormData(form)
+      const draft = {
+        contactId: String(formData.get("contact_id") || "").trim(),
+        title: String(formData.get("title") || "").trim(),
+        startsAt: String(formData.get("starts_at") || ""),
+        endsAt: String(formData.get("ends_at") || ""),
+        description: String(formData.get("description") || "").trim(),
+      }
+      state.drafts.manualBooking = draft
+      if (!draft.title || !draft.startsAt || !draft.endsAt) {
+        pushToast("Título, início e fim são obrigatórios.", "error")
+        return
+      }
+      state.loading = true
+      state.loadingMessage = mode === "bot" ? "Criando booking e enfileirando confirmação..." : "Criando booking manual..."
+      renderApp()
+      try {
+        await apiRequest("/admin/calendar/bookings", {
+          method: "POST",
+          params: getAdminCompanyParams(),
+          body: {
+            contact_id: draft.contactId || null,
+            title: draft.title,
+            starts_at: normalizeDatetimeLocal(draft.startsAt),
+            ends_at: normalizeDatetimeLocal(draft.endsAt),
+            description: draft.description || null,
+            request_bot_confirmation: mode === "bot",
+          },
+        })
+        pushToast(mode === "bot" ? "Booking criado. Bot enviou confirmação." : "Booking criado com sucesso.")
+        state.manualBookingOpen = false
+        state.drafts.manualBooking = { contactId: "", title: "", startsAt: "", endsAt: "", description: "" }
+        await loadAgendaData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  })
+}
+
 function bindAgendaEvents() {
   bindSchedulingPolicyEditorEvents()
+  bindManualBookingEvents()
   document.querySelectorAll("[data-agenda-mode]").forEach((button) => {
     button.addEventListener("click", () => {
       const mode = button.dataset.agendaMode

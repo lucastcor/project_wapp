@@ -244,6 +244,44 @@ def test_read_calendar_providers(monkeypatch) -> None:
     assert payload[1]["provider"] == "google_calendar"
 
 
+def test_read_calendar_timeline(monkeypatch) -> None:
+    monkeypatch.setattr(
+        admin_routes,
+        "get_calendar_timeline",
+        lambda company_id=None, start_date=None, days=7: {
+            "timezone": "America/Sao_Paulo",
+            "start_date": start_date or "2026-04-07",
+            "days": [
+                {
+                    "date": "2026-04-07",
+                    "label": "07/04",
+                    "weekday_label": "segunda",
+                    "booking_count": 1,
+                    "segments": [
+                        {
+                            "booking_id": 22,
+                            "title": "Consultoria inicial",
+                            "start_minutes": 600,
+                            "end_minutes": 660,
+                            "duration_minutes": 60,
+                            "column_index": 0,
+                            "column_count": 1,
+                        }
+                    ],
+                }
+            ],
+            "summary": {"booking_count": 1, "confirmed_count": 1, "pending_count": 0},
+        },
+    )
+
+    response = client.get("/admin/calendar/timeline", params={"company_id": 1, "start_date": "2026-04-07", "days": 7})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["timezone"] == "America/Sao_Paulo"
+    assert payload["days"][0]["segments"][0]["booking_id"] == 22
+
+
 def test_query_calendar_availability_endpoint(monkeypatch) -> None:
     monkeypatch.setattr(
         admin_routes,
@@ -309,6 +347,207 @@ def test_create_calendar_booking_endpoint(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["id"] == 22
     assert response.json()["provider"] == "mock"
+
+
+def test_create_calendar_booking_endpoint_requests_bot_confirmation(monkeypatch) -> None:
+    outbound_calls: list[dict] = []
+    dispatch_calls: list[int] = []
+
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+        def create_outbound_message(self, **kwargs) -> int:
+            outbound_calls.append(kwargs)
+            return 777
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "create_calendar_booking",
+        lambda **kwargs: {
+            "id": 55,
+            "provider": "mock",
+            "company_id": 1,
+            "contact_id": "contato-55",
+            "starts_at": "2026-04-20T14:00:00+00:00",
+            "ends_at": "2026-04-20T15:00:00+00:00",
+        },
+    )
+    monkeypatch.setattr(
+        admin_routes,
+        "dispatch_outbound_message",
+        lambda outbound_message_id: dispatch_calls.append(outbound_message_id) or {"status": "sent"},
+    )
+
+    response = client.post(
+        "/admin/calendar/bookings",
+        json={
+            "contact_id": "contato-55",
+            "title": "Sessão premium",
+            "starts_at": "2026-04-20T11:00:00-03:00",
+            "ends_at": "2026-04-20T12:00:00-03:00",
+            "timezone": "America/Sao_Paulo",
+            "description": "Manual com confirmação",
+            "request_bot_confirmation": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == 55
+    assert body["confirmation_outbound_message_id"] == 777
+    assert len(outbound_calls) == 1
+    assert outbound_calls[0]["contact_id"] == "contato-55"
+    assert outbound_calls[0]["source"] == "manual_booking_confirmation"
+    assert "Sessão premium" in outbound_calls[0]["message"]
+    assert dispatch_calls == [777]
+
+
+def test_create_appointment_queue_entry_endpoint(monkeypatch) -> None:
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "create_queue_entry",
+        lambda **kwargs: {
+            "id": 30,
+            "company_id": kwargs["company_id"],
+            "contact_id": kwargs["contact_id"],
+            "desired_title": kwargs["desired_title"],
+            "priority_tier": kwargs["priority_tier"],
+            "priority_score": kwargs["priority_score"],
+            "status": "active",
+            "original_booking_id": kwargs["original_booking_id"],
+        },
+    )
+
+    response = client.post(
+        "/admin/calendar/queue",
+        json={
+            "contact_id": "5511999999999",
+            "desired_title": "Consulta inicial",
+            "priority_tier": "high",
+            "priority_score": 25,
+            "original_booking_id": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == 30
+    assert response.json()["priority_tier"] == "high"
+
+
+def test_cancel_calendar_booking_endpoint_triggers_queue_recovery(monkeypatch) -> None:
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "release_booking_slot",
+        lambda booking_id: {
+            "booking": {
+                "id": booking_id,
+                "company_id": 1,
+                "status": "cancelled",
+            },
+            "cancelled_reminders": 2,
+            "queue_recovery": {
+                "released_booking_id": booking_id,
+                "candidate_count": 1,
+                "created_offer": {"id": 77, "queue_entry_id": 12},
+            },
+        },
+    )
+
+    response = client.post(
+        "/admin/calendar/bookings/22/cancel",
+        json={
+            "trigger_queue_recovery": True,
+            "reason": "Cliente cancelou",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["booking"]["status"] == "cancelled"
+    assert response.json()["queue_recovery"]["created_offer"]["id"] == 77
+
+
+def test_reschedule_calendar_booking_endpoint(monkeypatch) -> None:
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "reschedule_calendar_booking",
+        lambda **kwargs: {
+            "id": kwargs["booking_id"],
+            "company_id": 1,
+            "starts_at": "2026-04-09T13:00:00+00:00",
+            "ends_at": "2026-04-09T14:00:00+00:00",
+            "scheduling_profile_key": "retorno",
+            "customer_profile": "returning_customer",
+            "external_sync": {"status": "updated"},
+        },
+    )
+
+    response = client.post(
+        "/admin/calendar/bookings/22/reschedule",
+        json={
+            "starts_at": "2026-04-09T10:00:00-03:00",
+            "ends_at": "2026-04-09T11:00:00-03:00",
+            "scheduling_profile_key": "retorno",
+            "customer_profile": "returning_customer",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == 22
+    assert response.json()["external_sync"]["status"] == "updated"
+
+
+def test_respond_to_appointment_queue_offer_endpoint(monkeypatch) -> None:
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "respond_to_queue_offer",
+        lambda **kwargs: {
+            "offer": {
+                "id": kwargs["offer_id"],
+                "company_id": 1,
+                "status": kwargs["response_status"],
+            },
+            "entry": {
+                "id": 12,
+                "status": "converted",
+            },
+            "new_booking": {"id": 88},
+            "next_offer": None,
+        },
+    )
+
+    response = client.post(
+        "/admin/calendar/queue-offers/9/respond",
+        json={
+            "response_status": "accepted",
+            "response_notes": "Cliente aceitou.",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["offer"]["status"] == "accepted"
+    assert response.json()["new_booking"]["id"] == 88
 
 
 def test_read_customer_reminders(monkeypatch) -> None:
@@ -535,3 +774,103 @@ def test_cleanup_audit_events_requires_superadmin_and_returns_deleted_count(monk
     assert response.status_code == 200
     assert response.json()["retention_days"] == 45
     assert response.json()["deleted_count"] == 7
+
+
+def test_update_contact_endpoint(monkeypatch) -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.contact = {
+                "contact_id": "5511999999999",
+                "contact_name": "Maria",
+                "company_id": 2,
+                "customer_profile": None,
+                "notes": None,
+            }
+
+        def get_contact(self, contact_id: str):
+            if contact_id == self.contact["contact_id"]:
+                return dict(self.contact)
+            return None
+
+        def update_contact(self, contact_id: str, **kwargs) -> None:
+            assert contact_id == self.contact["contact_id"]
+            self.contact.update(kwargs)
+
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(admin_routes, "repository", fake_repository)
+
+    response = client.patch(
+        "/admin/contacts/5511999999999",
+        params={"company_id": 2},
+        json={
+            "contact_name": "Maria Silva",
+            "customer_profile": "returning_customer",
+            "notes": "Cliente prefere atendimento a tarde.",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["contact_name"] == "Maria Silva"
+    assert payload["customer_profile"] == "returning_customer"
+    assert payload["notes"] == "Cliente prefere atendimento a tarde."
+
+
+def test_training_import_endpoint(monkeypatch) -> None:
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "import_training_records",
+        lambda **kwargs: {
+            "dry_run": kwargs["dry_run"],
+            "company_id": kwargs["company_id"],
+            "parsed_records": 1,
+            "contacts_to_update": 1,
+            "message_examples_to_create": 1,
+            "eligible_examples": 1,
+            "skipped_examples": 0,
+            "errors": [],
+            "preview": [
+                {
+                    "row_number": 1,
+                    "contact_id": "5511999999999",
+                    "contact_name": "Maria Silva",
+                    "customer_profile": "returning_customer",
+                    "profile_name": "returning_customer",
+                    "scenario_type": "reschedule",
+                    "eligible_for_training": True,
+                    "used_for_training": True,
+                }
+            ],
+        },
+    )
+
+    response = client.post(
+        "/admin/training-import",
+        params={"company_id": 3},
+        json={
+            "format": "csv",
+            "raw_text": (
+                "contact_id,contact_name,customer_profile,customer_message,approved_reply\n"
+                "5511999999999,Maria Silva,returning_customer,Oi,Claro, posso ajudar\n"
+            ),
+            "dry_run": True,
+            "update_contacts": True,
+            "create_message_examples": True,
+            "auto_promote_eligible_examples": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is True
+    assert payload["company_id"] == 3
+    assert payload["parsed_records"] == 1
+    assert payload["preview"][0]["customer_profile"] == "returning_customer"
