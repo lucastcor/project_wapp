@@ -25,6 +25,37 @@ const ICONS = {
   tag: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4L13.4 20.6a2 2 0 0 1-2.8 0l-8.2-8.2V2h10.4l8.2 8.2a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/></svg>',
 }
 
+const FLOW_NODE_TEMPLATES = [
+  {
+    category: "Entrada",
+    items: [
+      { icon: "spark", label: "Qualificação inicial", description: "Entende o contexto e intenção do cliente no primeiro contato.", defaults: { label: "Entrada e qualificação", objective: "Entender rapidamente quem é o cliente e o nível de intenção.", trigger_terms: ["primeiro contato", "interesse", "informação"], preferred_cta: "Perguntar detalhes sobre necessidade e urgência." } },
+      { icon: "target", label: "Triagem de intenção", description: "Classifica o pedido em trilhas (venda, suporte, agenda).", defaults: { label: "Triagem de intenção", objective: "Classificar a conversa em trilha operacional apropriada.", trigger_terms: ["dúvida", "quero saber"], preferred_cta: "Direcionar para a trilha adequada após confirmar tema." } },
+    ],
+  },
+  {
+    category: "Agenda",
+    items: [
+      { icon: "calendar", label: "Agendamento", description: "Apresenta disponibilidade e confirma reserva.", defaults: { label: "Agendamento", objective: "Conduzir disponibilidade, confirmação e reserva.", trigger_terms: ["agendar", "marcar", "horário"], preferred_cta: "Apresentar janela disponível e pedir confirmação." } },
+      { icon: "refresh", label: "Reagendamento", description: "Reorganiza horário existente sem atrito.", defaults: { label: "Reagendamento", objective: "Mover reserva existente para nova janela viável.", trigger_terms: ["remarcar", "trocar horário", "mudar"], preferred_cta: "Oferecer nova janela compatível com a agenda atual." } },
+      { icon: "trash", label: "Cancelamento", description: "Libera vaga e ativa fila de remanejamento.", defaults: { label: "Cancelamento", objective: "Cancelar reserva com clareza e acionar fila.", trigger_terms: ["cancelar", "desmarcar"], preferred_cta: "Confirmar cancelamento e liberar vaga na agenda." } },
+    ],
+  },
+  {
+    category: "Conversão",
+    items: [
+      { icon: "send", label: "Follow-up", description: "Retoma lead morno com próximo passo claro.", defaults: { label: "Conversão e follow-up", objective: "Mover leads mornos para próxima ação comercial.", trigger_terms: ["vou pensar", "depois", "me chama"], preferred_cta: "Propor próximo passo concreto com prazo." } },
+      { icon: "check", label: "Confirmação final", description: "Fecha a conversa com compromisso confirmado.", defaults: { label: "Confirmação final", objective: "Registrar próxima ação e encerrar conversa de forma positiva.", trigger_terms: ["ok", "combinado", "fechado"], preferred_cta: "Confirmar próximo passo e se despedir de forma calorosa." } },
+    ],
+  },
+  {
+    category: "Escalonamento",
+    items: [
+      { icon: "handoff", label: "Handoff humano", description: "Transfere para operador em casos de exceção.", defaults: { label: "Handoff para operador", objective: "Encaminhar caso complexo para operador humano.", trigger_terms: ["falar com humano", "atendente", "pessoa real"], handoff_when: "Sempre que o cliente pedir operador ou a política não cobrir.", preferred_cta: "Confirmar o encaminhamento e avisar o operador." } },
+    ],
+  },
+]
+
 const NAV_ITEMS = [
   { key: "dashboard", label: "Control Tower", caption: "Readiness e postura operacional", icon: "dashboard" },
   { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
@@ -105,6 +136,7 @@ const state = {
   },
   flowEditor: {
     selectedPipelineKey: "lead_capture",
+    zoom: 1,
   },
   agendaCalendar: {
     mode: "month",
@@ -894,7 +926,7 @@ function renderStudioView() {
             <textarea id="studio-message" name="message" placeholder="Ex.: Quero remarcar meu atendimento para sexta às 15h">${escapeHtml(state.drafts.studio.message)}</textarea>
           </div>
           <div class="toolbar-row">
-            <button class="button" type="submit">Enviar para o runtime</button>
+            <button class="button" type="submit">${ICONS.send}<span>Enviar para o runtime</span></button>
             ${
               operatorContacts.length
                 ? `<button class="button-ghost" type="button" id="use-operator-contact">Usar contato interno ${escapeHtml(operatorContacts[0])}</button>`
@@ -947,12 +979,23 @@ function renderStudioView() {
   `
 }
 
+function iconForPipeline(pipeline) {
+  const key = (pipeline.key || "").toLowerCase()
+  const label = (pipeline.label || "").toLowerCase()
+  const haystack = `${key} ${label}`
+  if (haystack.includes("reagend") || haystack.includes("remarc")) return ICONS.refresh
+  if (haystack.includes("cancel")) return ICONS.trash
+  if (haystack.includes("agend") || haystack.includes("book")) return ICONS.calendar
+  if (haystack.includes("handoff") || haystack.includes("operador") || haystack.includes("humano")) return ICONS.handoff
+  if (haystack.includes("follow") || haystack.includes("convers")) return ICONS.send
+  if (haystack.includes("triagem") || haystack.includes("intencao")) return ICONS.target
+  if (haystack.includes("confirma")) return ICONS.check
+  return ICONS.spark
+}
+
 function renderFlowCanvas(pipelines) {
-  const canvasWidth = 1180
-  const canvasHeight = Math.max(
-    560,
-    ...pipelines.map((pipeline) => Number(pipeline.canvas_position?.y || 0) + 220)
-  )
+  const canvasWidth = 2400
+  const canvasHeight = 1600
 
   const pipelineLookup = new Map(pipelines.map((pipeline) => [pipeline.key, pipeline]))
   const edges = pipelines.flatMap((pipeline) =>
@@ -980,37 +1023,64 @@ function renderFlowCanvas(pipelines) {
       .filter(Boolean)
   )
 
+  const zoom = state.flowEditor.zoom || 1
+  const zoomPct = Math.round(zoom * 100)
+
   return `
-    <div class="flow-canvas-wrapper">
-      <div class="flow-canvas-grid"></div>
-      <svg class="flow-svg" viewBox="0 0 ${canvasWidth} ${canvasHeight}" preserveAspectRatio="none">
-        <defs>
-          <marker id="flow-arrow" markerWidth="12" markerHeight="12" refX="8" refY="6" orient="auto">
-            <path d="M 0 0 L 12 6 L 0 12 z" fill="rgba(31, 210, 189, 0.7)"></path>
-          </marker>
-        </defs>
-        ${edges.join("")}
-      </svg>
-      ${pipelines
-        .map((pipeline) => {
-          const isSelected = state.flowEditor.selectedPipelineKey === pipeline.key
-          return `
-            <button
-              type="button"
-              class="flow-node ${isSelected ? "selected" : ""}"
-              data-select-pipeline="${escapeHtml(pipeline.key)}"
-              data-pipeline-key="${escapeHtml(pipeline.key)}"
-              style="left:${Number(pipeline.canvas_position?.x || 0)}px; top:${Number(pipeline.canvas_position?.y || 0)}px;"
-            >
-              <span class="flow-node-kicker">${escapeHtml(pipeline.key)}</span>
-              <strong>${escapeHtml(pipeline.label || pipeline.key)}</strong>
-              <p>${escapeHtml(pipeline.objective || "Sem objetivo descrito ainda.")}</p>
-              <span class="flow-node-footer">${escapeHtml((pipeline.next_keys || []).length)} transições</span>
-            </button>
-          `
-        })
-        .join("")}
-    </div>
+    <article class="card flow-canvas-card">
+      <div class="flow-canvas-toolbar">
+        <div class="flow-canvas-toolbar-group">
+          <span class="tag">${escapeHtml(String(pipelines.length))} etapas</span>
+          <span class="subtle" style="font-size:12px;">Arraste nós ou clique em um template para adicionar.</span>
+        </div>
+        <div class="flow-canvas-toolbar-group">
+          <button class="button-icon" data-flow-zoom="out" title="Zoom out">${ICONS.zoomOut}</button>
+          <span class="flow-zoom-readout">${zoomPct}%</span>
+          <button class="button-icon" data-flow-zoom="in" title="Zoom in">${ICONS.zoomIn}</button>
+          <button class="button-icon" data-flow-zoom="fit" title="Ajustar à tela">${ICONS.fit}</button>
+        </div>
+      </div>
+      <div class="flow-canvas-wrapper" id="flow-canvas-wrapper">
+        <div class="flow-canvas-inner" id="flow-canvas-inner" style="transform: scale(${zoom});">
+          <div class="flow-canvas-grid"></div>
+          <svg class="flow-svg" viewBox="0 0 ${canvasWidth} ${canvasHeight}" preserveAspectRatio="none">
+            <defs>
+              <marker id="flow-arrow" markerWidth="12" markerHeight="12" refX="8" refY="6" orient="auto">
+                <path d="M 0 0 L 12 6 L 0 12 z" fill="rgba(37, 211, 102, 0.75)"></path>
+              </marker>
+            </defs>
+            ${edges.join("")}
+          </svg>
+          ${pipelines
+            .map((pipeline) => {
+              const isSelected = state.flowEditor.selectedPipelineKey === pipeline.key
+              const nextCount = (pipeline.next_keys || []).length
+              const triggers = (pipeline.trigger_terms || []).length
+              return `
+                <button
+                  type="button"
+                  class="flow-node ${isSelected ? "selected" : ""}"
+                  data-select-pipeline="${escapeHtml(pipeline.key)}"
+                  data-pipeline-key="${escapeHtml(pipeline.key)}"
+                  style="left:${Number(pipeline.canvas_position?.x || 0)}px; top:${Number(pipeline.canvas_position?.y || 0)}px;"
+                >
+                  <div class="flow-node-head">
+                    <span class="flow-node-icon">${iconForPipeline(pipeline)}</span>
+                    <span class="flow-node-kicker">${escapeHtml(pipeline.key)}</span>
+                  </div>
+                  <strong>${escapeHtml(pipeline.label || pipeline.key)}</strong>
+                  <p>${escapeHtml(pipeline.objective || "Sem objetivo descrito ainda.")}</p>
+                  <div class="flow-node-footer">
+                    <span class="footer-chip">${nextCount} transições</span>
+                    <span class="footer-chip">${triggers} triggers</span>
+                  </div>
+                </button>
+              `
+            })
+            .join("")}
+        </div>
+      </div>
+    </article>
   `
 }
 
@@ -1280,6 +1350,28 @@ function renderMonthDayDetail(dayBookings, selectedKey) {
   `
 }
 
+function renderFlowPalette() {
+  return `
+    <aside class="card flow-palette">
+      <h4>Templates</h4>
+      ${FLOW_NODE_TEMPLATES.map((group) => `
+        <div class="flow-palette-group">
+          <h4>${escapeHtml(group.category)}</h4>
+          ${group.items.map((item, idx) => `
+            <button type="button" class="flow-palette-item" data-flow-template="${escapeHtml(group.category)}:${idx}">
+              <span class="palette-icon">${ICONS[item.icon] || ICONS.spark}</span>
+              <span>
+                <strong>${escapeHtml(item.label)}</strong>
+                <span>${escapeHtml(item.description)}</span>
+              </span>
+            </button>
+          `).join("")}
+        </div>
+      `).join("")}
+    </aside>
+  `
+}
+
 function renderFlowsView() {
   const context = ensureConversationPipelines(state.companyContext || {})
   const pipelines = context.conversation_pipelines || []
@@ -1292,37 +1384,26 @@ function renderFlowsView() {
   return `
     <section class="hero">
       <span class="brand-eyebrow">Flow Studio</span>
-      <h2 class="hero-title">Transforme regra de negócio em direção conversacional palpável.</h2>
+      <h2 class="hero-title">Desenhe o fluxo conversacional em um canvas visual.</h2>
       <p class="hero-copy">
-        Esta área junta a camada editorial e estrutural do bot: playbooks conversacionais, transições entre etapas, sinais de handoff e respostas aprovadas que alimentam comportamento e treino.
+        Clique num template à esquerda para adicionar, arraste os nós para posicionar, e ajuste comportamento no inspector à direita. Tudo persiste no company context.
       </p>
       <div class="hero-actions">
-        <button class="button" id="save-pipelines">Salvar pipelines no company context</button>
-        <button class="button-ghost" id="add-pipeline-stage">Adicionar etapa</button>
+        <button class="button" id="save-pipelines">${ICONS.check}<span>Salvar no company context</span></button>
+        <button class="button-ghost" id="add-pipeline-stage">${ICONS.plus}<span>Etapa em branco</span></button>
       </div>
     </section>
 
-    <section class="grid-two">
-      <article class="card">
-        <div class="section-header">
-          <div>
-            <h3 class="section-title">Canvas visual de fluxo</h3>
-            <p class="section-copy">Organize a lógica conversacional como um mapa operacional, com posições e transições persistidas no contexto.</p>
-          </div>
-          <span class="tag">${escapeHtml(String(pipelines.length))} etapas</span>
-        </div>
-        ${pipelines.length ? renderFlowCanvas(pipelines) : '<div class="empty-state">Nenhum pipeline configurado ainda.</div>'}
-      </article>
-
-      <article class="card">
-        <div class="section-header">
-          <div>
-            <h3 class="section-title">Inspector da etapa</h3>
-            <p class="section-copy">Edite a etapa selecionada, a posição no canvas e as transições para outras etapas.</p>
-          </div>
+    <section class="flow-layout">
+      ${renderFlowPalette()}
+      ${pipelines.length ? renderFlowCanvas(pipelines) : '<article class="card"><div class="empty-state">Nenhum pipeline configurado. Clique em um template à esquerda para começar.</div></article>'}
+      <aside class="card flow-inspector">
+        <div class="flow-inspector-header">
+          <strong>${selectedPipeline ? escapeHtml(selectedPipeline.label || selectedPipeline.key) : "Inspector"}</strong>
+          ${selectedPipeline ? `<span class="tag">${escapeHtml(selectedPipeline.key)}</span>` : ""}
         </div>
         ${renderFlowInspector(selectedPipeline, pipelines)}
-      </article>
+      </aside>
     </section>
 
     <section class="card">
@@ -2171,30 +2252,61 @@ function bindStudioEvents() {
 
 function bindFlowEvents() {
   const addPipelineStage = document.getElementById("add-pipeline-stage")
+  const pushStageFromTemplate = (defaults = {}) => {
+    const context = ensureConversationPipelines(state.companyContext || {})
+    const existing = new Set(context.conversation_pipelines.map((p) => p.key))
+    const baseKey = (defaults.label || "stage").toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "") || "stage"
+    let candidate = baseKey
+    let suffix = 1
+    while (existing.has(candidate)) {
+      suffix += 1
+      candidate = `${baseKey}_${suffix}`
+    }
+    const nextIndex = context.conversation_pipelines.length + 1
+    context.conversation_pipelines.push({
+      key: candidate,
+      label: defaults.label || "Nova etapa",
+      objective: defaults.objective || "",
+      trigger_terms: defaults.trigger_terms || [],
+      success_criteria: defaults.success_criteria || "",
+      handoff_when: defaults.handoff_when || "",
+      preferred_cta: defaults.preferred_cta || "",
+      next_keys: [],
+      canvas_position: {
+        x: 140 + ((nextIndex - 1) % 3) * 320,
+        y: 120 + Math.floor((nextIndex - 1) / 3) * 240,
+      },
+    })
+    state.companyContext = context
+    state.flowEditor.selectedPipelineKey = candidate
+    renderApp()
+  }
+
   if (addPipelineStage) {
-    addPipelineStage.addEventListener("click", () => {
-      const context = ensureConversationPipelines(state.companyContext || {})
-      const nextIndex = context.conversation_pipelines.length + 1
-      const newKey = `stage_${nextIndex}`
-      context.conversation_pipelines.push({
-        key: newKey,
-        label: "Nova etapa",
-        objective: "",
-        trigger_terms: [],
-        success_criteria: "",
-        handoff_when: "",
-        preferred_cta: "",
-        next_keys: [],
-        canvas_position: {
-          x: 120 + ((nextIndex - 1) % 3) * 320,
-          y: 90 + Math.floor((nextIndex - 1) / 3) * 220,
-        },
-      })
-      state.companyContext = context
-      state.flowEditor.selectedPipelineKey = newKey
+    addPipelineStage.addEventListener("click", () => pushStageFromTemplate({}))
+  }
+
+  document.querySelectorAll("[data-flow-template]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const [category, idxStr] = String(button.dataset.flowTemplate || "").split(":")
+      const group = FLOW_NODE_TEMPLATES.find((g) => g.category === category)
+      const item = group?.items?.[Number(idxStr)]
+      if (!item) return
+      pushStageFromTemplate(item.defaults || {})
+      pushToast(`Etapa "${item.label}" adicionada ao canvas.`)
+    })
+  })
+
+  document.querySelectorAll("[data-flow-zoom]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const action = button.dataset.flowZoom
+      const current = state.flowEditor.zoom || 1
+      if (action === "in") state.flowEditor.zoom = Math.min(1.6, Math.round((current + 0.1) * 10) / 10)
+      else if (action === "out") state.flowEditor.zoom = Math.max(0.4, Math.round((current - 0.1) * 10) / 10)
+      else if (action === "fit") state.flowEditor.zoom = 0.7
       renderApp()
     })
-  }
+  })
 
   const updateEdgePathsForKey = (movedKey) => {
     const context = ensureConversationPipelines(state.companyContext || {})
@@ -2239,10 +2351,11 @@ function bindFlowEvents() {
       } catch (_) {}
       event.preventDefault()
 
+      const zoom = state.flowEditor.zoom || 1
       const onMove = (moveEvent) => {
-        const dx = moveEvent.clientX - startX
-        const dy = moveEvent.clientY - startY
-        if (!dragging && Math.hypot(dx, dy) < 4) return
+        const dx = (moveEvent.clientX - startX) / zoom
+        const dy = (moveEvent.clientY - startY) / zoom
+        if (!dragging && Math.hypot(dx, dy) < 4 / zoom) return
         dragging = true
         button.classList.add("dragging")
         currentX = Math.max(20, originX + dx)
