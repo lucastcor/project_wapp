@@ -20,6 +20,7 @@ Arquivos principais:
 - `app/main.py`
 - `app/api/routes.py`
 - `app/api/admin_routes.py`
+- `app/api/platform_routes.py`
 - `app/api/schemas.py`
 
 Responsabilidades:
@@ -27,6 +28,8 @@ Responsabilidades:
 - inicializar a aplicacao FastAPI;
 - expor endpoints publicos de entrada de mensagem e webhook;
 - expor endpoints administrativos para operacao, treinamento e outbound;
+- servir a interface dedicada em `/platform` com assets estaticos;
+- autenticar a plataforma por sessao web com cookie HTTP-only;
 - validar payloads e traduzir erros de dominio em respostas HTTP.
 
 #### 2. Orquestracao
@@ -75,7 +78,10 @@ Servicos principais:
 - `outbound_dispatch_service.py`: envia mensagens outbound por provider configurado.
 - `finetuning_service.py`: cria, consulta e persiste jobs de fine-tuning.
 - `training_export_service.py`: cura, deduplica, divide e exporta datasets.
-- `calendar_service.py`: resolve integracao de agenda, disponibilidade e bookings.
+- `training_import_service.py`: importa CSV/JSON de base historica ou CRM, atualiza contatos e cria exemplos curados.
+- `calendar_service.py`: resolve integracao de agenda, perfis de disponibilidade, bookings e sync com calendario externo.
+- `appointment_queue_service.py`: gerencia fila de prioridade, ofertas de remanejamento e follow-ups.
+- `conversation_workflow_service.py`: conduz fluxos conversacionais de agenda, incluindo agendamento do cliente, cancelamento, reagendamento e comandos internos do operador.
 
 #### 4. Providers e integracoes
 
@@ -135,7 +141,9 @@ O `company_context` funciona como contrato de negocio para cada empresa. Ele con
 - politicas comerciais;
 - catalogo;
 - regras de negocio;
-- diretrizes de LLM.
+- diretrizes de LLM;
+- politicas de agenda em `scheduling_policy.profiles`;
+- contatos internos autorizados a operar agenda em `internal_operation.operator_contact_ids`.
 
 Quando um contexto por empresa nao existe, o sistema faz fallback para o contexto global.
 
@@ -160,13 +168,23 @@ Existe um painel Streamlit em `app/admin_app.py` para operacao minima, com foco 
 - readiness e onboarding operacional;
 - cadastro de empresas;
 - consulta de contatos;
-- edicao de company context;
+- edicao estruturada de perfis de agenda e operacao interna no company context;
+- edicao de `customer_profile` e observacoes de contato;
 - consulta de knowledge base;
 - curadoria de message examples;
+- importacao inicial de base historica/CRM para curadoria de treino;
 - atendimento de pending questions;
 - dispatch outbound;
 - acompanhamento de dataset e fine-tuning;
 - leitura de auditoria e migracoes.
+
+Agora existe tambem uma interface dedicada servida pelo proprio FastAPI em `/platform`, com foco em:
+
+- `Control Tower` para readiness, onboarding e observabilidade;
+- `Bot Studio` para simular cliente ou operador dentro do runtime real;
+- `Flow Studio` para editar playbooks e mensagens aprovadas;
+- `Agenda Console` para controlar bookings e fila;
+- `Training Ops` para importar base historica e acompanhar fine-tuning.
 
 ### Observabilidade
 
@@ -194,6 +212,7 @@ O backend agora inclui controles adicionais para operacao mais segura:
 
 - autenticacao administrativa por token configuravel;
 - RBAC administrativo por papel;
+- autenticacao de sessao para a plataforma dedicada;
 - trilha de auditoria persistida em banco;
 - metricas exportaveis para integracao com coletores externos.
 
@@ -201,6 +220,7 @@ Elementos principais:
 
 - `ENABLE_ADMIN_AUTH` e `ADMIN_API_TOKEN` controlam a protecao da superficie `/admin`;
 - `ADMIN_VIEWER_TOKEN`, `ADMIN_OPERATOR_TOKEN` e `ADMIN_SUPERADMIN_TOKEN` permitem separar privilegios por papel;
+- `PLATFORM_SESSION_SECRET` assina a sessao web da plataforma dedicada;
 - `X-Admin-Actor` identifica o operador logico em acoes administrativas;
 - tabela `audit_events` registra acoes criticas com `actor_id`, `request_id`, status e metadata;
 - endpoint `GET /admin/observability/metrics` entrega metricas em formato texto para scraping.
@@ -258,11 +278,18 @@ Capacidades atuais:
 
 - integracao ativa resolvida por empresa;
 - ativacao por empresa via `company_context`;
+- perfis de agendamento opcionais por empresa para separar janelas por tipo de atendimento;
 - provider `mock` funcional para validacao ponta a ponta;
 - bookings persistidos em banco;
+- endpoint de timeline proprio para renderizacao visual semanal na plataforma;
+- cancelamento com sync no provider externo quando existir `external_event_id`;
+- reagendamento com update do evento externo quando a integracao estiver ativa;
+- cancelamento e reagendamento conversacional natural do proprio cliente;
+- operacao interna por conversa para agendar cliente por nome ou telefone com confirmacao/desambiguacao;
 - lembretes internos persistidos e materializaveis em outbound apenas para uso de dono ou funcionario;
 - lembretes de cliente gerados automaticamente a partir de regras de agendamento;
 - fluxo conversacional com estado por contato em `conversation_flows`;
+- fila de prioridade persistida em `appointment_queue_entries` e `appointment_queue_offers`;
 - worker recorrente para materializacao e disparo de lembretes vencidos;
 - preparacao para Google Calendar via API oficial;
 - preparacao para CalDAV, cobrindo iCloud/Apple Calendar e outros servidores compativeis.
@@ -276,9 +303,28 @@ Superficie administrativa:
 - `POST /admin/calendar/availability/query`
 - `GET /admin/calendar/bookings`
 - `POST /admin/calendar/bookings`
+- `POST /admin/calendar/bookings/{booking_id}/reschedule`
+- `POST /admin/calendar/bookings/{booking_id}/cancel`
+- `GET /admin/calendar/queue`
+- `POST /admin/calendar/queue`
+- `GET /admin/calendar/queue-offers`
+- `POST /admin/calendar/queue-offers/{offer_id}/respond`
 - `GET /admin/reminders`
 - `POST /admin/reminders`
 - `POST /admin/reminders/dispatch-due`
+
+Arquivos centrais desse fluxo:
+
+- `app/core/company_context.py`: valida e persiste o contrato de contexto por empresa, incluindo `scheduling_policy.profiles`.
+- `app/core/company_context.py`: valida tambem `conversation_pipelines`, com transicoes e posicoes do canvas.
+- `app/services/calendar_service.py`: resolve o perfil aplicavel, calcula slots, valida janela, cria/cancela/reagenda booking e sincroniza provider externo.
+- `app/services/conversation_workflow_service.py`: conduz o agendamento conversacional do cliente, o cancelamento/reagendamento natural e a operacao interna de agenda.
+- `app/services/appointment_queue_service.py`: controla fila de prioridade, ofertas, espera, permanencia na fila e remanejamento.
+- `app/services/training_import_service.py`: transforma CSV/JSON curado em atualizacao de contatos e `message_examples`.
+- `app/services/platform_session_service.py`: emite e valida a sessao web da plataforma dedicada.
+- `app/storage/db.py`: materializa colunas e tabelas de agenda, fila e lembretes no bootstrap/migracoes internas.
+- `app/storage/repository.py`: faz leitura/escrita de bookings, fila, offers, reminders e integracoes.
+- `app/api/admin_routes.py`: expõe operacao administrativa de disponibilidade, timeline, bookings, reagendamento, cancelamento, fila, contatos e importacao de treino.
 
 ### Decisoes arquiteturais atuais
 

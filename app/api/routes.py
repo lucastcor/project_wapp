@@ -1,21 +1,27 @@
 import logging
+import hashlib
+import hmac
+from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 
 from app.api.schemas import (
     IncomingMessageRequest,
     IncomingMessageResponse,
-    WhatsAppWebhookRequest,
-    WhatsAppWebhookResponse,
 )
+from app.core.config import settings
 from app.core.orchestrator import (
     process_incoming_message,
     process_whatsapp_webhook,
 )
 from app.core.logging import get_logger, log_event
+from app.services.outbound_dispatch_service import OutboundDispatchError, dispatch_outbound_message
+from app.storage.repository import RuntimeRepository
 
 router = APIRouter(tags=["chat"])
 logger = get_logger(__name__)
+repository = RuntimeRepository()
 
 
 def _resolve_request_company(
@@ -39,6 +45,149 @@ def _resolve_request_company(
         "company_id": resolved_company_id,
         "company_slug": resolved_company_slug,
     }
+
+
+def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if payload.get("object") != "whatsapp_business_account":
+        return None
+
+    entries = payload.get("entry")
+    if not isinstance(entries, list):
+        return None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes")
+        if not isinstance(changes, list):
+            continue
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            messages = value.get("messages")
+            contacts = value.get("contacts")
+            if not isinstance(messages, list) or not messages:
+                continue
+
+            contact_name = None
+            contact_wa_id = None
+            if isinstance(contacts, list) and contacts:
+                first_contact = contacts[0]
+                if isinstance(first_contact, dict):
+                    contact_wa_id = first_contact.get("wa_id")
+                    profile = first_contact.get("profile")
+                    if isinstance(profile, dict):
+                        contact_name = profile.get("name")
+
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                if str(message.get("type") or "").strip().lower() != "text":
+                    continue
+                text_payload = message.get("text")
+                if not isinstance(text_payload, dict):
+                    continue
+                body = str(text_payload.get("body") or "").strip()
+                from_number = str(message.get("from") or contact_wa_id or "").strip()
+                if not body or not from_number:
+                    continue
+                return {
+                    "event": "message.received",
+                    "from_number": from_number,
+                    "from_name": str(contact_name or "").strip() or None,
+                    "text": body,
+                    "provider_message_id": str(message.get("id") or "").strip() or None,
+                }
+
+    return None
+
+
+def _extract_whatsapp_message_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    if all(key in payload for key in {"event", "from_number", "text"}):
+        normalized_text = str(payload.get("text") or "").strip()
+        normalized_number = str(payload.get("from_number") or "").strip()
+        if not normalized_text or not normalized_number:
+            raise HTTPException(status_code=400, detail="text and from_number must not be blank.")
+        return (
+            {
+                "event": str(payload.get("event") or "message.received"),
+                "from_number": normalized_number,
+                "from_name": str(payload.get("from_name") or "").strip() or None,
+                "text": normalized_text,
+                "provider_message_id": str(payload.get("provider_message_id") or "").strip() or None,
+            },
+            "normalized",
+        )
+
+    meta_message = _extract_meta_whatsapp_message(payload)
+    if meta_message:
+        return meta_message, "meta"
+
+    return None, "ignored"
+
+
+def _validate_meta_signature(raw_body: bytes, signature_header: str | None) -> None:
+    app_secret = (settings.whatsapp_app_secret or "").strip()
+    if not app_secret:
+        raise HTTPException(status_code=503, detail="WhatsApp app secret is not configured.")
+
+    normalized_signature = (signature_header or "").strip()
+    if not normalized_signature.startswith("sha256="):
+        raise HTTPException(status_code=403, detail="Missing WhatsApp webhook signature.")
+
+    expected_signature = hmac.new(
+        app_secret.encode("utf-8"),
+        msg=raw_body,
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+    received_signature = normalized_signature.removeprefix("sha256=").strip()
+
+    if not hmac.compare_digest(expected_signature, received_signature):
+        raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook signature.")
+
+
+def _dispatch_whatsapp_auto_reply(result: dict[str, Any]) -> dict[str, Any] | None:
+    if not result.get("auto_reply") or not str(result.get("reply") or "").strip():
+        return None
+
+    outbound_message_id = repository.create_outbound_message(
+        contact_id=str(result["contact_id"]),
+        company_id=result.get("company_id"),
+        message=str(result["reply"]),
+        source="whatsapp_auto_reply",
+        status="pending",
+    )
+    try:
+        dispatch_result = dispatch_outbound_message(
+            outbound_message_id=outbound_message_id,
+            channel="whatsapp",
+        )
+        return {
+            "outbound_message_id": outbound_message_id,
+            "delivery_status": dispatch_result.get("delivery_status"),
+            "provider_message_id": dispatch_result.get("provider_message_id"),
+            "provider_response": dispatch_result.get("provider_response"),
+            "error": None,
+        }
+    except OutboundDispatchError as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "api.whatsapp.auto_reply.dispatch_failed",
+            outbound_message_id=outbound_message_id,
+            error_type=type(exc).__name__,
+        )
+        return {
+            "outbound_message_id": outbound_message_id,
+            "delivery_status": "failed",
+            "provider_message_id": None,
+            "provider_response": None,
+            "error": str(exc),
+        }
 
 
 @router.post("/messages/incoming", response_model=IncomingMessageResponse)
@@ -87,17 +236,63 @@ def incoming_message(
     return IncomingMessageResponse(**result)
 
 
-@router.post("/webhooks/whatsapp", response_model=WhatsAppWebhookResponse)
-def whatsapp_webhook(
-    payload: WhatsAppWebhookRequest,
+@router.get("/webhooks/whatsapp", response_class=PlainTextResponse)
+def verify_whatsapp_webhook(
+    hub_mode: str | None = Query(default=None, alias="hub.mode"),
+    hub_verify_token: str | None = Query(default=None, alias="hub.verify_token"),
+    hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
+) -> PlainTextResponse:
+    if hub_mode != "subscribe" or not hub_challenge:
+        raise HTTPException(status_code=400, detail="Invalid WhatsApp webhook verification payload.")
+
+    configured_token = (settings.whatsapp_webhook_verify_token or "").strip()
+    if not configured_token:
+        raise HTTPException(status_code=503, detail="WhatsApp webhook verification token is not configured.")
+
+    if hub_verify_token != configured_token:
+        raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook verify token.")
+
+    log_event(
+        logger,
+        logging.INFO,
+        "api.whatsapp.webhook.verified",
+    )
+    return PlainTextResponse(str(hub_challenge))
+
+
+@router.post("/webhooks/whatsapp")
+async def whatsapp_webhook(
+    request: Request,
     company_id: int | None = Query(default=None),
     company_slug: str | None = Query(default=None),
     x_company_id: str | None = Header(default=None, alias="X-Company-Id"),
     x_company_slug: str | None = Header(default=None, alias="X-Company-Slug"),
-) -> WhatsAppWebhookResponse:
-    normalized_text = payload.text.strip()
-    if not normalized_text:
-        raise HTTPException(status_code=400, detail="text must not be blank.")
+    x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+) -> Any:
+    try:
+        raw_body = await request.body()
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object.")
+
+    normalized_payload, payload_mode = _extract_whatsapp_message_payload(payload)
+    if not normalized_payload:
+        log_event(
+            logger,
+            logging.INFO,
+            "api.whatsapp.webhook.ignored",
+            payload_mode=payload_mode,
+        )
+        return {
+            "processed": False,
+            "reason": "unsupported_or_non_message_event",
+            "payload_mode": payload_mode,
+        }
+
+    if payload_mode == "meta":
+        _validate_meta_signature(raw_body, x_hub_signature_256)
 
     request_company = _resolve_request_company(
         company_id=company_id,
@@ -109,18 +304,20 @@ def whatsapp_webhook(
         logger,
         logging.INFO,
         "api.whatsapp.webhook.received",
-        whatsapp_event=payload.event,
+        whatsapp_event=normalized_payload["event"],
         company_id=request_company["company_id"],
         company_slug=request_company["company_slug"],
-        has_from_name=bool(payload.from_name),
+        payload_mode=payload_mode,
+        has_from_name=bool(normalized_payload.get("from_name")),
     )
     result = process_whatsapp_webhook(
-        from_number=payload.from_number,
-        from_name=payload.from_name,
-        text=normalized_text,
+        from_number=str(normalized_payload["from_number"]),
+        from_name=normalized_payload.get("from_name"),
+        text=str(normalized_payload["text"]),
         company_id=request_company["company_id"],
         company_slug=request_company["company_slug"],
     )
+    auto_reply_dispatch = _dispatch_whatsapp_auto_reply(result)
     log_event(
         logger,
         logging.INFO,
@@ -130,5 +327,11 @@ def whatsapp_webhook(
         classification=result.get("classification"),
         auto_reply=result.get("auto_reply"),
         handoff_required=result.get("handoff_required"),
+        auto_reply_dispatched=bool(auto_reply_dispatch),
     )
-    return WhatsAppWebhookResponse(**result)
+    return {
+        **result,
+        "payload_mode": payload_mode,
+        "provider_message_id": normalized_payload.get("provider_message_id"),
+        "auto_reply_dispatch": auto_reply_dispatch,
+    }

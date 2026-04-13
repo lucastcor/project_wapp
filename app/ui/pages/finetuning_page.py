@@ -117,3 +117,76 @@ def render_finetuning_page(page_context: dict[str, Any]) -> None:
             value=str(validation_payload.get("dataset")),
             height=220,
         )
+
+    st.divider()
+    st.subheader("Importador de Base Histórica / CRM")
+    st.caption(
+        "Importe CSV ou JSON com conversas históricas para atualizar customer_profile e gerar message_examples para curadoria."
+    )
+
+    uploaded_file = st.file_uploader(
+        "Arquivo CSV ou JSON",
+        type=["csv", "json"],
+        accept_multiple_files=False,
+    )
+
+    with st.form("training_import_form"):
+        import_format = st.selectbox("Formato", options=["csv", "json"], index=0)
+        delimiter = st.text_input("Delimitador CSV", value=",")
+        default_profile_name = st.text_input("Profile padrão", value="default")
+        default_scenario_type = st.text_input("Scenario padrão", value="general")
+        default_quality_score = st.number_input(
+            "Quality score padrão",
+            min_value=0.0,
+            max_value=10.0,
+            value=7.0,
+            step=0.5,
+        )
+        col_import_1, col_import_2 = st.columns(2)
+        with col_import_1:
+            dry_run = st.checkbox("Pré-visualizar sem gravar", value=True)
+            update_contacts = st.checkbox("Atualizar contatos", value=True)
+        with col_import_2:
+            create_examples = st.checkbox("Criar message_examples", value=True)
+            auto_promote = st.checkbox("Promover exemplos elegíveis para treino", value=False)
+
+        submitted_import = st.form_submit_button("Processar importação", use_container_width=True)
+        if submitted_import:
+            if uploaded_file is None:
+                st.error("Selecione um arquivo CSV ou JSON para importar.")
+            else:
+                try:
+                    raw_text = uploaded_file.getvalue().decode("utf-8")
+                    result = client.import_training_records(
+                        fmt=import_format,
+                        raw_text=raw_text,
+                        delimiter=delimiter,
+                        dry_run=dry_run,
+                        update_contacts=update_contacts,
+                        create_message_examples=create_examples,
+                        auto_promote_eligible_examples=auto_promote,
+                        default_profile_name=default_profile_name.strip() or "default",
+                        default_scenario_type=default_scenario_type.strip() or "general",
+                        default_quality_score=float(default_quality_score),
+                        company_id=selected_company_id,
+                    )
+                    st.session_state["training_import_result"] = result
+                except AdminApiClientError as exc:
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.error(f"Erro inesperado ao importar base histórica: {exc}")
+
+    import_result = st.session_state.get("training_import_result")
+    if import_result:
+        st.write(
+            f"Registros lidos: {import_result.get('parsed_records')} | "
+            f"Contatos: {import_result.get('contacts_to_update')} | "
+            f"Examples: {import_result.get('message_examples_to_create')} | "
+            f"Elegíveis: {import_result.get('eligible_examples')}"
+        )
+        if import_result.get("errors"):
+            st.warning(f"Linhas com problema: {len(import_result.get('errors') or [])}")
+            st.json(import_result.get("errors"))
+        if import_result.get("preview"):
+            st.subheader("Preview")
+            st.dataframe(import_result.get("preview"), use_container_width=True)

@@ -279,3 +279,225 @@ class OpenAIProvider:
 
         content = response.output_text
         return json.loads(content)
+
+    def interpret_appointment_queue_reply(
+        self,
+        *,
+        stage: str,
+        customer_message: str,
+        desired_title: str | None = None,
+        offered_starts_at: str | None = None,
+        timezone_name: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_stage = stage.strip().lower()
+        if normalized_stage not in {"slot_offer", "queue_membership"}:
+            raise ValueError("stage must be slot_offer or queue_membership.")
+
+        service_label = desired_title or "o atendimento"
+        offered_slot = offered_starts_at or "não informado"
+        timezone_label = timezone_name or "não informado"
+
+        response = self.client.responses.create(
+            model=self.model,
+            input=(
+                "Você interpreta a intenção do cliente em uma conversa de remanejamento de agenda no WhatsApp. "
+                "Sua função é entender linguagem natural, inclusive respostas indiretas como "
+                "'vou confirmar aqui', 'me dá um minuto', 'não consigo esse horário mas quero continuar aguardando' "
+                "ou 'pode me tirar da fila'. "
+                "Não escreva a resposta para o cliente. "
+                "Retorne apenas JSON válido.\n\n"
+                "Contexto dos estágios:\n"
+                "- slot_offer: o cliente recebeu uma vaga que abriu e está decidindo se aceita, se precisa de um tempo, "
+                "se recusa essa vaga, se quer continuar na fila ou se quer sair da fila.\n"
+                "- queue_membership: o cliente está decidindo apenas se quer continuar na fila para próximas vagas ou sair dela.\n\n"
+                "Intents válidas:\n"
+                "- accept_offer: o cliente aceitou claramente a vaga oferecida.\n"
+                "- wait: o cliente pediu um tempo para confirmar, verificar agenda, falar com alguém ou checar disponibilidade.\n"
+                "- decline_offer: o cliente recusou a vaga atual, mas não deixou claro se quer continuar ou sair da fila.\n"
+                "- decline_offer_keep_queue: o cliente recusou a vaga atual e deixou claro que quer continuar aguardando futuras vagas.\n"
+                "- decline_offer_leave_queue: o cliente recusou a vaga atual e deixou claro que não quer mais ficar na fila.\n"
+                "- continue_queue: o cliente confirmou que quer continuar na fila para próximas vagas.\n"
+                "- leave_queue: o cliente confirmou que quer sair da fila.\n"
+                "- unclear: a mensagem não permite uma decisão segura.\n\n"
+                "Regras:\n"
+                "- Use apenas a intent mais adequada para a mensagem do cliente.\n"
+                "- Se houver pedido de tempo para verificar ou confirmar, prefira wait.\n"
+                "- Se a mensagem combinar recusa da vaga atual com desejo explícito de seguir aguardando, use decline_offer_keep_queue.\n"
+                "- Se a mensagem combinar recusa da vaga atual com pedido explícito para não receber mais vagas, use decline_offer_leave_queue.\n"
+                "- Em queue_membership, prefira continue_queue ou leave_queue.\n"
+                "- confidence deve ser um número entre 0 e 1.\n"
+                "- reason deve ser curta e objetiva.\n\n"
+                f"stage: {normalized_stage}\n"
+                f"serviço/atendimento: {service_label}\n"
+                f"vaga oferecida: {offered_slot}\n"
+                f"timezone: {timezone_label}\n"
+                f"mensagem do cliente: {customer_message}\n"
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "appointment_queue_reply",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "intent": {
+                                "type": "string",
+                                "enum": [
+                                    "accept_offer",
+                                    "wait",
+                                    "decline_offer",
+                                    "decline_offer_keep_queue",
+                                    "decline_offer_leave_queue",
+                                    "continue_queue",
+                                    "leave_queue",
+                                    "unclear",
+                                ],
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                            "reason": {
+                                "type": "string",
+                            },
+                        },
+                        "required": ["intent", "confidence", "reason"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                }
+            },
+        )
+
+        content = response.output_text
+        return json.loads(content)
+
+    def interpret_booking_change_request(
+        self,
+        *,
+        customer_message: str,
+        booking_summaries: list[str],
+    ) -> dict[str, Any]:
+        response = self.client.responses.create(
+            model=self.model,
+            input=(
+                "Você interpreta a intenção de um cliente que já possui agendamento e escreveu no WhatsApp.\n\n"
+                "Sua função é dizer se ele quer cancelar, reagendar, manter como está ou se a mensagem está ambígua. "
+                "Considere linguagem natural como 'preciso mudar meu horário', 'acho que não vou conseguir ir', "
+                "'tem como remarcar?', 'quero cancelar', 'vou manter', 'deixa como está'.\n\n"
+                "Intents válidas:\n"
+                "- cancel_booking\n"
+                "- reschedule_booking\n"
+                "- keep_booking\n"
+                "- unclear\n\n"
+                "Regras:\n"
+                "- Retorne apenas JSON válido.\n"
+                "- confidence deve ficar entre 0 e 1.\n"
+                "- reason deve ser curta.\n\n"
+                f"Agendamentos atuais: {json.dumps(booking_summaries, ensure_ascii=False)}\n"
+                f"Mensagem do cliente: {customer_message}\n"
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "booking_change_request",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "intent": {
+                                "type": "string",
+                                "enum": [
+                                    "cancel_booking",
+                                    "reschedule_booking",
+                                    "keep_booking",
+                                    "unclear",
+                                ],
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "minimum": 0,
+                                "maximum": 1,
+                            },
+                            "reason": {
+                                "type": "string",
+                            },
+                        },
+                        "required": ["intent", "confidence", "reason"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                }
+            },
+        )
+
+        content = response.output_text
+        return json.loads(content)
+
+    def extract_operator_booking_command(
+        self,
+        *,
+        operator_message: str,
+    ) -> dict[str, Any]:
+        response = self.client.responses.create(
+            model=self.model,
+            input=(
+                "Você interpreta uma instrução interna enviada por dono ou atendente da empresa pelo WhatsApp.\n\n"
+                "Sua função é extrair apenas o necessário para uma operação de agendamento para cliente. "
+                "Considere mensagens como 'marca a Maria amanhã às 14h', "
+                "'agenda o cliente João para sexta de manhã', "
+                "'quero encaixar a Ana para consultoria na quarta às 10h'.\n\n"
+                "Intents válidas:\n"
+                "- schedule_for_customer\n"
+                "- unclear\n\n"
+                "Campos:\n"
+                "- customer_reference: nome, telefone ou identificador mencionado.\n"
+                "- service_name: nome do serviço se houver.\n"
+                "- customer_profile: perfil do cliente se ficar explícito, como new_customer, returning_customer, vip.\n"
+                "- reason: curta.\n\n"
+                "Regras:\n"
+                "- Retorne apenas JSON válido.\n"
+                "- Se faltar referência de cliente, use intent unclear.\n"
+                "- Não invente dados ausentes.\n\n"
+                f"Mensagem do operador: {operator_message}\n"
+            ),
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "operator_booking_command",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "intent": {
+                                "type": "string",
+                                "enum": ["schedule_for_customer", "unclear"],
+                            },
+                            "customer_reference": {
+                                "type": ["string", "null"],
+                            },
+                            "service_name": {
+                                "type": ["string", "null"],
+                            },
+                            "customer_profile": {
+                                "type": ["string", "null"],
+                            },
+                            "reason": {
+                                "type": "string",
+                            },
+                        },
+                        "required": [
+                            "intent",
+                            "customer_reference",
+                            "service_name",
+                            "customer_profile",
+                            "reason",
+                        ],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                }
+            },
+        )
+
+        content = response.output_text
+        return json.loads(content)

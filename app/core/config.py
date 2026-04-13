@@ -12,6 +12,7 @@ class Settings:
     debug: bool = os.getenv("DEBUG", "true").lower() == "true"
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     log_json: bool = os.getenv("LOG_JSON", "true").lower() == "true"
+    strict_runtime_validation: bool = os.getenv("STRICT_RUNTIME_VALIDATION", "false").lower() == "true"
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///project_wapp.db")
     postgres_database_url: str | None = os.getenv("POSTGRES_DATABASE_URL")
     database_pool_size: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
@@ -21,6 +22,8 @@ class Settings:
     admin_viewer_token: str | None = os.getenv("ADMIN_VIEWER_TOKEN")
     admin_operator_token: str | None = os.getenv("ADMIN_OPERATOR_TOKEN")
     admin_superadmin_token: str | None = os.getenv("ADMIN_SUPERADMIN_TOKEN")
+    platform_session_secret: str | None = os.getenv("PLATFORM_SESSION_SECRET")
+    platform_session_ttl_seconds: int = int(os.getenv("PLATFORM_SESSION_TTL_SECONDS", "28800"))
     audit_retention_days: int = int(os.getenv("AUDIT_RETENTION_DAYS", "90"))
     reminder_worker_enabled: bool = os.getenv("REMINDER_WORKER_ENABLED", "false").lower() == "true"
     reminder_worker_poll_seconds: int = int(os.getenv("REMINDER_WORKER_POLL_SECONDS", "60"))
@@ -30,6 +33,9 @@ class Settings:
     ).lower() == "true"
     reminder_worker_channel: str | None = os.getenv("REMINDER_WORKER_CHANNEL")
     reminder_worker_audiences: str = os.getenv("REMINDER_WORKER_AUDIENCES", "customer,internal")
+    appointment_queue_auto_dispatch: bool = os.getenv("APPOINTMENT_QUEUE_AUTO_DISPATCH", "true").lower() == "true"
+    appointment_queue_response_window_minutes: int = int(os.getenv("APPOINTMENT_QUEUE_RESPONSE_WINDOW_MINUTES", "30"))
+    appointment_queue_wait_followup_minutes: int = int(os.getenv("APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES", "30"))
     admin_app_api_base_url: str = os.getenv("ADMIN_APP_API_BASE_URL", "http://127.0.0.1:8000")
 
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
@@ -59,6 +65,8 @@ class Settings:
     whatsapp_api_base_url: str | None = os.getenv("WHATSAPP_API_BASE_URL")
     whatsapp_api_token: str | None = os.getenv("WHATSAPP_API_TOKEN")
     whatsapp_phone_number_id: str | None = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    whatsapp_webhook_verify_token: str | None = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
+    whatsapp_app_secret: str | None = os.getenv("WHATSAPP_APP_SECRET")
 
 
 settings = Settings()

@@ -37,6 +37,10 @@ def _make_check(
     }
 
 
+def _production_guard_enabled() -> bool:
+    return settings.strict_runtime_validation or settings.environment.lower() == "production"
+
+
 def _configured_admin_roles() -> list[str]:
     roles: list[str] = []
     if settings.admin_viewer_token:
@@ -46,6 +50,11 @@ def _configured_admin_roles() -> list[str]:
     if settings.admin_superadmin_token or settings.admin_api_token:
         roles.append("superadmin")
     return roles
+
+
+def _required_admin_roles_configured() -> bool:
+    required_roles = {"viewer", "operator", "superadmin"}
+    return required_roles.issubset(set(_configured_admin_roles()))
 
 
 def _configured_reminder_worker_audiences() -> list[str]:
@@ -76,6 +85,7 @@ def get_system_profile() -> dict[str, Any]:
             "version": settings.app_version,
             "environment": settings.environment,
             "debug": settings.debug,
+            "strict_runtime_validation": settings.strict_runtime_validation,
         },
         "database": {
             "runtime": runtime_database,
@@ -108,6 +118,8 @@ def get_system_profile() -> dict[str, Any]:
                     settings.whatsapp_phone_number_id,
                 ]
             ),
+            "whatsapp_webhook_verification_configured": bool(settings.whatsapp_webhook_verify_token),
+            "whatsapp_signature_validation_configured": bool(settings.whatsapp_app_secret),
             "calendar_provider": settings.calendar_provider,
             "calendar_timezone": settings.calendar_timezone,
             "calendar_ready": calendar_profile["provider_readiness"]["ready"],
@@ -123,6 +135,9 @@ def get_system_profile() -> dict[str, Any]:
             "reminder_worker_dispatch_immediately": settings.reminder_worker_dispatch_immediately,
             "reminder_worker_audiences": _configured_reminder_worker_audiences(),
             "reminder_worker_channel": settings.reminder_worker_channel,
+            "appointment_queue_auto_dispatch": settings.appointment_queue_auto_dispatch,
+            "appointment_queue_response_window_minutes": settings.appointment_queue_response_window_minutes,
+            "appointment_queue_wait_followup_minutes": settings.appointment_queue_wait_followup_minutes,
         },
     }
 
@@ -136,6 +151,7 @@ def get_system_readiness() -> dict[str, Any]:
     global_context = get_company_context_status()
     configured_roles = _configured_admin_roles()
     calendar_profile = get_calendar_profile()
+    production_guard_enabled = _production_guard_enabled()
 
     checks: list[dict[str, str | None]] = []
 
@@ -168,7 +184,7 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
-    admin_auth_status = "pass" if settings.enable_admin_auth else "warn"
+    admin_auth_status = "pass" if settings.enable_admin_auth else ("fail" if production_guard_enabled else "warn")
     admin_auth_detail = (
         f"Autenticacao admin habilitada com papéis: {', '.join(configured_roles) or 'nenhum'}."
         if settings.enable_admin_auth
@@ -179,7 +195,7 @@ def get_system_readiness() -> dict[str, Any]:
             code="admin_auth",
             title="Autenticacao administrativa",
             status=admin_auth_status,
-            severity="blocker" if settings.environment == "production" else "warning",
+            severity="blocker" if production_guard_enabled else "warning",
             detail=admin_auth_detail,
             recommendation="Habilitar ENABLE_ADMIN_AUTH e definir tokens por papel antes de operar clientes reais."
             if not settings.enable_admin_auth
@@ -187,20 +203,20 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
-    role_tokens_status = "pass" if configured_roles else "warn"
+    role_tokens_status = "pass" if _required_admin_roles_configured() else ("fail" if production_guard_enabled else "warn")
     checks.append(
         _make_check(
             code="admin_roles",
             title="RBAC administrativo",
             status=role_tokens_status,
-            severity="warning",
+            severity="blocker" if production_guard_enabled else "warning",
             detail=(
                 f"Papéis configurados: {', '.join(configured_roles)}."
                 if configured_roles
                 else "Nenhum token de papel configurado."
             ),
-            recommendation="Configurar ao menos viewer, operator e superadmin para separar operação."
-            if not configured_roles
+            recommendation="Configurar viewer, operator e superadmin para separar operação com RBAC completo."
+            if not _required_admin_roles_configured()
             else None,
         )
     )
@@ -221,7 +237,11 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
-    openai_required = settings.classification_provider == "openai" or settings.enable_finetuning_pipeline
+    openai_required = (
+        production_guard_enabled
+        or settings.classification_provider == "openai"
+        or settings.enable_finetuning_pipeline
+    )
     openai_status = "pass" if settings.openai_api_key else ("fail" if openai_required else "warn")
     checks.append(
         _make_check(
@@ -238,7 +258,26 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
-    whatsapp_required = settings.outbound_provider == "whatsapp"
+    outbound_provider_ready = settings.outbound_provider == "whatsapp"
+    outbound_provider_status = "pass" if outbound_provider_ready else ("fail" if production_guard_enabled else "warn")
+    checks.append(
+        _make_check(
+            code="outbound_provider",
+            title="Provider outbound",
+            status=outbound_provider_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Provider outbound configurado para WhatsApp."
+                if outbound_provider_ready
+                else f"Provider atual: {settings.outbound_provider}."
+            ),
+            recommendation="Definir OUTBOUND_PROVIDER=whatsapp para dispatch automático em produção."
+            if not outbound_provider_ready
+            else None,
+        )
+    )
+
+    whatsapp_required = settings.outbound_provider == "whatsapp" or production_guard_enabled
     whatsapp_configured = all(
         [
             settings.whatsapp_api_base_url,
@@ -261,6 +300,48 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+    whatsapp_webhook_verify_status = (
+        "pass"
+        if settings.whatsapp_webhook_verify_token
+        else ("fail" if production_guard_enabled else "warn")
+    )
+    checks.append(
+        _make_check(
+            code="whatsapp_webhook_verification",
+            title="Verificação do webhook WhatsApp",
+            status=whatsapp_webhook_verify_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Token de verificação do webhook configurado."
+                if settings.whatsapp_webhook_verify_token
+                else "WHATSAPP_WEBHOOK_VERIFY_TOKEN ausente."
+            ),
+            recommendation="Definir WHATSAPP_WEBHOOK_VERIFY_TOKEN para concluir o handshake do provedor real."
+            if not settings.whatsapp_webhook_verify_token
+            else None,
+        )
+    )
+    whatsapp_signature_status = (
+        "pass"
+        if settings.whatsapp_app_secret
+        else ("fail" if production_guard_enabled else "warn")
+    )
+    checks.append(
+        _make_check(
+            code="whatsapp_signature_validation",
+            title="Assinatura do webhook WhatsApp",
+            status=whatsapp_signature_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "App secret configurado para validar assinatura do webhook."
+                if settings.whatsapp_app_secret
+                else "WHATSAPP_APP_SECRET ausente."
+            ),
+            recommendation="Definir WHATSAPP_APP_SECRET para validar a origem do POST do Meta."
+            if not settings.whatsapp_app_secret
+            else None,
+        )
+    )
     checks.append(
         _make_check(
             code="calendar_provider",
@@ -277,8 +358,8 @@ def get_system_readiness() -> dict[str, Any]:
         _make_check(
             code="reminder_worker",
             title="Worker de lembretes",
-            status="pass" if settings.reminder_worker_enabled else "warn",
-            severity="warning",
+            status="pass" if settings.reminder_worker_enabled else ("fail" if production_guard_enabled else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
             detail=(
                 "Worker recorrente habilitado para processar lembretes vencidos."
                 if settings.reminder_worker_enabled
@@ -291,10 +372,13 @@ def get_system_readiness() -> dict[str, Any]:
     )
 
     postgres_in_runtime = runtime_backend == "postgres"
-    postgres_status = "pass" if postgres_probe["ok"] else "warn"
+    postgres_required = production_guard_enabled or postgres_in_runtime
+    postgres_status = "pass" if postgres_probe["ok"] and postgres_in_runtime else ("fail" if postgres_required else "warn")
     postgres_detail = (
         "Postgres já é o banco de runtime e respondeu ao probe."
         if postgres_in_runtime and postgres_probe["ok"]
+        else "O runtime ainda não está usando Postgres."
+        if production_guard_enabled and not postgres_in_runtime
         else str(postgres_probe["detail"])
         if postgres_target["configured"]
         else "POSTGRES_DATABASE_URL ainda não foi configurada."
@@ -304,10 +388,10 @@ def get_system_readiness() -> dict[str, Any]:
             code="postgres_target",
             title="Runtime/target Postgres",
             status=postgres_status,
-            severity="warning",
+            severity="blocker" if production_guard_enabled else "warning",
             detail=postgres_detail,
-            recommendation="Configurar POSTGRES_DATABASE_URL e validar conectividade antes da migração de produção."
-            if not postgres_probe["ok"]
+            recommendation="Configurar DATABASE_URL e POSTGRES_DATABASE_URL para Postgres e validar conectividade antes da operação real."
+            if not (postgres_probe["ok"] and postgres_in_runtime)
             else None,
         )
     )

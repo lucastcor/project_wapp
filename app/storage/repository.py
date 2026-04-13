@@ -323,6 +323,8 @@ class RuntimeRepository:
         contact_id: str,
         contact_name: str | None,
         company_id: int | None = None,
+        customer_profile: str | None = None,
+        notes: str | None = None,
     ) -> None:
         connection = get_connection()
         cursor = connection.cursor()
@@ -341,10 +343,12 @@ class RuntimeRepository:
                 UPDATE contacts
                 SET
                     contact_name = COALESCE(?, contact_name),
-                    company_id = COALESCE(?, company_id)
+                    company_id = COALESCE(?, company_id),
+                    customer_profile = COALESCE(?, customer_profile),
+                    notes = COALESCE(?, notes)
                 WHERE contact_id = ?
                 """,
-                (contact_name, company_id, contact_id),
+                (contact_name, company_id, customer_profile, notes, contact_id),
             )
 
         connection.commit()
@@ -448,6 +452,8 @@ class RuntimeRepository:
                 pipeline_stage,
                 next_action,
                 lead_temperature,
+                customer_profile,
+                notes,
                 updated_at
             FROM contacts
             WHERE contact_id = ?
@@ -514,6 +520,8 @@ class RuntimeRepository:
                 pipeline_stage,
                 next_action,
                 lead_temperature,
+                customer_profile,
+                notes,
                 updated_at
             FROM contacts
             ORDER BY contact_id
@@ -524,6 +532,101 @@ class RuntimeRepository:
         connection.close()
 
         return [dict(row) for row in rows]
+
+    def search_contacts(
+        self,
+        *,
+        query: str,
+        company_id: int | None = None,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        normalized_query = str(query or "").strip()
+        if not normalized_query:
+            return []
+
+        connection = get_connection()
+        cursor = connection.cursor()
+        like_query = f"%{normalized_query.lower()}%"
+
+        cursor.execute(
+            """
+            SELECT
+                contact_id,
+                contact_name,
+                company_id,
+                last_classification,
+                last_interaction_at,
+                conversation_summary,
+                pipeline_stage,
+                next_action,
+                lead_temperature,
+                customer_profile,
+                notes,
+                updated_at
+            FROM contacts
+            WHERE (? IS NULL OR company_id = ?)
+              AND (
+                LOWER(COALESCE(contact_name, '')) LIKE ?
+                OR LOWER(COALESCE(contact_id, '')) LIKE ?
+              )
+            ORDER BY
+                CASE
+                    WHEN LOWER(COALESCE(contact_name, '')) = ? THEN 0
+                    WHEN LOWER(COALESCE(contact_id, '')) = ? THEN 0
+                    WHEN LOWER(COALESCE(contact_name, '')) LIKE ? THEN 1
+                    WHEN LOWER(COALESCE(contact_id, '')) LIKE ? THEN 1
+                    ELSE 2
+                END,
+                updated_at DESC,
+                contact_name ASC,
+                contact_id ASC
+            LIMIT ?
+            """,
+            (
+                company_id,
+                company_id,
+                like_query,
+                like_query,
+                normalized_query.lower(),
+                normalized_query.lower(),
+                f"{normalized_query.lower()}%",
+                f"{normalized_query.lower()}%",
+                max(1, limit),
+            ),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def update_contact(
+        self,
+        contact_id: str,
+        *,
+        contact_name: str | None = None,
+        company_id: int | None = None,
+        customer_profile: str | None = None,
+        notes: str | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE contacts
+            SET
+                contact_name = COALESCE(?, contact_name),
+                company_id = COALESCE(?, company_id),
+                customer_profile = COALESCE(?, customer_profile),
+                notes = COALESCE(?, notes),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE contact_id = ?
+            """,
+            (contact_name, company_id, customer_profile, notes, contact_id),
+        )
+
+        connection.commit()
+        connection.close()
 
     def create_pending_question(
         self,
@@ -1794,6 +1897,8 @@ class RuntimeRepository:
         contact_id: str | None = None,
         integration_id: int | None = None,
         external_event_id: str | None = None,
+        scheduling_profile_key: str | None = None,
+        customer_profile: str | None = None,
         description: str | None = None,
         status: str = "confirmed",
     ) -> int:
@@ -1808,6 +1913,8 @@ class RuntimeRepository:
                 integration_id,
                 provider,
                 external_event_id,
+                scheduling_profile_key,
+                customer_profile,
                 title,
                 description,
                 starts_at,
@@ -1816,7 +1923,7 @@ class RuntimeRepository:
                 status,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             """,
             (
                 company_id,
@@ -1824,6 +1931,8 @@ class RuntimeRepository:
                 integration_id,
                 provider,
                 external_event_id,
+                scheduling_profile_key,
+                customer_profile,
                 title,
                 description,
                 starts_at,
@@ -1842,6 +1951,7 @@ class RuntimeRepository:
         self,
         company_id: int | None = None,
         status: str | None = None,
+        contact_id: str | None = None,
     ) -> list[dict[str, Any]]:
         connection = get_connection()
         cursor = connection.cursor()
@@ -1855,6 +1965,8 @@ class RuntimeRepository:
                 integration_id,
                 provider,
                 external_event_id,
+                scheduling_profile_key,
+                customer_profile,
                 title,
                 description,
                 starts_at,
@@ -1865,15 +1977,49 @@ class RuntimeRepository:
                 updated_at
             FROM appointment_bookings
             WHERE (? IS NULL OR company_id = ?)
+              AND (? IS NULL OR contact_id = ?)
               AND (? IS NULL OR status = ?)
             ORDER BY starts_at ASC, id ASC
             """,
-            (company_id, company_id, status, status),
+            (company_id, company_id, contact_id, contact_id, status, status),
         )
 
         rows = cursor.fetchall()
         connection.close()
         return [dict(row) for row in rows]
+
+    def get_appointment_booking(self, booking_id: int) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                integration_id,
+                provider,
+                external_event_id,
+                scheduling_profile_key,
+                customer_profile,
+                title,
+                description,
+                starts_at,
+                ends_at,
+                timezone,
+                status,
+                created_at,
+                updated_at
+            FROM appointment_bookings
+            WHERE id = ?
+            """,
+            (booking_id,),
+        )
+
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
 
     def get_appointment_bookings_between(
         self,
@@ -1893,6 +2039,8 @@ class RuntimeRepository:
                 integration_id,
                 provider,
                 external_event_id,
+                scheduling_profile_key,
+                customer_profile,
                 title,
                 description,
                 starts_at,
@@ -1914,6 +2062,71 @@ class RuntimeRepository:
         rows = cursor.fetchall()
         connection.close()
         return [dict(row) for row in rows]
+
+    def update_appointment_booking_status(self, booking_id: int, status: str) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE appointment_bookings
+            SET
+                status = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (status, booking_id),
+        )
+
+        connection.commit()
+        connection.close()
+
+    def update_appointment_booking_schedule(
+        self,
+        booking_id: int,
+        *,
+        starts_at: str,
+        ends_at: str,
+        timezone: str,
+        external_event_id: str | None,
+        scheduling_profile_key: str | None = None,
+        customer_profile: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE appointment_bookings
+            SET
+                starts_at = ?,
+                ends_at = ?,
+                timezone = ?,
+                external_event_id = ?,
+                scheduling_profile_key = ?,
+                customer_profile = ?,
+                title = COALESCE(?, title),
+                description = COALESCE(?, description),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                starts_at,
+                ends_at,
+                timezone,
+                external_event_id,
+                scheduling_profile_key,
+                customer_profile,
+                title,
+                description,
+                booking_id,
+            ),
+        )
+
+        connection.commit()
+        connection.close()
 
     def get_active_conversation_flow(
         self,
@@ -2273,6 +2486,392 @@ class RuntimeRepository:
             WHERE id = ?
             """,
             (outbound_message_id, reminder_id),
+        )
+
+        connection.commit()
+        connection.close()
+
+    def cancel_customer_reminders_for_booking(self, appointment_booking_id: int) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE customer_reminders
+            SET
+                status = 'cancelled',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE appointment_booking_id = ?
+              AND status = 'pending'
+            """,
+            (appointment_booking_id,),
+        )
+
+        updated_count = int(cursor.rowcount)
+        connection.commit()
+        connection.close()
+        return updated_count
+
+    def create_appointment_queue_entry(
+        self,
+        *,
+        company_id: int | None,
+        contact_id: str,
+        desired_title: str,
+        scheduling_profile_key: str | None,
+        customer_profile: str | None,
+        request_summary: str | None,
+        timezone: str,
+        earliest_starts_at: str | None,
+        latest_starts_at: str | None,
+        preferred_periods: list[str] | None,
+        priority_tier: str,
+        priority_score: int,
+        accepts_short_notice: bool,
+        original_booking_id: int | None,
+        status: str = "active",
+        source: str = "manual",
+        notes: str | None = None,
+    ) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO appointment_queue_entries (
+                company_id,
+                contact_id,
+                desired_title,
+                scheduling_profile_key,
+                customer_profile,
+                request_summary,
+                timezone,
+                earliest_starts_at,
+                latest_starts_at,
+                preferred_periods_json,
+                priority_tier,
+                priority_score,
+                accepts_short_notice,
+                original_booking_id,
+                status,
+                source,
+                notes,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                company_id,
+                contact_id,
+                desired_title,
+                scheduling_profile_key,
+                customer_profile,
+                request_summary,
+                timezone,
+                earliest_starts_at,
+                latest_starts_at,
+                json.dumps(preferred_periods or [], ensure_ascii=False),
+                priority_tier,
+                priority_score,
+                int(accepts_short_notice),
+                original_booking_id,
+                status,
+                source,
+                notes,
+            ),
+        )
+
+        entry_id = int(cursor.lastrowid)
+        connection.commit()
+        connection.close()
+        return entry_id
+
+    def get_appointment_queue_entries(
+        self,
+        *,
+        company_id: int | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                contact_id,
+                desired_title,
+                scheduling_profile_key,
+                customer_profile,
+                request_summary,
+                timezone,
+                earliest_starts_at,
+                latest_starts_at,
+                preferred_periods_json,
+                priority_tier,
+                priority_score,
+                accepts_short_notice,
+                original_booking_id,
+                status,
+                source,
+                notes,
+                created_at,
+                updated_at
+            FROM appointment_queue_entries
+            WHERE (? IS NULL OR company_id = ?)
+              AND (? IS NULL OR status = ?)
+            ORDER BY priority_score DESC, created_at ASC, id ASC
+            """,
+            (company_id, company_id, status, status),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            preferred_periods_json = item.get("preferred_periods_json")
+            try:
+                item["preferred_periods"] = json.loads(preferred_periods_json) if preferred_periods_json else []
+            except json.JSONDecodeError:
+                item["preferred_periods"] = []
+            item.pop("preferred_periods_json", None)
+            result.append(item)
+        return result
+
+    def get_appointment_queue_entry(self, entry_id: int) -> dict[str, Any] | None:
+        entries = self.get_appointment_queue_entries()
+        for entry in entries:
+            if int(entry["id"]) == entry_id:
+                return entry
+        return None
+
+    def update_appointment_queue_entry_status(
+        self,
+        entry_id: int,
+        *,
+        status: str,
+        notes: str | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        if notes is None:
+            cursor.execute(
+                """
+                UPDATE appointment_queue_entries
+                SET
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, entry_id),
+            )
+        else:
+            cursor.execute(
+                """
+                UPDATE appointment_queue_entries
+                SET
+                    status = ?,
+                    notes = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, notes, entry_id),
+            )
+
+        connection.commit()
+        connection.close()
+
+    def create_appointment_queue_offer(
+        self,
+        *,
+        company_id: int | None,
+        queue_entry_id: int,
+        released_booking_id: int | None,
+        outbound_message_id: int | None,
+        new_booking_id: int | None,
+        offered_starts_at: str,
+        offered_ends_at: str,
+        timezone: str,
+        status: str = "pending",
+        response_deadline_at: str | None = None,
+        follow_up_after: str | None = None,
+        responded_at: str | None = None,
+        response_notes: str | None = None,
+    ) -> int:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            INSERT INTO appointment_queue_offers (
+                company_id,
+                queue_entry_id,
+                released_booking_id,
+                outbound_message_id,
+                new_booking_id,
+                offered_starts_at,
+                offered_ends_at,
+                timezone,
+                status,
+                response_deadline_at,
+                follow_up_after,
+                responded_at,
+                response_notes,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """,
+            (
+                company_id,
+                queue_entry_id,
+                released_booking_id,
+                outbound_message_id,
+                new_booking_id,
+                offered_starts_at,
+                offered_ends_at,
+                timezone,
+                status,
+                response_deadline_at,
+                follow_up_after,
+                responded_at,
+                response_notes,
+            ),
+        )
+
+        offer_id = int(cursor.lastrowid)
+        connection.commit()
+        connection.close()
+        return offer_id
+
+    def get_appointment_queue_offers(
+        self,
+        *,
+        company_id: int | None = None,
+        status: str | None = None,
+        released_booking_id: int | None = None,
+        queue_entry_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                queue_entry_id,
+                released_booking_id,
+                outbound_message_id,
+                new_booking_id,
+                offered_starts_at,
+                offered_ends_at,
+                timezone,
+                status,
+                response_deadline_at,
+                follow_up_after,
+                responded_at,
+                response_notes,
+                created_at,
+                updated_at
+            FROM appointment_queue_offers
+            WHERE (? IS NULL OR company_id = ?)
+              AND (? IS NULL OR status = ?)
+              AND (? IS NULL OR released_booking_id = ?)
+              AND (? IS NULL OR queue_entry_id = ?)
+            ORDER BY created_at ASC, id ASC
+            """,
+            (
+                company_id,
+                company_id,
+                status,
+                status,
+                released_booking_id,
+                released_booking_id,
+                queue_entry_id,
+                queue_entry_id,
+            ),
+        )
+
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
+
+    def get_appointment_queue_offer(self, offer_id: int) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT
+                id,
+                company_id,
+                queue_entry_id,
+                released_booking_id,
+                outbound_message_id,
+                new_booking_id,
+                offered_starts_at,
+                offered_ends_at,
+                timezone,
+                status,
+                response_deadline_at,
+                follow_up_after,
+                responded_at,
+                response_notes,
+                created_at,
+                updated_at
+            FROM appointment_queue_offers
+            WHERE id = ?
+            """,
+            (offer_id,),
+        )
+
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
+
+    def update_appointment_queue_offer(
+        self,
+        offer_id: int,
+        *,
+        status: str,
+        outbound_message_id: int | None = None,
+        new_booking_id: int | None = None,
+        response_deadline_at: str | None = None,
+        follow_up_after: str | None = None,
+        responded_at: str | None = None,
+        response_notes: str | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            UPDATE appointment_queue_offers
+            SET
+                status = ?,
+                outbound_message_id = COALESCE(?, outbound_message_id),
+                new_booking_id = COALESCE(?, new_booking_id),
+                response_deadline_at = ?,
+                follow_up_after = ?,
+                responded_at = ?,
+                response_notes = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (
+                status,
+                outbound_message_id,
+                new_booking_id,
+                response_deadline_at,
+                follow_up_after,
+                responded_at,
+                response_notes,
+                offer_id,
+            ),
         )
 
         connection.commit()

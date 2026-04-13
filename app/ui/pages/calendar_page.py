@@ -30,6 +30,8 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
         return
 
     readiness = profile.get("provider_readiness", {})
+    scheduling_profiles = profile.get("scheduling_profiles") or []
+    profile_options = [""] + [str(item.get("key") or "") for item in scheduling_profiles if item.get("key")]
     st.info(
         f"Provider ativo: {profile.get('integration', {}).get('provider')} | "
         f"Fonte: {profile.get('integration', {}).get('source')} | "
@@ -49,6 +51,13 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
             end_date = st.date_input("Data final", value=date.today() + timedelta(days=3))
             duration_minutes = st.number_input("Duração (min)", min_value=15, max_value=240, value=60, step=15)
             limit = st.number_input("Limite de slots", min_value=1, max_value=50, value=12, step=1)
+            scheduling_profile_key = st.selectbox(
+                "Scheduling profile",
+                options=profile_options,
+                format_func=lambda item: item or "Automático",
+            )
+            customer_profile = st.text_input("Customer profile", placeholder="new_customer, returning_customer...")
+            service_name = st.text_input("Serviço")
             submitted = st.form_submit_button("Buscar slots")
 
             if submitted:
@@ -59,6 +68,9 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
                         end_date=end_date.isoformat(),
                         duration_minutes=int(duration_minutes),
                         limit=int(limit),
+                        scheduling_profile_key=scheduling_profile_key or None,
+                        customer_profile=customer_profile.strip() or None,
+                        service_name=service_name.strip() or None,
                     )
                     st.session_state["calendar_availability_payload"] = availability
                 except AdminApiClientError as exc:
@@ -88,6 +100,16 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
             starts_at = st.text_input("Início ISO8601", value=default_start.isoformat())
             ends_at = st.text_input("Fim ISO8601", value=default_end.isoformat())
             timezone = st.text_input("Timezone", value="America/Sao_Paulo")
+            scheduling_profile_key_booking = st.selectbox(
+                "Scheduling profile da reserva",
+                options=profile_options,
+                format_func=lambda item: item or "Automático",
+                key="calendar_booking_scheduling_profile",
+            )
+            customer_profile_booking = st.text_input(
+                "Customer profile da reserva",
+                key="calendar_booking_customer_profile",
+            )
             description = st.text_area("Descrição", height=120)
             submitted_booking = st.form_submit_button("Criar reserva")
 
@@ -101,6 +123,8 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
                         ends_at=ends_at.strip(),
                         timezone=timezone.strip() or None,
                         description=description.strip() or None,
+                        scheduling_profile_key=scheduling_profile_key_booking or None,
+                        customer_profile=customer_profile_booking.strip() or None,
                     )
                     st.success(f"Reserva #{created['id']} criada com sucesso.")
                     st.rerun()
@@ -118,9 +142,53 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
                     st.write(f"**{booking.get('title')}**")
                     st.write(f"Início: {booking.get('starts_at')} | Fim: {booking.get('ends_at')}")
                     st.write(f"Provider: {booking.get('provider')} | Status: {booking.get('status')}")
+                    st.write(
+                        f"Scheduling profile: {booking.get('scheduling_profile_key') or '—'} | "
+                        f"Customer profile: {booking.get('customer_profile') or '—'}"
+                    )
                     st.caption(
                         f"Contato: {booking.get('contact_id') or '—'} | Company ID: {booking.get('company_id') or '—'} | TZ: {booking.get('timezone')}"
                     )
+                    with st.expander("Operar reserva"):
+                        with st.form(f"calendar_booking_ops_{booking.get('id')}"):
+                            new_starts_at = st.text_input("Novo início ISO8601", value=str(booking.get("starts_at") or ""))
+                            new_ends_at = st.text_input("Novo fim ISO8601", value=str(booking.get("ends_at") or ""))
+                            reschedule_reason = st.text_input("Observação", value=str(booking.get("description") or ""))
+                            col_ops_1, col_ops_2 = st.columns(2)
+                            with col_ops_1:
+                                submitted_reschedule = st.form_submit_button("Reagendar")
+                            with col_ops_2:
+                                submitted_cancel = st.form_submit_button("Cancelar")
+                            if submitted_reschedule:
+                                try:
+                                    client.reschedule_calendar_booking(
+                                        booking_id=int(booking["id"]),
+                                        starts_at=new_starts_at.strip(),
+                                        ends_at=new_ends_at.strip(),
+                                        timezone=str(booking.get("timezone") or "America/Sao_Paulo"),
+                                        description=reschedule_reason.strip() or None,
+                                        scheduling_profile_key=booking.get("scheduling_profile_key"),
+                                        customer_profile=booking.get("customer_profile"),
+                                    )
+                                    st.success("Reserva reagendada com sucesso.")
+                                    st.rerun()
+                                except AdminApiClientError as exc:
+                                    st.error(str(exc))
+                                except Exception as exc:
+                                    st.error(f"Erro inesperado ao reagendar reserva: {exc}")
+                            if submitted_cancel:
+                                try:
+                                    client.cancel_calendar_booking(
+                                        booking_id=int(booking["id"]),
+                                        trigger_queue_recovery=True,
+                                        reason="Cancelado via painel admin",
+                                    )
+                                    st.success("Reserva cancelada com sucesso.")
+                                    st.rerun()
+                                except AdminApiClientError as exc:
+                                    st.error(str(exc))
+                                except Exception as exc:
+                                    st.error(f"Erro inesperado ao cancelar reserva: {exc}")
 
     with tabs[3]:
         st.subheader("Lembretes")

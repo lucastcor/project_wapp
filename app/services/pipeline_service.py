@@ -1,6 +1,8 @@
+import logging
 from typing import Any
 
 from app.core.config import settings
+from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
 
 
@@ -15,6 +17,7 @@ VALID_PIPELINE_STAGES = {
 }
 
 VALID_LEAD_TEMPERATURES = {"cold", "warm", "hot"}
+logger = get_logger(__name__)
 
 
 def _fallback_pipeline_state(
@@ -98,8 +101,14 @@ def infer_pipeline_state(
             "next_action": next_action,
             "lead_temperature": lead_temperature,
         }
-    except Exception as e:
-        print("OPENAI PIPELINE ERROR:", repr(e))
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "pipeline.provider.fallback",
+            provider="openai",
+            error_type=type(exc).__name__,
+        )
         return _fallback_pipeline_state(
             conversation_summary=conversation_summary,
             latest_message=latest_message,

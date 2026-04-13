@@ -72,6 +72,78 @@ def _validate_company_context(data: dict[str, Any]) -> None:
     if not isinstance(data.get("enabled_modules"), dict):
         raise CompanyContextError("enabled_modules must be an object.")
 
+    scheduling_policy = data.get("scheduling_policy")
+    if scheduling_policy is not None and not isinstance(scheduling_policy, dict):
+        raise CompanyContextError("scheduling_policy must be an object when provided.")
+
+    profiles = scheduling_policy.get("profiles") if isinstance(scheduling_policy, dict) else None
+    if profiles is not None:
+        if not isinstance(profiles, list):
+            raise CompanyContextError("scheduling_policy.profiles must be a list when provided.")
+        profile_keys: set[str] = set()
+        for index, profile in enumerate(profiles):
+            if not isinstance(profile, dict):
+                raise CompanyContextError(f"scheduling_policy.profiles[{index}] must be an object.")
+            profile_key = str(profile.get("key") or "").strip()
+            if not profile_key:
+                raise CompanyContextError(
+                    f"scheduling_policy.profiles[{index}].key must be a non-empty string."
+                )
+            if profile_key in profile_keys:
+                raise CompanyContextError(
+                    f"scheduling_policy.profiles contains duplicate key: {profile_key}"
+                )
+            profile_keys.add(profile_key)
+
+    conversation_pipelines = data.get("conversation_pipelines")
+    if conversation_pipelines is not None:
+        if not isinstance(conversation_pipelines, list):
+            raise CompanyContextError("conversation_pipelines must be a list when provided.")
+
+        pipeline_keys: set[str] = set()
+        for index, pipeline in enumerate(conversation_pipelines):
+            if not isinstance(pipeline, dict):
+                raise CompanyContextError(f"conversation_pipelines[{index}] must be an object.")
+
+            pipeline_key = str(pipeline.get("key") or "").strip()
+            if not pipeline_key:
+                raise CompanyContextError(f"conversation_pipelines[{index}].key must be a non-empty string.")
+            if pipeline_key in pipeline_keys:
+                raise CompanyContextError(f"conversation_pipelines contains duplicate key: {pipeline_key}")
+            pipeline_keys.add(pipeline_key)
+
+            label = pipeline.get("label")
+            if label is not None and (not isinstance(label, str) or not label.strip()):
+                raise CompanyContextError(f"conversation_pipelines[{index}].label must be a non-empty string when provided.")
+
+            trigger_terms = pipeline.get("trigger_terms")
+            if trigger_terms is not None and not isinstance(trigger_terms, list):
+                raise CompanyContextError(f"conversation_pipelines[{index}].trigger_terms must be a list when provided.")
+
+            next_keys = pipeline.get("next_keys")
+            if next_keys is not None and not isinstance(next_keys, list):
+                raise CompanyContextError(f"conversation_pipelines[{index}].next_keys must be a list when provided.")
+
+            canvas_position = pipeline.get("canvas_position")
+            if canvas_position is not None:
+                if not isinstance(canvas_position, dict):
+                    raise CompanyContextError(f"conversation_pipelines[{index}].canvas_position must be an object when provided.")
+                x = canvas_position.get("x")
+                y = canvas_position.get("y")
+                if x is not None and not isinstance(x, (int, float)):
+                    raise CompanyContextError(f"conversation_pipelines[{index}].canvas_position.x must be numeric when provided.")
+                if y is not None and not isinstance(y, (int, float)):
+                    raise CompanyContextError(f"conversation_pipelines[{index}].canvas_position.y must be numeric when provided.")
+
+        for index, pipeline in enumerate(conversation_pipelines):
+            next_keys = pipeline.get("next_keys") or []
+            for next_key in next_keys:
+                normalized_next_key = str(next_key or "").strip()
+                if normalized_next_key and normalized_next_key not in pipeline_keys:
+                    raise CompanyContextError(
+                        f"conversation_pipelines[{index}].next_keys references unknown key: {normalized_next_key}"
+                    )
+
 
 def get_company_context(company_slug: str | None = None) -> dict[str, Any]:
     context_path = _get_company_context_path(company_slug)

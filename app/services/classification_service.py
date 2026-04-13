@@ -1,7 +1,12 @@
+import logging
 from typing import Any
 
 from app.core.config import settings
+from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
+
+
+logger = get_logger(__name__)
 
 
 def fallback_classification(message: str) -> dict[str, Any]:
@@ -75,6 +80,12 @@ def classify_message(message: str) -> dict[str, Any]:
             "confidence": float(result["confidence"]),
             "reason": result["reason"],
         }
-    except Exception as e:
-        print("OPENAI CLASSIFICATION ERROR:", repr(e))
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "classification.provider.fallback",
+            provider="openai",
+            error_type=type(exc).__name__,
+        )
         return fallback_classification(message)

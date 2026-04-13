@@ -1,12 +1,16 @@
 import logging
 import time
 import uuid
+from contextlib import asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.admin_routes import admin_router
+from app.api.platform_routes import PLATFORM_ASSETS_DIR, platform_router
 from app.api.routes import router
 from app.core.config import settings
 from app.core.logging import (
@@ -16,16 +20,26 @@ from app.core.logging import (
     log_event,
     set_request_context,
 )
+from app.services.runtime_guard_service import get_runtime_blockers, validate_runtime_environment
+from app.services.system_readiness_service import get_system_readiness
 from app.storage.db import check_runtime_database_connection, init_db
 
 configure_logging()
 logger = get_logger(__name__)
 
-init_db()
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_db()
+    validate_runtime_environment("api")
+    yield
+
+
 app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description="API base para orquestração simples de chatbot.",
+    lifespan=lifespan,
 )
 
 
@@ -78,6 +92,8 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestObservabilityMiddleware)
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(platform_router)
+app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")
 
 
 @app.exception_handler(Exception)
@@ -105,9 +121,20 @@ def healthcheck() -> dict[str, str]:
 
 
 @app.get("/health/ready", tags=["health"])
-def readiness_check() -> dict[str, str | bool]:
+def readiness_check() -> Any:
+    blockers = get_runtime_blockers()
+    readiness = get_system_readiness()
     database_probe = check_runtime_database_connection()
-    return {
+    payload = {
         "status": "ok" if database_probe["ok"] else "degraded",
         "database_ok": bool(database_probe["ok"]),
+        "overall_status": readiness["overall_status"],
+        "pilot_ready": readiness["pilot_ready"],
+        "scale_ready": readiness["scale_ready"],
+        "blocker_count": len(blockers),
+        "blockers": [str(check.get("code")) for check in blockers],
     }
+    if database_probe["ok"] and not blockers:
+        return payload
+    payload["status"] = "degraded"
+    return JSONResponse(status_code=503, content=payload)

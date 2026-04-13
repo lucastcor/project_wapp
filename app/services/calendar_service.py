@@ -23,6 +23,11 @@ DAY_SCHEDULE_KEYS = {
     5: ("saturday", "sabado", "sábado"),
     6: ("sunday", "domingo"),
 }
+WEEKDAY_ALIAS_MAP = {
+    alias: aliases[0]
+    for aliases in DAY_SCHEDULE_KEYS.values()
+    for alias in aliases
+}
 SUPPORTED_CALENDAR_PROVIDERS = {
     "mock": {
         "label": "Mock",
@@ -87,22 +92,78 @@ def _parse_clock(value: str) -> time:
     return time(hour=int(hour_text), minute=int(minute_text))
 
 
-def _parse_workday_window(value: Any) -> tuple[time, time] | None:
+def _normalize_lookup_key(value: Any) -> str:
     normalized = str(value or "").strip().lower()
+    replacements = str.maketrans({
+        "á": "a",
+        "à": "a",
+        "ã": "a",
+        "â": "a",
+        "é": "e",
+        "ê": "e",
+        "í": "i",
+        "ó": "o",
+        "ô": "o",
+        "õ": "o",
+        "ú": "u",
+        "ç": "c",
+    })
+    normalized = normalized.translate(replacements)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def _normalize_weekday_key(value: Any) -> str | None:
+    normalized = _normalize_lookup_key(value)
     if not normalized:
         return None
+    return WEEKDAY_ALIAS_MAP.get(normalized, normalized)
+
+
+def _normalize_string_list(values: Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        candidates = re.split(r"[,\n;]+", values)
+    elif isinstance(values, list):
+        candidates = values
+    else:
+        return []
+    normalized: list[str] = []
+    for item in candidates:
+        value = str(item or "").strip()
+        if value and value not in normalized:
+            normalized.append(value)
+    return normalized
+
+
+def _parse_workday_windows(value: Any) -> list[tuple[time, time]]:
+    if isinstance(value, list):
+        windows: list[tuple[time, time]] = []
+        for item in value:
+            windows.extend(_parse_workday_windows(item))
+        return windows
+
+    normalized = _normalize_lookup_key(value)
+    if not normalized:
+        return []
     if normalized in {"fechado", "closed", "off"}:
-        return None
+        return []
 
-    match = re.fullmatch(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", normalized)
-    if not match:
-        return None
-
-    starts_at = _parse_clock(match.group(1))
-    ends_at = _parse_clock(match.group(2))
-    if starts_at >= ends_at:
-        return None
-    return starts_at, ends_at
+    windows: list[tuple[time, time]] = []
+    for chunk in re.split(r"[;,]+", normalized):
+        candidate = chunk.strip()
+        if not candidate:
+            continue
+        match = re.fullmatch(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", candidate)
+        if not match:
+            continue
+        starts_at = _parse_clock(match.group(1))
+        ends_at = _parse_clock(match.group(2))
+        if starts_at >= ends_at:
+            continue
+        windows.append((starts_at, ends_at))
+    return windows
 
 
 def _parse_iso_datetime(value: str, timezone_name: str | None = None) -> datetime:
@@ -134,10 +195,10 @@ def _intervals_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_
     return a_start < b_end and a_end > b_start
 
 
-def _resolve_workday_window(
+def _resolve_workday_windows(
     current_day: date,
     company_context: dict[str, Any],
-) -> tuple[time, time] | None:
+) -> list[tuple[time, time]]:
     business_hours = company_context.get("business_hours", {})
     weekday = current_day.weekday()
 
@@ -150,25 +211,197 @@ def _resolve_workday_window(
     if configured_value is None and weekday < 5:
         configured_value = business_hours.get("weekdays")
 
-    window = _parse_workday_window(configured_value)
-    if window:
-        return window
+    windows = _parse_workday_windows(configured_value)
+    if windows:
+        return windows
 
     if configured_value is not None:
+        return []
+
+    return [
+        (
+            _parse_clock(settings.calendar_default_workday_start),
+            _parse_clock(settings.calendar_default_workday_end),
+        )
+    ]
+
+
+def _profile_enabled(profile: dict[str, Any]) -> bool:
+    return bool(profile.get("enabled", True))
+
+
+def _list_scheduling_profiles(company_context: dict[str, Any]) -> list[dict[str, Any]]:
+    scheduling_policy = company_context.get("scheduling_policy", {})
+    profiles = scheduling_policy.get("profiles")
+    if not isinstance(profiles, list):
+        return []
+    return [profile for profile in profiles if isinstance(profile, dict) and _profile_enabled(profile)]
+
+
+def resolve_scheduling_profile(
+    *,
+    company_context: dict[str, Any],
+    requested_profile_key: str | None = None,
+    service_name: str | None = None,
+    customer_profile: str | None = None,
+    request_context: str | None = None,
+) -> dict[str, Any] | None:
+    profiles = _list_scheduling_profiles(company_context)
+    if not profiles:
         return None
 
-    return (
-        _parse_clock(settings.calendar_default_workday_start),
-        _parse_clock(settings.calendar_default_workday_end),
+    normalized_requested_key = _normalize_lookup_key(requested_profile_key)
+    if normalized_requested_key:
+        for profile in profiles:
+            if _normalize_lookup_key(profile.get("key")) == normalized_requested_key:
+                return profile
+        raise CalendarProviderError(
+            f"scheduling_profile_key '{requested_profile_key}' is not configured for this company."
+        )
+
+    default_profile_key = _normalize_lookup_key(
+        company_context.get("scheduling_policy", {}).get("default_profile_key")
     )
+    normalized_service_name = _normalize_lookup_key(service_name)
+    normalized_customer_profile = _normalize_lookup_key(customer_profile)
+    normalized_request_context = _normalize_lookup_key(request_context)
+
+    ranked_candidates: list[tuple[int, int, dict[str, Any]]] = []
+    for index, profile in enumerate(profiles):
+        score = 0
+        profile_customer_profiles = {
+            _normalize_lookup_key(item)
+            for item in _normalize_string_list(profile.get("customer_profiles"))
+        }
+        if normalized_customer_profile and normalized_customer_profile in profile_customer_profiles:
+            score += 100
+
+        profile_service_names = {
+            _normalize_lookup_key(item)
+            for item in _normalize_string_list(profile.get("service_names"))
+        }
+        if normalized_service_name and normalized_service_name in profile_service_names:
+            score += 50
+
+        profile_keywords = {
+            _normalize_lookup_key(item)
+            for item in _normalize_string_list(profile.get("match_keywords"))
+        }
+        if normalized_request_context and any(keyword and keyword in normalized_request_context for keyword in profile_keywords):
+            score += 25
+
+        if default_profile_key and _normalize_lookup_key(profile.get("key")) == default_profile_key:
+            score += 5
+
+        if score > 0:
+            ranked_candidates.append((score, -index, profile))
+
+    if ranked_candidates:
+        ranked_candidates.sort(reverse=True)
+        return ranked_candidates[0][2]
+
+    if default_profile_key:
+        for profile in profiles:
+            if _normalize_lookup_key(profile.get("key")) == default_profile_key:
+                return profile
+
+    if len(profiles) == 1:
+        return profiles[0]
+
+    return None
 
 
-def _resolve_slot_increment_minutes(company_context: dict[str, Any]) -> int:
+def _resolve_profile_daily_windows(
+    *,
+    current_day: date,
+    scheduling_profile: dict[str, Any],
+    company_context: dict[str, Any],
+) -> list[tuple[time, time]]:
+    weekday = current_day.weekday()
+    normalized_allowed_weekdays = {
+        _normalize_weekday_key(item)
+        for item in _normalize_string_list(scheduling_profile.get("allowed_weekdays"))
+        if _normalize_weekday_key(item)
+    }
+    current_weekday_key = DAY_SCHEDULE_KEYS[weekday][0]
+    if normalized_allowed_weekdays and current_weekday_key not in normalized_allowed_weekdays:
+        return []
+
+    day_windows = scheduling_profile.get("day_windows")
+    if isinstance(day_windows, dict):
+        configured_values: list[Any] = []
+        for key in DAY_SCHEDULE_KEYS.get(weekday, ()):
+            if key in day_windows:
+                configured_values.append(day_windows.get(key))
+        if weekday < 5:
+            configured_values.extend(
+                day_windows.get(key)
+                for key in ("weekdays", "dias_uteis", "dias úteis")
+                if key in day_windows
+            )
+        configured_values.extend(
+            day_windows.get(key)
+            for key in ("all", "todos")
+            if key in day_windows
+        )
+        windows: list[tuple[time, time]] = []
+        for configured_value in configured_values:
+            windows.extend(_parse_workday_windows(configured_value))
+        if windows:
+            return windows
+        if configured_values:
+            return []
+
+    allowed_windows = scheduling_profile.get("allowed_windows")
+    windows = _parse_workday_windows(allowed_windows)
+    if windows:
+        return windows
+    if allowed_windows is not None:
+        return []
+
+    return _resolve_workday_windows(current_day, company_context)
+
+
+def _resolve_slot_increment_minutes(
+    company_context: dict[str, Any],
+    scheduling_profile: dict[str, Any] | None = None,
+) -> int:
+    configured = (scheduling_profile or {}).get("slot_increment_minutes")
+    if isinstance(configured, int) and configured > 0:
+        return configured
     scheduling_policy = company_context.get("scheduling_policy", {})
     configured = scheduling_policy.get("slot_increment_minutes")
     if isinstance(configured, int) and configured > 0:
         return configured
     return max(5, settings.calendar_slot_increment_minutes)
+
+
+def _resolve_minimum_notice_minutes(
+    company_context: dict[str, Any],
+    scheduling_profile: dict[str, Any] | None = None,
+) -> int:
+    configured = (scheduling_profile or {}).get("minimum_notice_minutes")
+    if isinstance(configured, int) and configured >= 0:
+        return configured
+    scheduling_policy = company_context.get("scheduling_policy", {})
+    configured = scheduling_policy.get("minimum_notice_minutes")
+    if isinstance(configured, int) and configured >= 0:
+        return configured
+    return 0
+
+
+def _resolve_default_slot_duration_minutes(
+    company_context: dict[str, Any],
+    scheduling_profile: dict[str, Any] | None = None,
+) -> int:
+    configured = (scheduling_profile or {}).get("default_duration_minutes")
+    if isinstance(configured, int) and configured > 0:
+        return configured
+    scheduling_policy = company_context.get("scheduling_policy", {})
+    configured = scheduling_policy.get("default_slot_duration_minutes")
+    if isinstance(configured, int) and configured > 0:
+        return configured
+    return 60
 
 
 def _default_provider_config(provider: str) -> dict[str, Any]:
@@ -219,7 +452,9 @@ def _get_local_busy_intervals(
     company_id: int | None,
     window_start: datetime,
     window_end: datetime,
+    ignore_booking_ids: set[int] | None = None,
 ) -> list[BusyInterval]:
+    ignored_booking_ids = {int(item) for item in (ignore_booking_ids or set())}
     bookings = repository.get_appointment_bookings_between(
         company_id=company_id,
         starts_at=_to_utc_iso(window_start),
@@ -227,6 +462,8 @@ def _get_local_busy_intervals(
     )
     intervals: list[BusyInterval] = []
     for booking in bookings:
+        if int(booking.get("id") or 0) in ignored_booking_ids:
+            continue
         intervals.append(
             BusyInterval(
                 starts_at=_parse_iso_datetime(str(booking["starts_at"]), str(booking.get("timezone") or settings.calendar_timezone)),
@@ -234,6 +471,69 @@ def _get_local_busy_intervals(
             )
         )
     return intervals
+
+
+def _slot_respects_scheduling_policy(
+    *,
+    starts_at: datetime,
+    ends_at: datetime,
+    company_context: dict[str, Any],
+    scheduling_profile: dict[str, Any] | None,
+) -> bool:
+    timezone_obj = _get_company_timezone(company_context=company_context)
+    localized_start = starts_at.astimezone(timezone_obj)
+    localized_end = ends_at.astimezone(timezone_obj)
+    if localized_end.date() != localized_start.date():
+        return False
+
+    daily_windows = (
+        _resolve_profile_daily_windows(
+            current_day=localized_start.date(),
+            scheduling_profile=scheduling_profile,
+            company_context=company_context,
+        )
+        if scheduling_profile
+        else _resolve_workday_windows(localized_start.date(), company_context)
+    )
+
+    if not daily_windows:
+        return False
+
+    for work_start, work_end in daily_windows:
+        window_start = datetime.combine(localized_start.date(), work_start, tzinfo=timezone_obj)
+        window_end = datetime.combine(localized_start.date(), work_end, tzinfo=timezone_obj)
+        if localized_start >= window_start and localized_end <= window_end:
+            return True
+    return False
+
+
+def _validate_booking_window(
+    *,
+    starts_at: datetime,
+    ends_at: datetime,
+    company_context: dict[str, Any],
+    scheduling_profile: dict[str, Any] | None,
+) -> None:
+    if not _slot_respects_scheduling_policy(
+        starts_at=starts_at,
+        ends_at=ends_at,
+        company_context=company_context,
+        scheduling_profile=scheduling_profile,
+    ):
+        if scheduling_profile:
+            profile_label = scheduling_profile.get("label") or scheduling_profile.get("key")
+            raise CalendarProviderError(
+                f"O horário solicitado está fora da janela permitida para o perfil de agendamento '{profile_label}'."
+            )
+        raise CalendarProviderError("O horário solicitado está fora da janela disponível da empresa.")
+
+    minimum_notice_minutes = _resolve_minimum_notice_minutes(company_context, scheduling_profile)
+    if minimum_notice_minutes > 0:
+        current_time = datetime.now(starts_at.tzinfo or UTC)
+        if starts_at < current_time + timedelta(minutes=minimum_notice_minutes):
+            raise CalendarProviderError(
+                f"O horário solicitado precisa respeitar antecedência mínima de {minimum_notice_minutes} minuto(s)."
+            )
 
 
 class BaseCalendarProvider:
@@ -266,6 +566,33 @@ class BaseCalendarProvider:
         description: str | None = None,
     ) -> str | None:
         return None
+
+    def cancel_external_event(
+        self,
+        *,
+        external_event_id: str,
+    ) -> bool:
+        return False
+
+    def update_external_event(
+        self,
+        *,
+        external_event_id: str | None,
+        title: str,
+        starts_at: datetime,
+        ends_at: datetime,
+        timezone_name: str,
+        description: str | None = None,
+    ) -> str | None:
+        if external_event_id:
+            return external_event_id
+        return self.create_external_event(
+            title=title,
+            starts_at=starts_at,
+            ends_at=ends_at,
+            timezone_name=timezone_name,
+            description=description,
+        )
 
 
 class MockCalendarProvider(BaseCalendarProvider):
@@ -373,6 +700,57 @@ class GoogleCalendarProvider(BaseCalendarProvider):
         )
         return str(response.get("id")) if response.get("id") else None
 
+    def cancel_external_event(
+        self,
+        *,
+        external_event_id: str,
+    ) -> bool:
+        service, calendar_id = self._get_google_service()
+        service.events().delete(calendarId=calendar_id, eventId=external_event_id).execute()
+        return True
+
+    def update_external_event(
+        self,
+        *,
+        external_event_id: str | None,
+        title: str,
+        starts_at: datetime,
+        ends_at: datetime,
+        timezone_name: str,
+        description: str | None = None,
+    ) -> str | None:
+        if not external_event_id:
+            return self.create_external_event(
+                title=title,
+                starts_at=starts_at,
+                ends_at=ends_at,
+                timezone_name=timezone_name,
+                description=description,
+            )
+
+        service, calendar_id = self._get_google_service()
+        response = (
+            service.events()
+            .patch(
+                calendarId=calendar_id,
+                eventId=external_event_id,
+                body={
+                    "summary": title,
+                    "description": description or "",
+                    "start": {
+                        "dateTime": starts_at.isoformat(),
+                        "timeZone": timezone_name,
+                    },
+                    "end": {
+                        "dateTime": ends_at.isoformat(),
+                        "timeZone": timezone_name,
+                    },
+                },
+            )
+            .execute()
+        )
+        return str(response.get("id") or external_event_id)
+
 
 class CalDAVCalendarProvider(BaseCalendarProvider):
     provider_name = "caldav"
@@ -464,6 +842,93 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
         event = calendar.save_event(ical)
         return str(getattr(event, "url", uid))
 
+    def _get_event_by_reference(self, calendar: Any, external_event_id: str):
+        normalized_reference = str(external_event_id or "").strip()
+        if not normalized_reference:
+            raise CalendarProviderError("CalDAV external_event_id is required.")
+
+        if normalized_reference.startswith("http") and hasattr(calendar, "event_by_url"):
+            event = calendar.event_by_url(normalized_reference)
+            if event:
+                return event
+
+        if hasattr(calendar, "event"):
+            try:
+                event = calendar.event(normalized_reference)
+                if event:
+                    return event
+            except Exception:
+                pass
+
+        if hasattr(calendar, "object_by_uid"):
+            try:
+                event = calendar.object_by_uid(normalized_reference)
+                if event:
+                    return event
+            except Exception:
+                pass
+
+        raise CalendarProviderError("CalDAV não conseguiu localizar o evento externo para sincronização.")
+
+    def cancel_external_event(
+        self,
+        *,
+        external_event_id: str,
+    ) -> bool:
+        calendar = self._get_calendar()
+        event = self._get_event_by_reference(calendar, external_event_id)
+        event.delete()
+        return True
+
+    def update_external_event(
+        self,
+        *,
+        external_event_id: str | None,
+        title: str,
+        starts_at: datetime,
+        ends_at: datetime,
+        timezone_name: str,
+        description: str | None = None,
+    ) -> str | None:
+        if not external_event_id:
+            return self.create_external_event(
+                title=title,
+                starts_at=starts_at,
+                ends_at=ends_at,
+                timezone_name=timezone_name,
+                description=description,
+            )
+
+        calendar = self._get_calendar()
+        event = self._get_event_by_reference(calendar, external_event_id)
+        uid = str(uuid.uuid4())
+        vobject_instance = getattr(event, "vobject_instance", None)
+        vevent = getattr(vobject_instance, "vevent", None)
+        if vevent and getattr(vevent, "uid", None) and getattr(vevent.uid, "value", None):
+            uid = str(vevent.uid.value)
+
+        ical = "\r\n".join(
+            [
+                "BEGIN:VCALENDAR",
+                "VERSION:2.0",
+                "PRODID:-//Project WAPP//Calendar//PT-BR",
+                "BEGIN:VEVENT",
+                f"UID:{uid}",
+                f"DTSTAMP:{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}",
+                f"DTSTART:{starts_at.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}",
+                f"DTEND:{ends_at.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}",
+                f"SUMMARY:{title}",
+                f"DESCRIPTION:{(description or '').replace(chr(10), '\\n')}",
+                f"X-WR-TIMEZONE:{timezone_name}",
+                "END:VEVENT",
+                "END:VCALENDAR",
+                "",
+            ]
+        )
+        event.data = ical
+        event.save()
+        return str(getattr(event, "url", external_event_id))
+
 
 def _get_provider(integration: dict[str, Any]) -> BaseCalendarProvider:
     provider_name = str(integration.get("provider") or "mock").strip().lower()
@@ -485,6 +950,7 @@ def list_supported_calendar_providers() -> list[dict[str, Any]]:
 
 
 def get_calendar_profile(company_id: int | None = None) -> dict[str, Any]:
+    company_context = _resolve_company_context(company_id)
     integration = _resolve_calendar_integration(company_id=company_id)
     provider = _get_provider(integration)
     readiness = provider.readiness()
@@ -492,6 +958,133 @@ def get_calendar_profile(company_id: int | None = None) -> dict[str, Any]:
         "integration": integration,
         "supported_providers": list_supported_calendar_providers(),
         "provider_readiness": readiness,
+        "scheduling_profiles": _list_scheduling_profiles(company_context),
+    }
+
+
+def _layout_timeline_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not segments:
+        return []
+
+    ordered_segments = sorted(
+        segments,
+        key=lambda item: (int(item["start_minutes"]), int(item["end_minutes"]), int(item["booking_id"])),
+    )
+    active_columns: list[dict[str, Any] | None] = []
+
+    for segment in ordered_segments:
+        start_minutes = int(segment["start_minutes"])
+
+        assigned_column = None
+        for index, active_segment in enumerate(active_columns):
+            if active_segment is None or int(active_segment["end_minutes"]) <= start_minutes:
+                assigned_column = index
+                break
+
+        if assigned_column is None:
+            assigned_column = len(active_columns)
+            active_columns.append(None)
+
+        segment["column_index"] = assigned_column
+        active_columns[assigned_column] = segment
+
+    for segment in ordered_segments:
+        overlapping_count = 1
+        for candidate in ordered_segments:
+            if candidate["booking_id"] == segment["booking_id"]:
+                continue
+            if int(candidate["start_minutes"]) < int(segment["end_minutes"]) and int(candidate["end_minutes"]) > int(segment["start_minutes"]):
+                overlapping_count += 1
+        segment["column_count"] = overlapping_count
+
+    return ordered_segments
+
+
+def get_calendar_timeline(
+    *,
+    company_id: int | None = None,
+    start_date: str | None = None,
+    days: int = 7,
+) -> dict[str, Any]:
+    normalized_days = max(1, min(days, 14))
+    company_context = _resolve_company_context(company_id)
+    timezone_obj = _get_company_timezone(company_id=company_id, company_context=company_context)
+    timeline_start = date.fromisoformat(start_date) if start_date else datetime.now(timezone_obj).date()
+    timeline_end = timeline_start + timedelta(days=normalized_days)
+
+    range_start = datetime.combine(timeline_start, time.min, tzinfo=timezone_obj)
+    range_end = datetime.combine(timeline_end, time.min, tzinfo=timezone_obj)
+
+    bookings = repository.get_appointment_bookings_between(
+        starts_at=range_start.astimezone(UTC).isoformat(),
+        ends_at=range_end.astimezone(UTC).isoformat(),
+        company_id=company_id,
+    )
+
+    day_buckets: dict[str, list[dict[str, Any]]] = {
+        (timeline_start + timedelta(days=offset)).isoformat(): []
+        for offset in range(normalized_days)
+    }
+
+    for booking in bookings:
+        starts_at = datetime.fromisoformat(str(booking["starts_at"])).astimezone(timezone_obj)
+        ends_at = datetime.fromisoformat(str(booking["ends_at"])).astimezone(timezone_obj)
+        current_day = starts_at.date()
+        last_day = ends_at.date()
+
+        while current_day <= last_day:
+            day_key = current_day.isoformat()
+            if day_key not in day_buckets:
+                current_day += timedelta(days=1)
+                continue
+
+            day_start = datetime.combine(current_day, time.min, tzinfo=timezone_obj)
+            day_end = day_start + timedelta(days=1)
+            segment_start = max(starts_at, day_start)
+            segment_end = min(ends_at, day_end)
+            day_buckets[day_key].append(
+                {
+                    "booking_id": int(booking["id"]),
+                    "title": str(booking.get("title") or "Agendamento"),
+                    "contact_id": booking.get("contact_id"),
+                    "customer_profile": booking.get("customer_profile"),
+                    "scheduling_profile_key": booking.get("scheduling_profile_key"),
+                    "status": booking.get("status"),
+                    "starts_at": starts_at.isoformat(),
+                    "ends_at": ends_at.isoformat(),
+                    "segment_starts_at": segment_start.isoformat(),
+                    "segment_ends_at": segment_end.isoformat(),
+                    "start_minutes": int((segment_start - day_start).total_seconds() / 60),
+                    "end_minutes": max(30, int((segment_end - day_start).total_seconds() / 60)),
+                    "duration_minutes": max(30, int((segment_end - segment_start).total_seconds() / 60)),
+                }
+            )
+            current_day += timedelta(days=1)
+
+    days_payload = []
+    for offset in range(normalized_days):
+        current_day = timeline_start + timedelta(days=offset)
+        day_key = current_day.isoformat()
+        segments = _layout_timeline_segments(day_buckets[day_key])
+        days_payload.append(
+            {
+                "date": day_key,
+                "label": current_day.strftime("%d/%m"),
+                "weekday_label": current_day.strftime("%A"),
+                "booking_count": len(segments),
+                "segments": segments,
+            }
+        )
+
+    return {
+        "timezone": str(timezone_obj),
+        "start_date": timeline_start.isoformat(),
+        "days": days_payload,
+        "summary": {
+            "booking_count": len(bookings),
+            "confirmed_count": len([item for item in bookings if str(item.get("status") or "").lower() == "confirmed"]),
+            "pending_count": len([item for item in bookings if str(item.get("status") or "").lower() == "pending"]),
+        },
     }
 
 
@@ -502,11 +1095,23 @@ def query_calendar_availability(
     end_date: str,
     duration_minutes: int,
     limit: int = 12,
+    scheduling_profile_key: str | None = None,
+    customer_profile: str | None = None,
+    service_name: str | None = None,
+    request_context: str | None = None,
+    ignore_booking_id: int | None = None,
 ) -> dict[str, Any]:
     if duration_minutes <= 0:
         raise CalendarProviderError("duration_minutes must be greater than zero.")
 
     company_context = _resolve_company_context(company_id)
+    scheduling_profile = resolve_scheduling_profile(
+        company_context=company_context,
+        requested_profile_key=scheduling_profile_key,
+        service_name=service_name,
+        customer_profile=customer_profile,
+        request_context=request_context,
+    )
     timezone_obj = _get_company_timezone(company_context=company_context)
     start_day = date.fromisoformat(start_date)
     end_day = date.fromisoformat(end_date)
@@ -525,31 +1130,46 @@ def query_calendar_availability(
         company_id=company_id,
         window_start=window_start,
         window_end=window_end,
+        ignore_booking_ids={ignore_booking_id} if ignore_booking_id is not None else None,
     )
 
-    increment = _resolve_slot_increment_minutes(company_context)
+    increment = _resolve_slot_increment_minutes(company_context, scheduling_profile)
 
     slots: list[dict[str, Any]] = []
     current_day = start_day
     while current_day <= end_day and len(slots) < limit:
-        workday_window = _resolve_workday_window(current_day, company_context)
-        if not workday_window:
+        daily_windows = (
+            _resolve_profile_daily_windows(
+                current_day=current_day,
+                scheduling_profile=scheduling_profile,
+                company_context=company_context,
+            )
+            if scheduling_profile
+            else _resolve_workday_windows(current_day, company_context)
+        )
+        if not daily_windows:
             current_day += timedelta(days=1)
             continue
 
-        work_start, work_end = workday_window
-        slot_cursor = datetime.combine(current_day, work_start, tzinfo=timezone_obj)
-        workday_end = datetime.combine(current_day, work_end, tzinfo=timezone_obj)
+        for work_start, work_end in daily_windows:
+            slot_cursor = datetime.combine(current_day, work_start, tzinfo=timezone_obj)
+            workday_end = datetime.combine(current_day, work_end, tzinfo=timezone_obj)
 
-        while slot_cursor + timedelta(minutes=duration_minutes) <= workday_end and len(slots) < limit:
-            slot_end = slot_cursor + timedelta(minutes=duration_minutes)
-            has_conflict = any(
-                _intervals_overlap(slot_cursor, slot_end, interval.starts_at, interval.ends_at)
-                for interval in busy_intervals
-            )
-            if not has_conflict:
-                slots.append(_to_provider_slot(slot_cursor, duration_minutes, str(integration["provider"])))
-            slot_cursor += timedelta(minutes=increment)
+            while slot_cursor + timedelta(minutes=duration_minutes) <= workday_end and len(slots) < limit:
+                slot_end = slot_cursor + timedelta(minutes=duration_minutes)
+                has_conflict = any(
+                    _intervals_overlap(slot_cursor, slot_end, interval.starts_at, interval.ends_at)
+                    for interval in busy_intervals
+                )
+                if not has_conflict:
+                    slots.append(
+                        {
+                            **_to_provider_slot(slot_cursor, duration_minutes, str(integration["provider"])),
+                            "scheduling_profile_key": scheduling_profile.get("key") if scheduling_profile else None,
+                            "customer_profile": customer_profile,
+                        }
+                    )
+                slot_cursor += timedelta(minutes=increment)
 
         current_day += timedelta(days=1)
 
@@ -559,6 +1179,7 @@ def query_calendar_availability(
         "integration_source": integration["source"],
         "slots": slots,
         "provider_readiness": readiness,
+        "scheduling_profile": scheduling_profile,
     }
 
 
@@ -571,13 +1192,32 @@ def create_calendar_booking(
     ends_at: str,
     timezone_name: str | None = None,
     description: str | None = None,
+    scheduling_profile_key: str | None = None,
+    customer_profile: str | None = None,
+    service_name: str | None = None,
+    request_context: str | None = None,
+    ignore_booking_id: int | None = None,
 ) -> dict[str, Any]:
     company_context = _resolve_company_context(company_id)
+    scheduling_profile = resolve_scheduling_profile(
+        company_context=company_context,
+        requested_profile_key=scheduling_profile_key,
+        service_name=service_name,
+        customer_profile=customer_profile,
+        request_context=request_context,
+    )
     timezone_value = timezone_name or str(_get_company_timezone(company_context=company_context))
     starts_at_dt = _parse_iso_datetime(starts_at, timezone_value)
     ends_at_dt = _parse_iso_datetime(ends_at, timezone_value)
     if ends_at_dt <= starts_at_dt:
         raise CalendarProviderError("ends_at must be greater than starts_at.")
+
+    _validate_booking_window(
+        starts_at=starts_at_dt,
+        ends_at=ends_at_dt,
+        company_context=company_context,
+        scheduling_profile=scheduling_profile,
+    )
 
     integration = _resolve_calendar_integration(company_id=company_id)
     provider = _get_provider(integration)
@@ -585,9 +1225,19 @@ def create_calendar_booking(
     if not readiness["ready"] and integration["provider"] != "mock":
         raise CalendarProviderError(str(readiness["details"]))
 
-    local_conflicts = _get_local_busy_intervals(company_id, starts_at_dt, ends_at_dt)
+    local_conflicts = _get_local_busy_intervals(
+        company_id,
+        starts_at_dt,
+        ends_at_dt,
+        ignore_booking_ids={ignore_booking_id} if ignore_booking_id is not None else None,
+    )
     if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in local_conflicts):
         raise CalendarProviderError("O horário solicitado conflita com um agendamento já existente.")
+
+    if ignore_booking_id is None:
+        provider_conflicts = provider.list_busy_intervals(starts_at_dt, ends_at_dt)
+        if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in provider_conflicts):
+            raise CalendarProviderError("O horário solicitado conflita com um evento já existente no calendário externo.")
 
     external_event_id = provider.create_external_event(
         title=title,
@@ -602,6 +1252,8 @@ def create_calendar_booking(
         integration_id=integration.get("integration_id"),
         provider=str(integration["provider"]),
         external_event_id=external_event_id,
+        scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
+        customer_profile=customer_profile,
         title=title,
         description=description,
         starts_at=_to_utc_iso(starts_at_dt),
@@ -626,6 +1278,159 @@ def create_calendar_booking(
         **booking,
         "provider_readiness": readiness,
         "scheduled_reminders": scheduled_reminders,
+        "scheduling_profile": scheduling_profile,
+    }
+
+
+def _sync_booking_cancellation(
+    *,
+    booking: dict[str, Any],
+    provider: BaseCalendarProvider,
+    integration: dict[str, Any],
+) -> dict[str, Any]:
+    external_event_id = str(booking.get("external_event_id") or "").strip()
+    if not external_event_id or str(integration.get("provider") or "mock") == "mock":
+        return {
+            "attempted": False,
+            "status": "not_required",
+            "provider": integration.get("provider"),
+            "external_event_id": external_event_id or None,
+        }
+
+    readiness = provider.readiness()
+    if not readiness["ready"]:
+        raise CalendarProviderError(str(readiness["details"]))
+
+    provider.cancel_external_event(external_event_id=external_event_id)
+    return {
+        "attempted": True,
+        "status": "cancelled",
+        "provider": integration.get("provider"),
+        "external_event_id": external_event_id,
+    }
+
+
+def cancel_calendar_booking(
+    *,
+    booking_id: int,
+) -> dict[str, Any]:
+    booking = repository.get_appointment_booking(booking_id)
+    if not booking:
+        raise CalendarProviderError("Booking not found.")
+    if str(booking.get("status") or "") not in {"confirmed", "pending"}:
+        raise CalendarProviderError("Only confirmed or pending bookings can be cancelled.")
+
+    integration = _resolve_calendar_integration(company_id=booking.get("company_id"))
+    provider = _get_provider(integration)
+    external_sync = _sync_booking_cancellation(
+        booking=booking,
+        provider=provider,
+        integration=integration,
+    )
+    repository.update_appointment_booking_status(booking_id, "cancelled")
+    cancelled_reminders = repository.cancel_customer_reminders_for_booking(booking_id)
+
+    return {
+        "booking": repository.get_appointment_booking(booking_id),
+        "cancelled_reminders": cancelled_reminders,
+        "external_sync": external_sync,
+    }
+
+
+def reschedule_calendar_booking(
+    *,
+    booking_id: int,
+    starts_at: str,
+    ends_at: str,
+    timezone_name: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    scheduling_profile_key: str | None = None,
+    customer_profile: str | None = None,
+    request_context: str | None = None,
+) -> dict[str, Any]:
+    booking = repository.get_appointment_booking(booking_id)
+    if not booking:
+        raise CalendarProviderError("Booking not found.")
+    if str(booking.get("status") or "") not in {"confirmed", "pending"}:
+        raise CalendarProviderError("Only confirmed or pending bookings can be rescheduled.")
+
+    company_id = booking.get("company_id")
+    company_context = _resolve_company_context(company_id)
+    resolved_timezone_name = timezone_name or str(booking.get("timezone") or _get_company_timezone(company_context=company_context))
+    starts_at_dt = _parse_iso_datetime(starts_at, resolved_timezone_name)
+    ends_at_dt = _parse_iso_datetime(ends_at, resolved_timezone_name)
+    if ends_at_dt <= starts_at_dt:
+        raise CalendarProviderError("ends_at must be greater than starts_at.")
+
+    resolved_title = (title or str(booking.get("title") or "")).strip() or "Agendamento"
+    resolved_description = description if description is not None else booking.get("description")
+    resolved_customer_profile = customer_profile if customer_profile is not None else booking.get("customer_profile")
+    scheduling_profile = resolve_scheduling_profile(
+        company_context=company_context,
+        requested_profile_key=scheduling_profile_key or booking.get("scheduling_profile_key"),
+        customer_profile=resolved_customer_profile,
+        request_context=request_context,
+    )
+
+    _validate_booking_window(
+        starts_at=starts_at_dt,
+        ends_at=ends_at_dt,
+        company_context=company_context,
+        scheduling_profile=scheduling_profile,
+    )
+
+    integration = _resolve_calendar_integration(company_id=company_id)
+    provider = _get_provider(integration)
+    readiness = provider.readiness()
+    if not readiness["ready"] and integration["provider"] != "mock":
+        raise CalendarProviderError(str(readiness["details"]))
+
+    local_conflicts = _get_local_busy_intervals(
+        company_id,
+        starts_at_dt,
+        ends_at_dt,
+        ignore_booking_ids={booking_id},
+    )
+    if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in local_conflicts):
+        raise CalendarProviderError("O horário solicitado conflita com um agendamento já existente.")
+
+    external_event_id = provider.update_external_event(
+        external_event_id=str(booking.get("external_event_id") or "").strip() or None,
+        title=resolved_title,
+        starts_at=starts_at_dt,
+        ends_at=ends_at_dt,
+        timezone_name=resolved_timezone_name,
+        description=str(resolved_description) if resolved_description is not None else None,
+    )
+    repository.update_appointment_booking_schedule(
+        booking_id,
+        starts_at=_to_utc_iso(starts_at_dt),
+        ends_at=_to_utc_iso(ends_at_dt),
+        timezone=resolved_timezone_name,
+        external_event_id=external_event_id,
+        scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
+        customer_profile=str(resolved_customer_profile) if resolved_customer_profile is not None else None,
+        title=resolved_title,
+        description=str(resolved_description) if resolved_description is not None else None,
+    )
+    cancelled_reminders = repository.cancel_customer_reminders_for_booking(booking_id)
+    updated_booking = repository.get_appointment_booking(booking_id)
+    if not updated_booking:
+        raise CalendarProviderError("Booking not found after reschedule.")
+    scheduled_reminders = schedule_booking_customer_reminders(updated_booking)
+    return {
+        **updated_booking,
+        "provider_readiness": readiness,
+        "scheduled_reminders": scheduled_reminders,
+        "cancelled_reminders": cancelled_reminders,
+        "scheduling_profile": scheduling_profile,
+        "external_sync": {
+            "attempted": bool(str(booking.get("external_event_id") or "").strip() or external_event_id),
+            "status": "updated" if external_event_id else "local_only",
+            "provider": integration.get("provider"),
+            "external_event_id": external_event_id,
+        },
     }
 
 

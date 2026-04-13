@@ -1,12 +1,13 @@
-
-
+import logging
 from typing import Any
 
 from app.core.config import settings
+from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
 
 
 MAX_SUMMARY_LENGTH = 800
+logger = get_logger(__name__)
 
 
 def _truncate_summary(text: str, limit: int = MAX_SUMMARY_LENGTH) -> str:
@@ -57,8 +58,14 @@ def update_conversation_summary(
             latest_reply=latest_reply,
         )
         return _truncate_summary(summary)
-    except Exception as e:
-        print("OPENAI MEMORY ERROR:", repr(e))
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "memory.provider.fallback",
+            provider="openai",
+            error_type=type(exc).__name__,
+        )
         return _fallback_update_conversation_summary(
             previous_summary=previous_summary,
             latest_message=latest_message,

@@ -70,6 +70,37 @@ class AdminApiClient:
     def get_contacts(self) -> list[dict[str, Any]]:
         return self._request("GET", "/admin/contacts")
 
+    def search_contacts(
+        self,
+        query: str,
+        company_id: int | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"q": query, "limit": limit}
+        if company_id is not None:
+            params["company_id"] = company_id
+        return self._request("GET", "/admin/contacts", params=params)
+
+    def update_contact(
+        self,
+        contact_id: str,
+        contact_name: str | None = None,
+        customer_profile: str | None = None,
+        notes: str | None = None,
+        company_id: int | None = None,
+    ) -> dict[str, Any]:
+        params = {"company_id": company_id} if company_id is not None else None
+        return self._request(
+            "PATCH",
+            f"/admin/contacts/{contact_id}",
+            params=params,
+            json_body={
+                "contact_name": contact_name,
+                "customer_profile": customer_profile,
+                "notes": notes,
+            },
+        )
+
     def create_company(
         self,
         slug: str,
@@ -197,6 +228,44 @@ class AdminApiClient:
         params = {"company_id": company_id} if company_id is not None else None
         return self._request("GET", "/admin/training-dataset/review", params=params)
 
+    def import_training_records(
+        self,
+        *,
+        fmt: str,
+        raw_text: str | None = None,
+        records: list[dict[str, Any]] | None = None,
+        delimiter: str = ",",
+        dry_run: bool = True,
+        update_contacts: bool = True,
+        create_message_examples: bool = True,
+        auto_promote_eligible_examples: bool = False,
+        default_profile_name: str = "default",
+        default_scenario_type: str = "general",
+        default_quality_score: float = 7.0,
+        active_default: bool = True,
+        company_id: int | None = None,
+    ) -> dict[str, Any]:
+        params = {"company_id": company_id} if company_id is not None else None
+        return self._request(
+            "POST",
+            "/admin/training-import",
+            params=params,
+            json_body={
+                "format": fmt,
+                "raw_text": raw_text,
+                "records": records or [],
+                "delimiter": delimiter,
+                "dry_run": dry_run,
+                "update_contacts": update_contacts,
+                "create_message_examples": create_message_examples,
+                "auto_promote_eligible_examples": auto_promote_eligible_examples,
+                "default_profile_name": default_profile_name,
+                "default_scenario_type": default_scenario_type,
+                "default_quality_score": default_quality_score,
+                "active_default": active_default,
+            },
+        )
+
     def get_observability_summary(self) -> dict[str, Any]:
         return self._request("GET", "/admin/observability/summary")
 
@@ -277,6 +346,10 @@ class AdminApiClient:
         duration_minutes: int,
         limit: int = 12,
         company_id: int | None = None,
+        scheduling_profile_key: str | None = None,
+        customer_profile: str | None = None,
+        service_name: str | None = None,
+        request_context: str | None = None,
     ) -> dict[str, Any]:
         params = {"company_id": company_id} if company_id is not None else None
         return self._request(
@@ -288,6 +361,10 @@ class AdminApiClient:
                 "end_date": end_date,
                 "duration_minutes": duration_minutes,
                 "limit": limit,
+                "scheduling_profile_key": scheduling_profile_key,
+                "customer_profile": customer_profile,
+                "service_name": service_name,
+                "request_context": request_context,
             },
         )
 
@@ -304,6 +381,8 @@ class AdminApiClient:
         contact_id: str | None = None,
         timezone: str | None = None,
         description: str | None = None,
+        scheduling_profile_key: str | None = None,
+        customer_profile: str | None = None,
     ) -> dict[str, Any]:
         params = {"company_id": company_id} if company_id is not None else None
         return self._request(
@@ -317,6 +396,49 @@ class AdminApiClient:
                 "ends_at": ends_at,
                 "timezone": timezone,
                 "description": description,
+                "scheduling_profile_key": scheduling_profile_key,
+                "customer_profile": customer_profile,
+            },
+        )
+
+    def reschedule_calendar_booking(
+        self,
+        booking_id: int,
+        starts_at: str,
+        ends_at: str,
+        timezone: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        scheduling_profile_key: str | None = None,
+        customer_profile: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/admin/calendar/bookings/{booking_id}/reschedule",
+            json_body={
+                "starts_at": starts_at,
+                "ends_at": ends_at,
+                "timezone": timezone,
+                "title": title,
+                "description": description,
+                "scheduling_profile_key": scheduling_profile_key,
+                "customer_profile": customer_profile,
+            },
+        )
+
+    def cancel_calendar_booking(
+        self,
+        booking_id: int,
+        *,
+        trigger_queue_recovery: bool = True,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/admin/calendar/bookings/{booking_id}/cancel",
+            json_body={
+                "trigger_queue_recovery": trigger_queue_recovery,
+                "reason": reason,
             },
         )
 

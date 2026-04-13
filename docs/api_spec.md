@@ -15,6 +15,61 @@ Formato padrao:
 
 ## Endpoints publicos
 
+### `GET /platform`
+
+Uso:
+
+- abrir a interface dedicada do produto, servida pelo proprio FastAPI.
+
+Observacao:
+
+- a shell SPA carrega assets em `/platform/assets/...` e consome os endpoints publicos e administrativos existentes.
+
+### `POST /platform/auth/session`
+
+Uso:
+
+- trocar credencial administrativa por sessao web da plataforma;
+- definir cookie HTTP-only para a interface dedicada.
+
+Request:
+
+```json
+{
+  "admin_token": "viewer-ou-operator-ou-superadmin-token",
+  "admin_actor": "platform-admin"
+}
+```
+
+Response:
+
+```json
+{
+  "authenticated": true,
+  "role": "operator",
+  "actor": "platform-admin",
+  "auth_mode": "session",
+  "expires_at": 1770000000
+}
+```
+
+Observacoes:
+
+- quando `ENABLE_ADMIN_AUTH=false`, o endpoint permite sessao local de desenvolvimento sem token;
+- em producao, o recomendado e definir `PLATFORM_SESSION_SECRET`.
+
+### `GET /platform/auth/session`
+
+Uso:
+
+- inspecionar a sessao web atual da plataforma.
+
+### `DELETE /platform/auth/session`
+
+Uso:
+
+- encerrar a sessao atual da plataforma e limpar o cookie.
+
 ### `GET /health`
 
 Uso:
@@ -96,6 +151,12 @@ Response:
 }
 ```
 
+Observacoes operacionais:
+
+- quando `enabled_modules.scheduling=true`, a mesma entrada publica tambem pode conduzir fluxo natural de agendamento, cancelamento e reagendamento;
+- quando o remetente estiver listado em `internal_operation.operator_contact_ids`, a conversa pode operar agendamento interno de cliente por nome ou telefone, com confirmacao e desambiguacao;
+- os fluxos de agenda respeitam `scheduling_policy.profiles` quando a empresa segmenta janelas por perfil de cliente, tipo de atendimento ou regra operacional.
+
 Erros esperados:
 
 - `400` quando `message` fica vazia apos `strip()`;
@@ -105,7 +166,10 @@ Erros esperados:
 
 Uso:
 
-- entrada especifica para webhook normalizado de WhatsApp.
+- entrada especifica para webhook de WhatsApp.
+- aceita payload normalizado interno e payload bruto de mensagem de texto do Meta.
+- quando `auto_reply=true`, a resposta tambem e materializada em `outbound_messages` e despachada pelo provider configurado.
+- para payload bruto do Meta, o header `X-Hub-Signature-256` precisa conferir com `WHATSAPP_APP_SECRET`.
 
 Query params opcionais:
 
@@ -117,7 +181,7 @@ Headers opcionais:
 - `X-Company-Id`
 - `X-Company-Slug`
 
-Request:
+Request normalizado:
 
 ```json
 {
@@ -130,12 +194,37 @@ Request:
 
 Response:
 
-- mesmo contrato estrutural de `/messages/incoming`.
+- para mensagem processada, retorna o contrato estrutural principal com metadados adicionais de dispatch.
+- para eventos do Meta sem mensagem de texto, retorna `processed=false` com `reason=unsupported_or_non_message_event`.
 
 Erros esperados:
 
 - `400` quando `text` fica vazio apos `strip()`;
+- `403` quando a assinatura do Meta nao confere;
+- `503` quando `WHATSAPP_APP_SECRET` nao foi configurado para payload bruto do Meta;
 - `422` para payloads invalidos no schema.
+
+### `GET /webhooks/whatsapp`
+
+Uso:
+
+- handshake de verificacao do webhook do WhatsApp provider real.
+
+Query params esperados:
+
+- `hub.mode=subscribe`
+- `hub.verify_token`
+- `hub.challenge`
+
+Response:
+
+- `200 text/plain` com o valor de `hub.challenge` quando o token confere com `WHATSAPP_WEBHOOK_VERIFY_TOKEN`.
+
+Erros esperados:
+
+- `400` para payload de verificacao invalido;
+- `403` quando o token nao confere;
+- `503` quando `WHATSAPP_WEBHOOK_VERIFY_TOKEN` nao foi configurado.
 
 ## Endpoints administrativos
 
@@ -151,11 +240,18 @@ Erros esperados:
 - `GET /admin/system/onboarding`
 - `GET /admin/calendar/providers`
 - `GET /admin/calendar/profile`
+- `GET /admin/calendar/timeline`
 - `GET /admin/calendar/integrations`
 - `POST /admin/calendar/integrations`
 - `POST /admin/calendar/availability/query`
 - `GET /admin/calendar/bookings`
 - `POST /admin/calendar/bookings`
+- `POST /admin/calendar/bookings/{booking_id}/reschedule`
+- `POST /admin/calendar/bookings/{booking_id}/cancel`
+- `GET /admin/calendar/queue`
+- `POST /admin/calendar/queue`
+- `GET /admin/calendar/queue-offers`
+- `POST /admin/calendar/queue-offers/{offer_id}/respond`
 - `GET /admin/reminders`
 - `POST /admin/reminders`
 - `POST /admin/reminders/dispatch-due`
@@ -163,6 +259,8 @@ Erros esperados:
 - `GET /admin/messages`
 - `GET /admin/contacts`
 - `GET /admin/contacts/{contact_id}`
+- `PATCH /admin/contacts/{contact_id}`
+- `POST /admin/training-import`
 
 Uso:
 
@@ -333,15 +431,36 @@ Request:
   "start_date": "2026-04-07",
   "end_date": "2026-04-10",
   "duration_minutes": 60,
-  "limit": 12
+  "limit": 12,
+  "scheduling_profile_key": "novos",
+  "customer_profile": "new_customer",
+  "service_name": "Consultoria inicial",
+  "request_context": "primeira consulta"
 }
 ```
+
+Observacao:
+
+- `scheduling_profile_key`, `customer_profile`, `service_name` e `request_context` sao opcionais e ajudam o backend a escolher a janela correta quando a empresa segmenta a agenda por perfil.
 
 ### `GET /admin/calendar/bookings`
 
 Uso:
 
 - listar reservas persistidas da agenda.
+
+### `GET /admin/calendar/timeline`
+
+Uso:
+
+- devolver a agenda em formato proprio para timeline/calendario visual da plataforma;
+- incluir segmentos por dia, com layout de sobreposicao pronto para renderizacao.
+
+Query params opcionais:
+
+- `company_id`
+- `start_date`
+- `days` de `1` a `14`
 
 ### `POST /admin/calendar/bookings`
 
@@ -352,6 +471,80 @@ Uso:
 Permissao:
 
 - `operator`
+
+Request exemplo:
+
+```json
+{
+  "contact_id": "5511999999999",
+  "title": "Consultoria inicial | Cliente: Maria",
+  "starts_at": "2026-04-08T10:00:00-03:00",
+  "ends_at": "2026-04-08T11:00:00-03:00",
+  "timezone": "America/Sao_Paulo",
+  "description": "Primeira consulta",
+  "scheduling_profile_key": "novos",
+  "customer_profile": "new_customer"
+}
+```
+
+### `POST /admin/calendar/bookings/{booking_id}/reschedule`
+
+Uso:
+
+- reagendar um booking existente;
+- atualizar o evento no provider externo quando a integracao estiver ativa.
+
+Permissao:
+
+- `operator`
+
+Request exemplo:
+
+```json
+{
+  "starts_at": "2026-04-09T10:00:00-03:00",
+  "ends_at": "2026-04-09T11:00:00-03:00",
+  "timezone": "America/Sao_Paulo",
+  "scheduling_profile_key": "retorno",
+  "customer_profile": "returning_customer"
+}
+```
+
+### `POST /admin/calendar/bookings/{booking_id}/cancel`
+
+Uso:
+
+- cancelar o booking local;
+- cancelar o evento externo quando houver `external_event_id`;
+- opcionalmente disparar a recuperacao da vaga pela fila de prioridade.
+
+### `GET /admin/contacts`
+
+Uso:
+
+- listar contatos conhecidos pelo runtime;
+- filtrar por `company_id`;
+- pesquisar por nome ou telefone usando o parametro `q`.
+
+### `PATCH /admin/contacts/{contact_id}`
+
+Uso:
+
+- atualizar metadados operacionais do contato, como `contact_name`, `customer_profile` e `notes`.
+
+Permissao:
+
+- `operator`
+
+Request exemplo:
+
+```json
+{
+  "contact_name": "Maria Silva",
+  "customer_profile": "returning_customer",
+  "notes": "Prefere horarios a tarde."
+}
+```
 
 ### `GET /admin/reminders`
 
@@ -494,6 +687,37 @@ Uso:
 - exportar formatos de treino;
 - criar e acompanhar jobs de fine-tuning;
 - consultar historico persistido localmente.
+
+### `POST /admin/training-import`
+
+Uso:
+
+- importar base historica ou export simples de CRM em CSV ou JSON;
+- atualizar `customer_profile` dos contatos;
+- criar `message_examples` a partir de pares curados;
+- rodar em `dry_run` antes de persistir.
+
+Permissao:
+
+- `operator`
+
+Request exemplo:
+
+```json
+{
+  "format": "csv",
+  "raw_text": "contact_id,contact_name,customer_profile,profile_name,scenario_type,customer_message,approved_reply,quality_score\n5511999999999,Maria Silva,returning_customer,retorno,reschedule,Quero remarcar,Claro,9\n",
+  "dry_run": true,
+  "update_contacts": true,
+  "create_message_examples": true,
+  "auto_promote_eligible_examples": false
+}
+```
+
+Observacoes:
+
+- o importador atual espera pares ja razoavelmente curados;
+- dados sensiveis ainda devem passar por sanitizacao antes de seguirem para treino.
 
 ### Outbound
 

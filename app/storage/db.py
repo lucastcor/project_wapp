@@ -19,6 +19,8 @@ SQLITE_ID_TABLES = {
     "appointment_bookings",
     "conversation_flows",
     "customer_reminders",
+    "appointment_queue_entries",
+    "appointment_queue_offers",
 }
 Migration = tuple[str, str, Callable[[Any], None]]
 _POSTGRES_POOL = None
@@ -628,6 +630,8 @@ def _ensure_runtime_columns(ensure_column: Callable[[Any, str, str, str], None],
     ensure_column(cursor, "contacts", "pipeline_stage", "TEXT")
     ensure_column(cursor, "contacts", "next_action", "TEXT")
     ensure_column(cursor, "contacts", "lead_temperature", "TEXT")
+    ensure_column(cursor, "contacts", "customer_profile", "TEXT")
+    ensure_column(cursor, "contacts", "notes", "TEXT")
     ensure_column(cursor, "contacts", "updated_at", "TIMESTAMP")
     ensure_column(cursor, "contacts", "company_id", "INTEGER")
     ensure_column(cursor, "messages", "classification_reason", "TEXT")
@@ -815,6 +819,8 @@ def _create_calendar_tables(cursor: Any) -> None:
                 integration_id BIGINT REFERENCES calendar_integrations(id),
                 provider TEXT NOT NULL,
                 external_event_id TEXT,
+                scheduling_profile_key TEXT,
+                customer_profile TEXT,
                 title TEXT NOT NULL,
                 description TEXT,
                 starts_at TIMESTAMPTZ NOT NULL,
@@ -851,6 +857,8 @@ def _create_calendar_tables(cursor: Any) -> None:
                 integration_id INTEGER,
                 provider TEXT NOT NULL,
                 external_event_id TEXT,
+                scheduling_profile_key TEXT,
+                customer_profile TEXT,
                 title TEXT NOT NULL,
                 description TEXT,
                 starts_at TIMESTAMP NOT NULL,
@@ -878,6 +886,8 @@ def _create_calendar_tables(cursor: Any) -> None:
     ensure_column(cursor, "appointment_bookings", "integration_id", "INTEGER")
     ensure_column(cursor, "appointment_bookings", "provider", "TEXT NOT NULL DEFAULT 'mock'")
     ensure_column(cursor, "appointment_bookings", "external_event_id", "TEXT")
+    ensure_column(cursor, "appointment_bookings", "scheduling_profile_key", "TEXT")
+    ensure_column(cursor, "appointment_bookings", "customer_profile", "TEXT")
     ensure_column(cursor, "appointment_bookings", "title", "TEXT NOT NULL DEFAULT 'Agendamento'")
     ensure_column(cursor, "appointment_bookings", "description", "TEXT")
     ensure_column(cursor, "appointment_bookings", "starts_at", "TIMESTAMP")
@@ -1028,6 +1038,183 @@ def _create_workflow_indexes(cursor: Any) -> None:
     )
 
 
+def _create_queue_tables(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointment_queue_entries (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER,
+                contact_id TEXT NOT NULL,
+                desired_title TEXT NOT NULL,
+                scheduling_profile_key TEXT,
+                customer_profile TEXT,
+                request_summary TEXT,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                earliest_starts_at TIMESTAMPTZ,
+                latest_starts_at TIMESTAMPTZ,
+                preferred_periods_json TEXT,
+                priority_tier TEXT NOT NULL DEFAULT 'normal',
+                priority_score INTEGER NOT NULL DEFAULT 0,
+                accepts_short_notice INTEGER NOT NULL DEFAULT 1,
+                original_booking_id BIGINT REFERENCES appointment_bookings(id),
+                status TEXT NOT NULL DEFAULT 'active',
+                source TEXT NOT NULL DEFAULT 'manual',
+                notes TEXT,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointment_queue_offers (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER,
+                queue_entry_id BIGINT NOT NULL REFERENCES appointment_queue_entries(id),
+                released_booking_id BIGINT REFERENCES appointment_bookings(id),
+                outbound_message_id BIGINT REFERENCES outbound_messages(id),
+                new_booking_id BIGINT REFERENCES appointment_bookings(id),
+                offered_starts_at TIMESTAMPTZ NOT NULL,
+                offered_ends_at TIMESTAMPTZ NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                status TEXT NOT NULL DEFAULT 'pending',
+                response_deadline_at TIMESTAMPTZ,
+                follow_up_after TIMESTAMPTZ,
+                responded_at TIMESTAMPTZ,
+                response_notes TEXT,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        ensure_column = _ensure_postgres_column
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointment_queue_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER,
+                contact_id TEXT NOT NULL,
+                desired_title TEXT NOT NULL,
+                scheduling_profile_key TEXT,
+                customer_profile TEXT,
+                request_summary TEXT,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                earliest_starts_at TIMESTAMP,
+                latest_starts_at TIMESTAMP,
+                preferred_periods_json TEXT,
+                priority_tier TEXT NOT NULL DEFAULT 'normal',
+                priority_score INTEGER NOT NULL DEFAULT 0,
+                accepts_short_notice INTEGER NOT NULL DEFAULT 1,
+                original_booking_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'active',
+                source TEXT NOT NULL DEFAULT 'manual',
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (original_booking_id) REFERENCES appointment_bookings(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS appointment_queue_offers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER,
+                queue_entry_id INTEGER NOT NULL,
+                released_booking_id INTEGER,
+                outbound_message_id INTEGER,
+                new_booking_id INTEGER,
+                offered_starts_at TIMESTAMP NOT NULL,
+                offered_ends_at TIMESTAMP NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                status TEXT NOT NULL DEFAULT 'pending',
+                response_deadline_at TIMESTAMP,
+                follow_up_after TIMESTAMP,
+                responded_at TIMESTAMP,
+                response_notes TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (queue_entry_id) REFERENCES appointment_queue_entries(id),
+                FOREIGN KEY (released_booking_id) REFERENCES appointment_bookings(id),
+                FOREIGN KEY (outbound_message_id) REFERENCES outbound_messages(id),
+                FOREIGN KEY (new_booking_id) REFERENCES appointment_bookings(id)
+            )
+            """
+        )
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "appointment_queue_entries", "company_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_entries", "contact_id", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(cursor, "appointment_queue_entries", "desired_title", "TEXT NOT NULL DEFAULT 'Agendamento'")
+    ensure_column(cursor, "appointment_queue_entries", "scheduling_profile_key", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "customer_profile", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "request_summary", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "timezone", "TEXT NOT NULL DEFAULT 'UTC'")
+    ensure_column(cursor, "appointment_queue_entries", "earliest_starts_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_entries", "latest_starts_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_entries", "preferred_periods_json", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "priority_tier", "TEXT NOT NULL DEFAULT 'normal'")
+    ensure_column(cursor, "appointment_queue_entries", "priority_score", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(cursor, "appointment_queue_entries", "accepts_short_notice", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(cursor, "appointment_queue_entries", "original_booking_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_entries", "status", "TEXT NOT NULL DEFAULT 'active'")
+    ensure_column(cursor, "appointment_queue_entries", "source", "TEXT NOT NULL DEFAULT 'manual'")
+    ensure_column(cursor, "appointment_queue_entries", "notes", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_entries", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+    ensure_column(cursor, "appointment_queue_offers", "company_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_offers", "queue_entry_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_offers", "released_booking_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_offers", "outbound_message_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_offers", "new_booking_id", "INTEGER")
+    ensure_column(cursor, "appointment_queue_offers", "offered_starts_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_offers", "offered_ends_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_offers", "timezone", "TEXT NOT NULL DEFAULT 'UTC'")
+    ensure_column(cursor, "appointment_queue_offers", "status", "TEXT NOT NULL DEFAULT 'pending'")
+    ensure_column(cursor, "appointment_queue_offers", "response_deadline_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_offers", "follow_up_after", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_offers", "responded_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_offers", "response_notes", "TEXT")
+    ensure_column(cursor, "appointment_queue_offers", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "appointment_queue_offers", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+
+def _create_queue_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_queue_entries_company_status_priority
+        ON appointment_queue_entries (company_id, status, priority_score, created_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_queue_entries_original_booking_status
+        ON appointment_queue_entries (original_booking_id, status)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_queue_offers_company_status_starts_at
+        ON appointment_queue_offers (company_id, status, offered_starts_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_queue_offers_released_booking_status
+        ON appointment_queue_offers (released_booking_id, status, created_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_queue_offers_entry_status
+        ON appointment_queue_offers (queue_entry_id, status, created_at)
+        """
+    )
+
+
 MIGRATIONS: list[Migration] = [
     ("001_runtime_tables", "Create runtime tables and columns", _create_runtime_tables),
     ("002_audit_events", "Create audit events table", _create_audit_tables),
@@ -1039,6 +1226,8 @@ MIGRATIONS: list[Migration] = [
     ("008_workflow_indexes", "Create workflow indexes", _create_workflow_indexes),
     ("009_reminder_audience", "Add audience and booking columns to reminders", _create_workflow_tables),
     ("010_reminder_booking_index", "Add reminder booking index", _create_workflow_indexes),
+    ("011_queue_tables", "Create appointment queue tables", _create_queue_tables),
+    ("012_queue_indexes", "Create appointment queue indexes", _create_queue_indexes),
 ]
 
 

@@ -1,7 +1,9 @@
+import logging
 from typing import Any
 
 from app.core.config import settings
 from app.core.company_context import get_company_context
+from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
 from app.storage.repository import RuntimeRepository
 from app.services.style_service import (
@@ -11,6 +13,7 @@ from app.services.style_service import (
 )
 
 repository = RuntimeRepository()
+logger = get_logger(__name__)
 
 
 def _fallback_business_reply(
@@ -137,8 +140,17 @@ def generate_business_reply(
             "reply": reply,
             "source": reply_source,
         }
-    except Exception as e:
-        print("OPENAI REPLY ERROR:", repr(e))
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "reply.provider.fallback",
+            provider="openai",
+            error_type=type(exc).__name__,
+            classification=classification,
+            company_id=company_id,
+            company_slug=company_slug,
+        )
         return _fallback_business_reply(
             classification=classification,
             message=message,
