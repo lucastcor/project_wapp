@@ -1126,20 +1126,13 @@ function renderFlowInspector(pipeline, allPipelines) {
         <label>CTA preferido</label>
         <textarea name="preferred_cta">${escapeHtml(pipeline.preferred_cta || "")}</textarea>
       </div>
-      <div class="form-grid-two">
-        <div class="field">
-          <label>Próximas etapas</label>
-          <input name="next_keys" value="${escapeHtml(nextKeysValue)}" placeholder="Ex.: appointment_management, conversion_followup" />
-          <small>Keys disponíveis: ${escapeHtml(allPipelines.map((item) => item.key).join(", "))}</small>
-        </div>
-        <div class="field">
-          <label>Posição no canvas</label>
-          <div class="quick-row">
-            <input name="canvas_x" type="number" value="${escapeHtml(String(Number(pipeline.canvas_position?.x || 0)))}" placeholder="x" />
-            <input name="canvas_y" type="number" value="${escapeHtml(String(Number(pipeline.canvas_position?.y || 0)))}" placeholder="y" />
-          </div>
-        </div>
+      <div class="field">
+        <label>Próximas etapas</label>
+        <input name="next_keys" value="${escapeHtml(nextKeysValue)}" placeholder="Ex.: appointment_management, conversion_followup" />
+        <small>Keys disponíveis: ${escapeHtml(allPipelines.map((item) => item.key).join(", "))}</small>
       </div>
+      <input type="hidden" name="canvas_x" value="${escapeHtml(String(Number(pipeline.canvas_position?.x || 0)))}" />
+      <input type="hidden" name="canvas_y" value="${escapeHtml(String(Number(pipeline.canvas_position?.y || 0)))}" />
       <div class="inline-actions">
         <button class="button-ghost" type="submit">Aplicar no canvas</button>
         <button class="button-danger" type="button" data-remove-pipeline-key="${escapeHtml(pipeline.key)}">Remover etapa</button>
@@ -1394,11 +1387,17 @@ function renderFlowsView() {
       <span class="brand-eyebrow">Flow Studio</span>
       <h2 class="hero-title">Desenhe o fluxo conversacional em um canvas visual.</h2>
       <p class="hero-copy">
-        Clique num template à esquerda para adicionar, arraste os nós para posicionar, e ajuste comportamento no inspector à direita. Tudo persiste no company context.
+        Clique num template à esquerda para adicionar, arraste os nós para posicionar, e ajuste comportamento no inspector à direita. Tudo persiste no company context e altera o comportamento real do bot.
       </p>
       <div class="hero-actions">
         <button class="button" id="save-pipelines">${ICONS.check}<span>Salvar no company context</span></button>
         <button class="button-ghost" id="add-pipeline-stage">${ICONS.plus}<span>Etapa em branco</span></button>
+      </div>
+      <div class="chip-row" style="margin-top:6px;">
+        <span class="chip" style="cursor:default;">1 · Escolha um template à esquerda</span>
+        <span class="chip" style="cursor:default;">2 · Arraste os nós para organizar o mapa</span>
+        <span class="chip" style="cursor:default;">3 · Edite objetivo e transições no inspector</span>
+        <span class="chip" style="cursor:default;">4 · Salvar aplica no runtime do bot</span>
       </div>
     </section>
 
@@ -2610,23 +2609,13 @@ function bindFlowEvents() {
     })
   })
 
-  const updateEdgePathsForKey = (movedKey) => {
-    const context = ensureConversationPipelines(state.companyContext || {})
-    const pipelines = context.conversation_pipelines || []
-    const lookup = new Map(pipelines.map((p) => [p.key, p]))
-    document
-      .querySelectorAll(`.flow-edge-path[data-edge-source="${CSS.escape(movedKey)}"], .flow-edge-path[data-edge-target="${CSS.escape(movedKey)}"]`)
-      .forEach((path) => {
-        const source = lookup.get(path.dataset.edgeSource)
-        const target = lookup.get(path.dataset.edgeTarget)
-        if (!source || !target) return
-        const startX = Number(source.canvas_position?.x || 0) + 260
-        const startY = Number(source.canvas_position?.y || 0) + 70
-        const endX = Number(target.canvas_position?.x || 0)
-        const endY = Number(target.canvas_position?.y || 0) + 70
-        const midX = startX + (endX - startX) / 2
-        path.setAttribute("d", `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`)
-      })
+  const computeEdgeD = (source, target) => {
+    const startX = Number(source.canvas_position?.x || 0) + 260
+    const startY = Number(source.canvas_position?.y || 0) + 70
+    const endX = Number(target.canvas_position?.x || 0)
+    const endY = Number(target.canvas_position?.y || 0) + 70
+    const midX = startX + (endX - startX) / 2
+    return `M ${startX} ${startY} C ${midX} ${startY}, ${midX} ${endY}, ${endX} ${endY}`
   }
 
   document.querySelectorAll("[data-select-pipeline]").forEach((button) => {
@@ -2647,6 +2636,18 @@ function bindFlowEvents() {
       let dragging = false
       let currentX = originX
       let currentY = originY
+      let rafPending = false
+
+      const pipelineLookup = new Map((context.conversation_pipelines || []).map((p) => [p.key, p]))
+      const incidentEdges = Array.from(
+        document.querySelectorAll(
+          `.flow-edge-path[data-edge-source="${CSS.escape(pipelineKey)}"], .flow-edge-path[data-edge-target="${CSS.escape(pipelineKey)}"]`
+        )
+      ).map((path) => ({
+        path,
+        source: pipelineLookup.get(path.dataset.edgeSource),
+        target: pipelineLookup.get(path.dataset.edgeTarget),
+      })).filter((e) => e.source && e.target)
 
       try {
         button.setPointerCapture(event.pointerId)
@@ -2654,18 +2655,29 @@ function bindFlowEvents() {
       event.preventDefault()
 
       const zoom = state.flowEditor.zoom || 1
+      const flushFrame = () => {
+        rafPending = false
+        button.style.left = `${currentX}px`
+        button.style.top = `${currentY}px`
+        for (const edge of incidentEdges) {
+          edge.path.setAttribute("d", computeEdgeD(edge.source, edge.target))
+        }
+      }
       const onMove = (moveEvent) => {
         const dx = (moveEvent.clientX - startX) / zoom
         const dy = (moveEvent.clientY - startY) / zoom
         if (!dragging && Math.hypot(dx, dy) < 4 / zoom) return
-        dragging = true
-        button.classList.add("dragging")
+        if (!dragging) {
+          dragging = true
+          button.classList.add("dragging")
+        }
         currentX = Math.max(20, originX + dx)
         currentY = Math.max(20, originY + dy)
-        button.style.left = `${currentX}px`
-        button.style.top = `${currentY}px`
         pipeline.canvas_position = { x: currentX, y: currentY }
-        updateEdgePathsForKey(pipelineKey)
+        if (!rafPending) {
+          rafPending = true
+          requestAnimationFrame(flushFrame)
+        }
       }
 
       const onUp = () => {
