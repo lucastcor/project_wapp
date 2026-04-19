@@ -50,10 +50,13 @@ def _process_contact_message(
     )
 
     repository.save_contact(contact_id, contact_name, company_id=resolved_company_id)
-    contact = repository.get_contact(contact_id)
+    contact = repository.get_contact(contact_id, company_id=resolved_company_id)
     previous_summary = contact["conversation_summary"] if contact else None
     previous_classification = contact["last_classification"] if contact else None
-    latest_customer_clarification = repository.get_latest_customer_clarification(contact_id)
+    latest_customer_clarification = repository.get_latest_customer_clarification(
+        contact_id,
+        company_id=resolved_company_id,
+    )
     company_context = get_company_context(company_slug=resolved_company_slug)
 
     workflow_result = handle_conversation_workflow(
@@ -140,7 +143,10 @@ def _process_contact_message(
                 "action": "request_customer_clarification",
                 "priority": "high",
             }
-            repository.mark_clarification_consumed(latest_customer_clarification["id"])
+            repository.mark_clarification_consumed(
+                latest_customer_clarification["id"],
+                company_id=resolved_company_id,
+            )
         elif decision["auto_reply"]:
             reply_result = generate_business_reply(
                 classification=classification,
@@ -218,6 +224,7 @@ def _process_contact_message(
         pipeline_stage=pipeline_state["pipeline_stage"],
         next_action=pipeline_state["next_action"],
         lead_temperature=pipeline_state["lead_temperature"],
+        company_id=resolved_company_id,
     )
 
     duration_ms = round((time.perf_counter() - start_time) * 1000, 2)

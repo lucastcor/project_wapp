@@ -6,6 +6,9 @@ class FakeRepository:
         self.saved_contacts: list[dict] = []
         self.saved_messages: list[dict] = []
         self.default_company_id = 7
+        self.last_get_contact: dict | None = None
+        self.last_get_latest_customer_clarification: dict | None = None
+        self.updated_contact_memory: dict | None = None
 
     def resolve_company_id(
         self,
@@ -40,10 +43,23 @@ class FakeRepository:
             }
         )
 
-    def get_contact(self, contact_id: str) -> dict | None:
+    def get_contact(self, contact_id: str, *, company_id: int | None = None) -> dict | None:
+        self.last_get_contact = {
+            "contact_id": contact_id,
+            "company_id": company_id,
+        }
         return None
 
-    def get_latest_customer_clarification(self, contact_id: str) -> None:
+    def get_latest_customer_clarification(
+        self,
+        contact_id: str,
+        *,
+        company_id: int | None = None,
+    ) -> None:
+        self.last_get_latest_customer_clarification = {
+            "contact_id": contact_id,
+            "company_id": company_id,
+        }
         return None
 
     def save_message(self, **kwargs) -> None:
@@ -52,11 +68,11 @@ class FakeRepository:
     def create_pending_question(self, **kwargs) -> int:
         raise AssertionError("Pending question should not be created in this scenario.")
 
-    def mark_clarification_consumed(self, question_id: int) -> None:
+    def mark_clarification_consumed(self, question_id: int, *, company_id: int | None = None) -> None:
         raise AssertionError("Clarification should not be consumed in this scenario.")
 
     def update_contact_memory(self, **kwargs) -> None:
-        return None
+        self.updated_contact_memory = kwargs
 
 
 def test_process_incoming_message_propagates_company_scope(monkeypatch) -> None:
@@ -124,3 +140,13 @@ def test_process_incoming_message_propagates_company_scope(monkeypatch) -> None:
     assert captured_reply_kwargs["company_slug"] == "empresa-teste"
     assert fake_repository.saved_contacts[0]["company_id"] == 7
     assert fake_repository.saved_messages[0]["company_id"] == 7
+    assert fake_repository.last_get_contact == {
+        "contact_id": "5511999991234",
+        "company_id": 7,
+    }
+    assert fake_repository.last_get_latest_customer_clarification == {
+        "contact_id": "5511999991234",
+        "company_id": 7,
+    }
+    assert fake_repository.updated_contact_memory is not None
+    assert fake_repository.updated_contact_memory["company_id"] == 7

@@ -37,22 +37,27 @@ class FakeRepository:
             "company_id": company_id,
         }
 
-    def get_contact(self, contact_id: str) -> dict:
+    def get_contact(self, contact_id: str, *, company_id: int | None = None) -> dict:
         return {
             "contact_id": contact_id,
             "contact_name": "Cliente Teste",
-            "company_id": self.default_company_id,
+            "company_id": company_id if company_id is not None else self.default_company_id,
             "conversation_summary": "Contato já demonstrou interesse inicial.",
             "last_classification": "lead_novo",
         }
 
-    def get_latest_customer_clarification(self, contact_id: str) -> None:
+    def get_latest_customer_clarification(
+        self,
+        contact_id: str,
+        *,
+        company_id: int | None = None,
+    ) -> None:
         return None
 
     def create_pending_question(self, **kwargs) -> int:
         raise AssertionError("Pending question should not be created in this flow.")
 
-    def mark_clarification_consumed(self, question_id: int) -> None:
+    def mark_clarification_consumed(self, question_id: int, *, company_id: int | None = None) -> None:
         raise AssertionError("Clarification should not be consumed in this flow.")
 
     def save_message(self, **kwargs) -> None:

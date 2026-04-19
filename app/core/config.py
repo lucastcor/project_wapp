@@ -5,6 +5,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+_PLACEHOLDER_PREFIXES = ("change-me", "changeme", "example-", "example_", "example")
+_PLACEHOLDER_VALUES = {
+    "project-wapp-platform-dev-secret",
+}
+
+
+def is_missing_or_placeholder(value: str | None) -> bool:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized in _PLACEHOLDER_VALUES:
+        return True
+    return any(normalized.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES)
+
+
 class Settings:
     app_name: str = os.getenv("APP_NAME", "Chatbot API")
     app_version: str = os.getenv("APP_VERSION", "1.0.0")
@@ -13,10 +28,18 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL", "INFO").upper()
     log_json: bool = os.getenv("LOG_JSON", "true").lower() == "true"
     strict_runtime_validation: bool = os.getenv("STRICT_RUNTIME_VALIDATION", "false").lower() == "true"
+    enable_rate_limiting: bool = os.getenv("ENABLE_RATE_LIMITING", "false").lower() == "true"
+    rate_limit_window_seconds: int = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+    rate_limit_auth_requests: int = int(os.getenv("RATE_LIMIT_AUTH_REQUESTS", "10"))
+    rate_limit_admin_requests: int = int(os.getenv("RATE_LIMIT_ADMIN_REQUESTS", "180"))
+    rate_limit_incoming_requests: int = int(os.getenv("RATE_LIMIT_INCOMING_REQUESTS", "120"))
+    rate_limit_webhook_requests: int = int(os.getenv("RATE_LIMIT_WEBHOOK_REQUESTS", "300"))
+    rate_limit_exempt_localhost: bool = os.getenv("RATE_LIMIT_EXEMPT_LOCALHOST", "false").lower() == "true"
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///project_wapp.db")
     postgres_database_url: str | None = os.getenv("POSTGRES_DATABASE_URL")
     database_pool_size: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
     database_statement_timeout_ms: int = int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "5000"))
+    operations_backup_dir: str = os.getenv("OPERATIONS_BACKUP_DIR", "backups")
     enable_admin_auth: bool = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"
     admin_api_token: str | None = os.getenv("ADMIN_API_TOKEN")
     admin_viewer_token: str | None = os.getenv("ADMIN_VIEWER_TOKEN")
@@ -39,10 +62,10 @@ class Settings:
     admin_app_api_base_url: str = os.getenv("ADMIN_APP_API_BASE_URL", "http://127.0.0.1:8000")
 
     openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
-    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-5")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
     openai_finetuned_model: str | None = os.getenv("OPENAI_FINETUNED_MODEL")
     use_finetuned_model_for_replies: bool = os.getenv("USE_FINETUNED_MODEL_FOR_REPLIES", "false").lower() == "true"
-    openai_finetuning_base_model: str = os.getenv("OPENAI_FINETUNING_BASE_MODEL", "gpt-4.1-mini")
+    openai_finetuning_base_model: str = os.getenv("OPENAI_FINETUNING_BASE_MODEL", "gpt-4o-mini-2024-07-18")
     openai_finetuning_suffix: str = os.getenv("OPENAI_FINETUNING_SUFFIX", "project-wapp-style")
     enable_finetuning_pipeline: bool = os.getenv("ENABLE_FINETUNING_PIPELINE", "false").lower() == "true"
     classification_provider: str = os.getenv("CLASSIFICATION_PROVIDER", "mock")

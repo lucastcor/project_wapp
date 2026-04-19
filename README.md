@@ -252,7 +252,18 @@ Esse contrato e validado no backend, incluindo unicidade de `key` e referencias 
 ## Configuração por ambiente
 O projeto depende de variáveis de ambiente. Não suba segredos reais para o repositório.
 
-### Exemplo de `.env`
+### Qual arquivo usar
+- `.env.example`: modelo versionado. Serve apenas como referência. Nunca coloque chaves reais nele.
+- `.env`: arquivo para desenvolvimento local quando voce roda comandos diretamente no host, por exemplo `uvicorn app.main:app --reload`. O backend carrega `.env` automaticamente via `load_dotenv()`.
+- `.env.production`: arquivo local para homologacao/producao com Docker Compose. Ele nao e versionado e deve receber as chaves reais quando voce subir a stack com `docker compose --env-file .env.production ...`.
+
+Regra pratica:
+- se voce vai rodar o app manualmente no host, preencha `.env`;
+- se voce vai rodar a stack pelo `compose.yaml`, preencha `.env.production`;
+- se voce so vai usar Docker, pode deixar `.env` vazio ou nem criar esse arquivo;
+- `.env.example` nunca deve ter segredo real.
+
+### Exemplo de `.env.example`
 ```env
 ENVIRONMENT=production
 DEBUG=false
@@ -267,6 +278,8 @@ USE_FINETUNED_MODEL_FOR_REPLIES=false
 
 DATABASE_URL=postgresql://project_wapp:project_wapp@127.0.0.1:5432/project_wapp
 POSTGRES_DATABASE_URL=postgresql://project_wapp:project_wapp@127.0.0.1:5432/project_wapp
+COMPOSE_DATABASE_URL=postgresql://project_wapp:project_wapp@postgres:5432/project_wapp
+COMPOSE_POSTGRES_DATABASE_URL=postgresql://project_wapp:project_wapp@postgres:5432/project_wapp
 DATABASE_POOL_SIZE=10
 DATABASE_STATEMENT_TIMEOUT_MS=5000
 ENABLE_ADMIN_AUTH=true
@@ -320,6 +333,31 @@ ADMIN_PORT=8501
 Existe um arquivo local pronto em `.env.production` com placeholders operacionais.
 Ele nao e versionado por Git e serve como ponto de partida para deploy/homologacao.
 
+### Onde colocar as chaves corretas
+Para o fluxo mais profissional do projeto hoje, coloque as chaves reais em `.env.production`.
+
+Sobre banco:
+- `DATABASE_URL` e `POSTGRES_DATABASE_URL`: use quando voce rodar scripts ou a API diretamente no host.
+- `COMPOSE_DATABASE_URL` e `COMPOSE_POSTGRES_DATABASE_URL`: use quando a stack subir pelo `docker compose`, porque dentro do container o host certo do banco e `postgres`, nao `127.0.0.1`.
+
+As variaveis internas que voce mesmo controla sao:
+- `POSTGRES_PASSWORD`
+- `ADMIN_API_TOKEN`
+- `ADMIN_VIEWER_TOKEN`
+- `ADMIN_OPERATOR_TOKEN`
+- `ADMIN_SUPERADMIN_TOKEN`
+- `PLATFORM_SESSION_SECRET`
+
+As variaveis externas, que precisam vir do provedor real, sao:
+- `OPENAI_API_KEY`
+- `GOOGLE_CALENDAR_CLIENT_ID`
+- `GOOGLE_CALENDAR_CLIENT_SECRET`
+- `GOOGLE_CALENDAR_REFRESH_TOKEN`
+- `WHATSAPP_API_TOKEN`
+- `WHATSAPP_PHONE_NUMBER_ID`
+- `WHATSAPP_WEBHOOK_VERIFY_TOKEN`
+- `WHATSAPP_APP_SECRET`
+
 ## Como rodar localmente
 ### 1. Criar e ativar ambiente virtual
 ```bash
@@ -332,81 +370,113 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configurar variáveis de ambiente
-Crie um arquivo `.env` com base no exemplo acima.
+### 3. Escolher o modo de execucao
+Voce tem dois caminhos:
 
-### 4. Subir a aplicação
+- modo desenvolvimento simples: usa `.env` e sobe API direto no host;
+- modo producao/homologacao: usa `.env.production` e sobe tudo com Docker Compose.
+
+### 4. Desenvolvimento simples com `.env`
+Crie `.env` com base em `.env.example` e rode:
 ```bash
 uvicorn app.main:app --reload
 ```
 
-### 4.1. Subir stack com Postgres
-O caminho mais profissional para ambiente local e homologação é usar a imagem oficial do Postgres via Compose:
-```bash
-docker compose up -d postgres
-```
+### 5. Subir stack completa com Docker e `.env.production`
+Esse e o fluxo recomendado para validacao seria, homologacao e producao.
 
-Para subir API + Postgres:
-```bash
-docker compose up --build
-```
+#### 5.1. Antes de subir
+- garanta que o Docker Desktop ou o Docker daemon esteja ligado;
+- revise `.env.production` e troque todo valor `change-me-*` por valor real;
+- mantenha `DATABASE_URL`, `POSTGRES_DATABASE_URL` e `POSTGRES_PASSWORD` coerentes entre si no host;
+- mantenha `COMPOSE_DATABASE_URL` e `COMPOSE_POSTGRES_DATABASE_URL` apontando para `@postgres:5432` dentro do Docker Compose.
 
-Para um runtime operacional de verdade, o `compose.yaml` agora sobe em modo endurecido por padrão: Postgres como runtime, auth admin obrigatória, validação estrita de configuração, worker recorrente habilitado e provider outbound real via WhatsApp. Se faltar credencial obrigatória, a API e o worker falham cedo em vez de subir em modo parcialmente configurado.
-
-### 4.2. Bootstrap de producao com Postgres
-Fluxo recomendado:
+#### 5.2. Subir apenas o Postgres
+Para local/homologacao, o caminho mais simples e suportado e usar o Postgres do proprio `compose.yaml`:
 ```bash
 docker compose --env-file .env.production up -d postgres
 ```
 
-Depois exporte as variaveis do arquivo de producao no shell:
+Observacao:
+- para ambiente local e homologacao, sim, o mais pratico e subir o Postgres pelo Docker;
+- em producao real, voce tambem pode apontar `DATABASE_URL` para um Postgres externo/gerenciado e nem subir o servico `postgres` do compose.
+- se a stack roda via `docker compose`, nao use `127.0.0.1` nas URLs internas do container; use `COMPOSE_DATABASE_URL` e `COMPOSE_POSTGRES_DATABASE_URL`.
+
+#### 5.3. Migrar dados antigos do SQLite, se existir
+Se voce ja tiver dados em `project_wapp.db`, exporte as variaveis de `.env.production` no shell e rode a migracao:
 ```bash
 set -a
 source .env.production
 set +a
-```
 
-Se voce ja tiver dados no SQLite atual, migre antes de subir a stack completa:
-```bash
 python3 -m app.tools.migrate_sqlite_to_postgres \
   --sqlite-path project_wapp.db \
   --postgres-url "$POSTGRES_DATABASE_URL"
 ```
 
-Valide o ambiente:
-```bash
-python3 -m app.tools.preflight_check
-```
-
-Se o preflight estiver sem blockers, suba a stack:
+#### 5.4. Subir a stack inteira
 ```bash
 docker compose --env-file .env.production up --build -d
 ```
 
-Serviços esperados:
+Para um runtime operacional de verdade, o `compose.yaml` sobe:
+- `postgres`
+- `api`
+- `worker`
+- `admin`
+
+Se faltar credencial obrigatoria, a API e o worker falham cedo em vez de subir em modo parcialmente configurado.
+
+#### 5.5. Validar se os containers subiram
+```bash
+docker compose --env-file .env.production ps
+```
+
+#### 5.6. Rodar preflight do jeito mais seguro
+O jeito mais limpo e rodar o preflight dentro do container da API, porque ele ja recebe as variaveis de `.env.production`:
+```bash
+docker compose --env-file .env.production exec api \
+  python -m app.tools.preflight_check
+```
+
+Para exigir readiness de escala:
+```bash
+docker compose --env-file .env.production exec api \
+  python -m app.tools.preflight_check --require-scale-ready
+```
+
+Se voce preferir rodar o preflight no host, ai sim exporte `.env.production` antes. Nesse caso o comando usa `DATABASE_URL` e `POSTGRES_DATABASE_URL` do host, nao as variaveis `COMPOSE_*`:
+```bash
+set -a
+source .env.production
+set +a
+python3 -m app.tools.preflight_check --require-scale-ready
+```
+
+#### 5.7. Servicos esperados
 
 - API em `http://127.0.0.1:8000`
 - Admin em `http://127.0.0.1:8501`
 - Worker recorrente de lembretes em container separado
 
-### 5. Acessar documentação interativa
+### 6. Acessar documentação interativa
 Abra no navegador:
 ```text
 http://127.0.0.1:8000/docs
 ```
 
-### 5.1. Readiness probe
+### 6.1. Readiness probe
 Para orquestração e deploy:
 ```text
 http://127.0.0.1:8000/health/ready
 ```
 
-### 6. Rodar o painel administrativo
+### 7. Rodar o painel administrativo
 ```bash
 streamlit run app/admin_app.py
 ```
 
-### 6.1. Abrir a plataforma dedicada
+### 7.1. Abrir a plataforma dedicada
 Com a API no ar, abra:
 
 ```text
@@ -424,7 +494,7 @@ A plataforma agora autentica por sessao propria. O token administrativo deixa de
 
 O painel Streamlit continua útil como contingência e apoio interno, mas a superfície dedicada em `/platform` passa a ser a camada principal de operação premium.
 
-### 7. Migrar dados do SQLite atual para Postgres
+### 8. Migrar dados do SQLite atual para Postgres
 Se você já tiver dados em `project_wapp.db`, pode migrar assim:
 ```bash
 python3 -m app.tools.migrate_sqlite_to_postgres \
@@ -432,14 +502,32 @@ python3 -m app.tools.migrate_sqlite_to_postgres \
   --postgres-url postgresql://project_wapp:project_wapp@127.0.0.1:5432/project_wapp
 ```
 
-### 8. Rodar preflight antes de publicar
+### 9. Rodar preflight antes de publicar
 ```bash
 python3 -m app.tools.preflight_check
 ```
 
 Se o comando retornar `blocked`, ainda há item crítico a resolver antes do deploy.
 
-### 8.1. Ativacao do webhook do Meta
+### 9.1. Backup lógico antes do go-live
+```bash
+python3 -m app.tools.export_runtime_backup
+```
+
+### 9.2. Limpeza operacional segura
+Dry-run:
+```bash
+python3 -m app.tools.cleanup_operational_data --stale-after-days 30
+```
+
+Execução real com backup automático:
+```bash
+python3 -m app.tools.cleanup_operational_data --execute --stale-after-days 30
+```
+
+O runbook completo de produção, backup, limpeza e incidente está em [docs/production_runbook.md](/Users/lucasteixeira/Documents/project_wapp/docs/production_runbook.md).
+
+### 9.3. Ativacao do webhook do Meta
 O endpoint de verificacao e recepcao e:
 
 - `GET /webhooks/whatsapp` para handshake

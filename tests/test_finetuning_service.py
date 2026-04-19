@@ -1,8 +1,8 @@
-
+import pytest
 
 from app.core.config import settings
-from app.services.finetuning_service import FineTuningError, FineTuningService
 from app.services import finetuning_service
+from app.services.finetuning_service import FineTuningError, FineTuningService
 
 
 class FakeRepository:
@@ -10,6 +10,7 @@ class FakeRepository:
         self.created_records: list[dict] = []
         self.updated_records: list[dict] = []
         self.records_by_job_id: dict[str, dict] = {}
+        self.record_lookup_calls: list[dict] = []
 
     def create_finetuning_job_record(self, **kwargs) -> int:
         self.created_records.append(kwargs)
@@ -22,8 +23,25 @@ class FakeRepository:
         record.update(kwargs)
         self.records_by_job_id[kwargs["job_id"]] = record
 
-    def get_finetuning_job_record(self, job_id: str) -> dict | None:
-        return self.records_by_job_id.get(job_id)
+    def get_finetuning_job_record(self, job_id: str, company_id: int | None = None) -> dict | None:
+        self.record_lookup_calls.append(
+            {
+                "job_id": job_id,
+                "company_id": company_id,
+            }
+        )
+        record = self.records_by_job_id.get(job_id)
+        if record is None:
+            return None
+        if company_id is not None and record.get("company_id") != company_id:
+            return None
+        return dict(record)
+
+    def get_finetuning_job_records(self, company_id: int | None = None) -> list[dict]:
+        records = [dict(record) for record in self.records_by_job_id.values()]
+        if company_id is None:
+            return records
+        return [record for record in records if record.get("company_id") == company_id]
 
 
 class FakeUploadedFile:
@@ -106,42 +124,59 @@ class FakeOpenAIClient:
         self.fine_tuning = FineTuningNamespace()
 
 
-
 def test_create_finetuning_job_raises_when_pipeline_is_disabled(monkeypatch) -> None:
     monkeypatch.setattr(settings, "enable_finetuning_pipeline", False)
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
 
     service = FineTuningService()
 
-    try:
-        service.create_finetuning_job()
-        assert False, "Expected FineTuningError to be raised"
-    except FineTuningError as exc:
-        assert "disabled" in str(exc).lower()
+    with pytest.raises(FineTuningError, match="disabled"):
+        service.create_finetuning_job(company_id=1)
 
 
+def test_create_finetuning_job_requires_company_scope(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "enable_finetuning_pipeline", True)
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
 
-def test_create_finetuning_job_creates_record(monkeypatch) -> None:
+    service = FineTuningService()
+
+    with pytest.raises(FineTuningError, match="company_id must be provided"):
+        service.create_finetuning_job(company_id=None)
+
+
+def test_create_finetuning_job_creates_scoped_record(monkeypatch) -> None:
     fake_repository = FakeRepository()
+    export_calls: list[tuple[str, int | None]] = []
+
     monkeypatch.setattr(finetuning_service, "repository", fake_repository)
     monkeypatch.setattr(settings, "enable_finetuning_pipeline", True)
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
     monkeypatch.setattr(settings, "openai_finetuning_base_model", "gpt-4o-mini-2024-07-18")
     monkeypatch.setattr(settings, "openai_finetuning_suffix", "project-wapp-style")
-    monkeypatch.setattr(finetuning_service, "export_finetuning_train_jsonl", lambda: '{"messages": []}')
-    monkeypatch.setattr(finetuning_service, "export_finetuning_validation_jsonl", lambda: '{"messages": []}')
+    monkeypatch.setattr(
+        finetuning_service,
+        "export_finetuning_train_jsonl",
+        lambda company_id=None: export_calls.append(("train", company_id)) or '{"messages": []}',
+    )
+    monkeypatch.setattr(
+        finetuning_service,
+        "export_finetuning_validation_jsonl",
+        lambda company_id=None: export_calls.append(("validation", company_id)) or '{"messages": []}',
+    )
     monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
 
     service = FineTuningService()
-    result = service.create_finetuning_job()
+    result = service.create_finetuning_job(company_id=7)
 
     assert result["job_id"] == "ftjob-test-123"
     assert result["status"] == "validating_files"
     assert result["training_file_info"]["status"] == "processed"
     assert result["validation_file_info"]["status"] == "processed"
+    assert export_calls == [("train", 7), ("validation", 7)]
     assert len(fake_repository.created_records) == 1
     assert fake_repository.created_records[0]["job_id"] == "ftjob-test-123"
-
+    assert fake_repository.created_records[0]["company_id"] == 7
 
 
 def test_retrieve_finetuning_job_updates_persisted_record(monkeypatch) -> None:
@@ -150,6 +185,7 @@ def test_retrieve_finetuning_job_updates_persisted_record(monkeypatch) -> None:
         job_id="ftjob-test-123",
         status="validating_files",
         base_model="gpt-4o-mini-2024-07-18",
+        company_id=7,
     )
 
     monkeypatch.setattr(finetuning_service, "repository", fake_repository)
@@ -157,7 +193,7 @@ def test_retrieve_finetuning_job_updates_persisted_record(monkeypatch) -> None:
     monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
 
     service = FineTuningService()
-    result = service.retrieve_finetuning_job("ftjob-test-123")
+    result = service.retrieve_finetuning_job("ftjob-test-123", company_id=7)
 
     assert result["job_id"] == "ftjob-test-123"
     assert result["status"] == "failed"
@@ -165,18 +201,76 @@ def test_retrieve_finetuning_job_updates_persisted_record(monkeypatch) -> None:
     assert len(fake_repository.updated_records) == 1
     assert fake_repository.updated_records[0]["job_id"] == "ftjob-test-123"
     assert fake_repository.updated_records[0]["status"] == "failed"
+    assert fake_repository.record_lookup_calls == [
+        {
+            "job_id": "ftjob-test-123",
+            "company_id": 7,
+        }
+    ]
 
 
-
-def test_list_finetuning_jobs_returns_structured_jobs(monkeypatch) -> None:
+def test_retrieve_finetuning_job_rejects_mismatched_company(monkeypatch) -> None:
     fake_repository = FakeRepository()
+    fake_repository.create_finetuning_job_record(
+        job_id="ftjob-test-123",
+        status="validating_files",
+        base_model="gpt-4o-mini-2024-07-18",
+        company_id=7,
+    )
+
     monkeypatch.setattr(finetuning_service, "repository", fake_repository)
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
     monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
 
     service = FineTuningService()
-    jobs = service.list_finetuning_jobs(limit=5)
+
+    with pytest.raises(FineTuningError, match="company_id=9"):
+        service.retrieve_finetuning_job("ftjob-test-123", company_id=9)
+
+
+def test_list_finetuning_jobs_returns_structured_jobs(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    fake_repository.create_finetuning_job_record(
+        job_id="ftjob-test-123",
+        status="validating_files",
+        base_model="gpt-4o-mini-2024-07-18",
+        company_id=7,
+    )
+
+    monkeypatch.setattr(finetuning_service, "repository", fake_repository)
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
+
+    service = FineTuningService()
+    jobs = service.list_finetuning_jobs(limit=5, company_id=7)
 
     assert len(jobs) == 1
     assert jobs[0]["job_id"] == "ftjob-test-123"
     assert jobs[0]["status"] == "failed"
+    assert len(fake_repository.updated_records) == 1
+    assert fake_repository.record_lookup_calls == [
+        {
+            "job_id": "ftjob-test-123",
+            "company_id": 7,
+        }
+    ]
+
+
+def test_list_finetuning_jobs_filters_other_companies(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    fake_repository.create_finetuning_job_record(
+        job_id="ftjob-test-123",
+        status="validating_files",
+        base_model="gpt-4o-mini-2024-07-18",
+        company_id=7,
+    )
+
+    monkeypatch.setattr(finetuning_service, "repository", fake_repository)
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
+
+    service = FineTuningService()
+    jobs = service.list_finetuning_jobs(limit=5, company_id=9)
+
+    assert jobs == []
+    assert fake_repository.updated_records == []

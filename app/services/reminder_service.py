@@ -264,6 +264,7 @@ def dispatch_due_reminders(
             dispatch_result = dispatch_outbound_message(
                 outbound_message_id=outbound_message_id,
                 channel=result["channel"],
+                company_id=reminder.get("company_id"),
             )
             result["status"] = "sent"
             result["dispatch_result"] = dispatch_result

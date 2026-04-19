@@ -1,3 +1,4 @@
+# ruff: noqa: E402
 
 from pathlib import Path
 import os
@@ -8,7 +9,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import streamlit as st
-
 
 from app.ui.admin_api_client import AdminApiClient
 from app.ui.pages.calendar_page import render_calendar_page

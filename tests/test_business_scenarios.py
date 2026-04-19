@@ -4,7 +4,7 @@ from tests.test_data.conversation_scenarios import ALL_SCENARIOS
 
 class FakeRepository:
     def __init__(self) -> None:
-        self.contacts: dict[str, dict] = {}
+        self.contacts: dict[tuple[int | None, str], dict] = {}
         self.messages: list[dict] = []
         self.pending_questions: list[dict] = []
         self.default_company_id = 1
@@ -32,8 +32,9 @@ class FakeRepository:
         contact_name: str | None,
         company_id: int | None = None,
     ) -> None:
-        existing = self.contacts.get(contact_id, {})
-        self.contacts[contact_id] = {
+        contact_key = (company_id, contact_id)
+        existing = self.contacts.get(contact_key, {})
+        self.contacts[contact_key] = {
             "contact_id": contact_id,
             "contact_name": contact_name,
             "company_id": company_id if company_id is not None else existing.get("company_id"),
@@ -45,8 +46,8 @@ class FakeRepository:
             **existing,
         }
 
-    def get_contact(self, contact_id: str) -> dict | None:
-        contact = self.contacts.get(contact_id)
+    def get_contact(self, contact_id: str, *, company_id: int | None = None) -> dict | None:
+        contact = self.contacts.get((company_id, contact_id))
         if not contact:
             return None
 
@@ -62,7 +63,12 @@ class FakeRepository:
             **contact,
         }
 
-    def get_latest_customer_clarification(self, contact_id: str) -> dict | None:
+    def get_latest_customer_clarification(
+        self,
+        contact_id: str,
+        *,
+        company_id: int | None = None,
+    ) -> dict | None:
         return None
 
     def create_pending_question(self, **kwargs) -> int:
@@ -70,7 +76,7 @@ class FakeRepository:
         self.pending_questions.append({"id": question_id, **kwargs})
         return question_id
 
-    def mark_clarification_consumed(self, question_id: int) -> None:
+    def mark_clarification_consumed(self, question_id: int, *, company_id: int | None = None) -> None:
         return None
 
     def save_message(self, **kwargs) -> None:
@@ -78,8 +84,10 @@ class FakeRepository:
 
     def update_contact_memory(self, **kwargs) -> None:
         contact_id = kwargs["contact_id"]
-        existing = self.contacts.get(contact_id, {})
-        self.contacts[contact_id] = {
+        company_id = kwargs.get("company_id")
+        contact_key = (company_id, contact_id)
+        existing = self.contacts.get(contact_key, {})
+        self.contacts[contact_key] = {
             **existing,
             **kwargs,
         }
@@ -303,7 +311,7 @@ def test_business_conversation_scenarios(monkeypatch) -> None:
                 "reason": "Mensagem com sinal de suporte técnico.",
             }
 
-        current_contact = fake_repository.get_contact(contact_id)
+        current_contact = fake_repository.get_contact(contact_id, company_id=1)
         if current_contact:
             summary = (current_contact.get("conversation_summary") or "").lower()
             if any(
@@ -351,7 +359,7 @@ def test_business_conversation_scenarios(monkeypatch) -> None:
         assert "lead_temperature" in last_result
         assert last_result["company_id"] == 1
         assert last_result["company_slug"] == "default"
-        assert fake_repository.get_contact(contact_id) is not None
+        assert fake_repository.get_contact(contact_id, company_id=1) is not None
 
         expected_classifications = EXPECTED_ALLOWED_CLASSIFICATIONS.get(scenario_name)
         if expected_classifications:

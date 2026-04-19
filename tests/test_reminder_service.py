@@ -182,12 +182,26 @@ def test_dispatch_due_reminders_uses_company_policy_channel(monkeypatch) -> None
     monkeypatch.setattr(
         reminder_service,
         "dispatch_outbound_message",
-        lambda outbound_message_id, channel=None: dispatched.append(
-            {"outbound_message_id": outbound_message_id, "channel": channel}
-        ) or {"outbound_message_id": outbound_message_id, "channel": channel},
+        lambda outbound_message_id, channel=None, company_id=None: dispatched.append(
+            {
+                "outbound_message_id": outbound_message_id,
+                "channel": channel,
+                "company_id": company_id,
+            }
+        ) or {
+            "outbound_message_id": outbound_message_id,
+            "channel": channel,
+            "company_id": company_id,
+        },
     )
 
     results = reminder_service.dispatch_due_reminders(dispatch_immediately=True, audience="customer")
 
     assert results[0]["channel"] == "whatsapp"
-    assert dispatched == [{"outbound_message_id": 44, "channel": "whatsapp"}]
+    assert dispatched == [
+        {
+            "outbound_message_id": 44,
+            "channel": "whatsapp",
+            "company_id": 1,
+        }
+    ]

@@ -33,13 +33,21 @@ services:
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-production}
       DEBUG: ${DEBUG:-false}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
-      POSTGRES_DATABASE_URL: ${POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
+      OPERATIONS_BACKUP_DIR: ${OPERATIONS_BACKUP_DIR:-/app/backups}
       LOG_JSON: ${LOG_JSON:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       STRICT_RUNTIME_VALIDATION: ${STRICT_RUNTIME_VALIDATION:-true}
+      ENABLE_RATE_LIMITING: ${ENABLE_RATE_LIMITING:-true}
+      RATE_LIMIT_WINDOW_SECONDS: ${RATE_LIMIT_WINDOW_SECONDS:-60}
+      RATE_LIMIT_AUTH_REQUESTS: ${RATE_LIMIT_AUTH_REQUESTS:-10}
+      RATE_LIMIT_ADMIN_REQUESTS: ${RATE_LIMIT_ADMIN_REQUESTS:-180}
+      RATE_LIMIT_INCOMING_REQUESTS: ${RATE_LIMIT_INCOMING_REQUESTS:-120}
+      RATE_LIMIT_WEBHOOK_REQUESTS: ${RATE_LIMIT_WEBHOOK_REQUESTS:-300}
+      RATE_LIMIT_EXEMPT_LOCALHOST: ${RATE_LIMIT_EXEMPT_LOCALHOST:-false}
       ENABLE_ADMIN_AUTH: ${ENABLE_ADMIN_AUTH:-true}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
       ADMIN_VIEWER_TOKEN: ${ADMIN_VIEWER_TOKEN:-}
@@ -83,6 +91,8 @@ services:
       WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
       WHATSAPP_WEBHOOK_VERIFY_TOKEN: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN:-}
       WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
+    volumes:
+      - backups_data:/app/backups
     ports:
       - "${APP_PORT:-8000}:8000"
     healthcheck:
@@ -111,8 +121,9 @@ services:
       ENVIRONMENT: ${ENVIRONMENT:-production}
       DEBUG: ${DEBUG:-false}
       STRICT_RUNTIME_VALIDATION: ${STRICT_RUNTIME_VALIDATION:-true}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
-      POSTGRES_DATABASE_URL: ${POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      OPERATIONS_BACKUP_DIR: ${OPERATIONS_BACKUP_DIR:-/app/backups}
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
       LOG_JSON: ${LOG_JSON:-true}
@@ -140,6 +151,8 @@ services:
       APPOINTMENT_QUEUE_AUTO_DISPATCH: ${APPOINTMENT_QUEUE_AUTO_DISPATCH:-true}
       APPOINTMENT_QUEUE_RESPONSE_WINDOW_MINUTES: ${APPOINTMENT_QUEUE_RESPONSE_WINDOW_MINUTES:-30}
       APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES: ${APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES:-30}
+    volumes:
+      - backups_data:/app/backups
     healthcheck:
       test: ["CMD", "python", "-m", "app.tools.reminder_worker", "--validate-only"]
       interval: 30s
@@ -175,3 +188,4 @@ services:
 
 volumes:
   postgres_data:
+  backups_data:

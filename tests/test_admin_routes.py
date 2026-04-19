@@ -77,10 +77,18 @@ def test_read_observability_metrics(monkeypatch) -> None:
 
 def test_read_audit_events(monkeypatch) -> None:
     class FakeRepository:
-        def get_audit_events(self, limit: int, action: str | None, resource_type: str | None) -> list[dict]:
+        def get_audit_events(
+            self,
+            limit: int,
+            action: str | None,
+            resource_type: str | None,
+            *,
+            company_id: int | None = None,
+        ) -> list[dict]:
             assert limit == 50
             assert action == "create"
             assert resource_type == "company"
+            assert company_id is None
             return [
                 {
                     "id": 1,
@@ -186,6 +194,84 @@ def test_read_system_readiness(monkeypatch) -> None:
     assert payload["pilot_ready"] is True
     assert payload["scale_ready"] is False
     assert payload["checks"][0]["code"] == "postgres_target"
+
+
+def test_create_finetuning_job_requires_resolved_company(monkeypatch) -> None:
+    class FakeRepository:
+        def resolve_company_id(self, company_id=None, company_slug=None):
+            return None
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+
+    response = client.post("/admin/finetuning/jobs")
+
+    assert response.status_code == 400
+    assert "company_id or company_slug" in response.json()["detail"]
+
+
+def test_create_finetuning_job_passes_resolved_company_scope(monkeypatch) -> None:
+    captured_audit_events: list[dict] = []
+
+    class FakeRepository:
+        def resolve_company_id(self, company_id=None, company_slug=None):
+            assert company_slug == "empresa-a"
+            return 5
+
+        def create_audit_event(self, **kwargs) -> int:
+            captured_audit_events.append(kwargs)
+            return 1
+
+    class FakeFineTuningService:
+        def create_finetuning_job(self, *, company_id: int | None):
+            assert company_id == 5
+            return {
+                "job_id": "ftjob-empresa-a",
+                "status": "validating_files",
+                "base_model": "gpt-4o-mini-2024-07-18",
+            }
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(admin_routes, "_get_finetuning_service", lambda: FakeFineTuningService())
+
+    response = client.post("/admin/finetuning/jobs", params={"company_slug": "empresa-a"})
+
+    assert response.status_code == 200
+    assert response.json()["job_id"] == "ftjob-empresa-a"
+    assert captured_audit_events[0]["admin_role"] == "superadmin"
+    assert captured_audit_events[0]["auth_mode"] == "disabled"
+    assert captured_audit_events[0]["http_method"] == "POST"
+    assert captured_audit_events[0]["http_path"] == "/admin/finetuning/jobs"
+    assert captured_audit_events[0]["client_ip"] == "testclient"
+
+
+def test_list_finetuning_jobs_uses_company_scope(monkeypatch) -> None:
+    class FakeRepository:
+        def resolve_company_id(self, company_id=None, company_slug=None):
+            assert company_id == 8
+            return 8
+
+    class FakeFineTuningService:
+        def list_finetuning_jobs(self, limit: int = 10, *, company_id: int | None = None):
+            assert limit == 20
+            assert company_id == 8
+            return [
+                {
+                    "job_id": "ftjob-empresa-8",
+                    "status": "succeeded",
+                    "base_model": "gpt-4o-mini-2024-07-18",
+                    "fine_tuned_model": "ft:gpt-4o-mini:empresa-8",
+                    "created_at": 1773709705,
+                    "finished_at": 1773709805,
+                }
+            ]
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(admin_routes, "_get_finetuning_service", lambda: FakeFineTuningService())
+
+    response = client.get("/admin/finetuning/jobs", params={"company_id": 8, "limit": 20})
+
+    assert response.status_code == 200
+    assert response.json()[0]["job_id"] == "ftjob-empresa-8"
 
 
 def test_read_system_onboarding(monkeypatch) -> None:
@@ -377,7 +463,13 @@ def test_create_calendar_booking_endpoint_requests_bot_confirmation(monkeypatch)
     monkeypatch.setattr(
         admin_routes,
         "dispatch_outbound_message",
-        lambda outbound_message_id: dispatch_calls.append(outbound_message_id) or {"status": "sent"},
+        lambda outbound_message_id, channel=None, company_id=None: dispatch_calls.append(
+            {
+                "outbound_message_id": outbound_message_id,
+                "channel": channel,
+                "company_id": company_id,
+            }
+        ) or {"status": "sent"},
     )
 
     response = client.post(
@@ -401,7 +493,13 @@ def test_create_calendar_booking_endpoint_requests_bot_confirmation(monkeypatch)
     assert outbound_calls[0]["contact_id"] == "contato-55"
     assert outbound_calls[0]["source"] == "manual_booking_confirmation"
     assert "Sessão premium" in outbound_calls[0]["message"]
-    assert dispatch_calls == [777]
+    assert dispatch_calls == [
+        {
+            "outbound_message_id": 777,
+            "channel": None,
+            "company_id": 1,
+        }
+    ]
 
 
 def test_create_appointment_queue_entry_endpoint(monkeypatch) -> None:
@@ -439,6 +537,44 @@ def test_create_appointment_queue_entry_endpoint(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["id"] == 30
     assert response.json()["priority_tier"] == "high"
+
+
+def test_dispatch_single_outbound_message_endpoint_passes_company_scope(monkeypatch) -> None:
+    captured_dispatch_calls: list[dict] = []
+
+    class FakeRepository:
+        def create_audit_event(self, **kwargs) -> int:
+            return 1
+
+    monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    monkeypatch.setattr(
+        admin_routes,
+        "dispatch_outbound_message",
+        lambda outbound_message_id, channel=None, company_id=None: captured_dispatch_calls.append(
+            {
+                "outbound_message_id": outbound_message_id,
+                "channel": channel,
+                "company_id": company_id,
+            }
+        ) or {
+            "outbound_message_id": outbound_message_id,
+            "delivery_status": "sent",
+        },
+    )
+
+    response = client.post(
+        "/admin/outbound-messages/99/dispatch",
+        params={"company_id": 12, "channel": "whatsapp"},
+    )
+
+    assert response.status_code == 200
+    assert captured_dispatch_calls == [
+        {
+            "outbound_message_id": 99,
+            "channel": "whatsapp",
+            "company_id": 12,
+        }
+    ]
 
 
 def test_cancel_calendar_booking_endpoint_triggers_queue_recovery(monkeypatch) -> None:
@@ -787,8 +923,10 @@ def test_update_contact_endpoint(monkeypatch) -> None:
                 "notes": None,
             }
 
-        def get_contact(self, contact_id: str):
+        def get_contact(self, contact_id: str, *, company_id: int | None = None):
             if contact_id == self.contact["contact_id"]:
+                if company_id is not None and self.contact.get("company_id") != company_id:
+                    return None
                 return dict(self.contact)
             return None
 

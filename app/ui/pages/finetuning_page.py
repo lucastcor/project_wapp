@@ -45,7 +45,7 @@ def render_finetuning_page(page_context: dict[str, Any]) -> None:
         st.subheader("Jobs de fine-tuning")
         if st.button("Atualizar lista de jobs", use_container_width=True):
             try:
-                jobs = client.get_finetuning_jobs(limit=20)
+                jobs = client.get_finetuning_jobs(limit=20, company_id=selected_company_id)
                 st.session_state["finetuning_jobs_payload"] = jobs
             except AdminApiClientError as exc:
                 st.error(str(exc))
@@ -73,8 +73,11 @@ def render_finetuning_page(page_context: dict[str, Any]) -> None:
 
     with col_create_job:
         if st.button("Criar novo job", use_container_width=True):
+            if selected_company_id is None:
+                st.error("Selecione uma empresa para criar o job de fine-tuning.")
+                return
             try:
-                result = client.create_finetuning_job()
+                result = client.create_finetuning_job(company_id=selected_company_id)
                 st.success(f"Job criado com sucesso: {result.get('job_id')}")
                 st.json(result)
             except AdminApiClientError as exc:

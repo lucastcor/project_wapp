@@ -1,8 +1,9 @@
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from app.core.company_context import get_company_context_status
-from app.core.config import settings
+from app.core.config import is_missing_or_placeholder, settings
 from app.services.calendar_service import get_calendar_profile
 from app.services.training_export_service import get_finetuning_readiness_report
 from app.storage.db import (
@@ -57,6 +58,56 @@ def _required_admin_roles_configured() -> bool:
     return required_roles.issubset(set(_configured_admin_roles()))
 
 
+def _has_real_secret(value: str | None) -> bool:
+    return not is_missing_or_placeholder(value)
+
+
+def _configured_admin_tokens_are_real() -> bool:
+    configured_values = [
+        settings.admin_viewer_token,
+        settings.admin_operator_token,
+        settings.admin_superadmin_token or settings.admin_api_token,
+    ]
+    return all(_has_real_secret(value) for value in configured_values if value is not None)
+
+
+def _whatsapp_provider_credentials_are_real() -> bool:
+    return all(
+        _has_real_secret(value)
+        for value in [
+            settings.whatsapp_api_base_url,
+            settings.whatsapp_api_token,
+            settings.whatsapp_phone_number_id,
+        ]
+    )
+
+
+def _configured_postgres_urls() -> list[str]:
+    urls: list[str] = []
+    for configured_url in [settings.database_url, settings.postgres_database_url]:
+        normalized = str(configured_url or "").strip()
+        if not normalized:
+            continue
+        if urlparse(normalized).scheme not in {"postgres", "postgresql"}:
+            continue
+        if normalized not in urls:
+            urls.append(normalized)
+    return urls
+
+
+def _postgres_credentials_are_real() -> bool:
+    configured_urls = _configured_postgres_urls()
+    if not configured_urls:
+        return False
+    for configured_url in configured_urls:
+        parsed = urlparse(configured_url)
+        if not str(parsed.username or "").strip():
+            return False
+        if is_missing_or_placeholder(parsed.password):
+            return False
+    return True
+
+
 def _configured_reminder_worker_audiences() -> list[str]:
     values = [
         item.strip().lower()
@@ -97,10 +148,12 @@ def get_system_profile() -> dict[str, Any]:
             "legacy_superadmin_fallback_enabled": bool(
                 settings.admin_api_token and not settings.admin_superadmin_token
             ),
+            "rate_limiting_enabled": settings.enable_rate_limiting,
+            "rate_limit_window_seconds": settings.rate_limit_window_seconds,
             "audit_retention_days": settings.audit_retention_days,
         },
         "ai": {
-            "openai_configured": bool(settings.openai_api_key),
+            "openai_configured": _has_real_secret(settings.openai_api_key),
             "classification_provider": settings.classification_provider,
             "openai_model": settings.openai_model,
             "finetuned_model_configured": bool(settings.openai_finetuned_model),
@@ -111,15 +164,9 @@ def get_system_profile() -> dict[str, Any]:
         "channels": {
             "outbound_provider": settings.outbound_provider,
             "default_channel": settings.outbound_default_channel,
-            "whatsapp_configured": all(
-                [
-                    settings.whatsapp_api_base_url,
-                    settings.whatsapp_api_token,
-                    settings.whatsapp_phone_number_id,
-                ]
-            ),
-            "whatsapp_webhook_verification_configured": bool(settings.whatsapp_webhook_verify_token),
-            "whatsapp_signature_validation_configured": bool(settings.whatsapp_app_secret),
+            "whatsapp_configured": _whatsapp_provider_credentials_are_real(),
+            "whatsapp_webhook_verification_configured": _has_real_secret(settings.whatsapp_webhook_verify_token),
+            "whatsapp_signature_validation_configured": _has_real_secret(settings.whatsapp_app_secret),
             "calendar_provider": settings.calendar_provider,
             "calendar_timezone": settings.calendar_timezone,
             "calendar_ready": calendar_profile["provider_readiness"]["ready"],
@@ -139,6 +186,10 @@ def get_system_profile() -> dict[str, Any]:
             "appointment_queue_response_window_minutes": settings.appointment_queue_response_window_minutes,
             "appointment_queue_wait_followup_minutes": settings.appointment_queue_wait_followup_minutes,
         },
+        "operations": {
+            "backup_dir": settings.operations_backup_dir,
+            "data_hygiene": repository.get_operational_hygiene_summary(),
+        },
     }
 
 
@@ -151,6 +202,7 @@ def get_system_readiness() -> dict[str, Any]:
     global_context = get_company_context_status()
     configured_roles = _configured_admin_roles()
     calendar_profile = get_calendar_profile()
+    hygiene_summary = repository.get_operational_hygiene_summary()
     production_guard_enabled = _production_guard_enabled()
 
     checks: list[dict[str, str | None]] = []
@@ -221,6 +273,42 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
+    session_secret_status = "pass" if _has_real_secret(settings.platform_session_secret) else ("fail" if production_guard_enabled else "warn")
+    checks.append(
+        _make_check(
+            code="platform_session_secret",
+            title="Segredo da sessão web",
+            status=session_secret_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "PLATFORM_SESSION_SECRET configurado com valor não-placeholder."
+                if _has_real_secret(settings.platform_session_secret)
+                else "PLATFORM_SESSION_SECRET ausente ou usando valor placeholder."
+            ),
+            recommendation="Definir PLATFORM_SESSION_SECRET forte e exclusivo para assinar a sessão da plataforma."
+            if not _has_real_secret(settings.platform_session_secret)
+            else None,
+        )
+    )
+
+    admin_token_quality_status = "pass" if _configured_admin_tokens_are_real() else ("fail" if production_guard_enabled else "warn")
+    checks.append(
+        _make_check(
+            code="admin_token_quality",
+            title="Qualidade dos segredos admin",
+            status=admin_token_quality_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Todos os tokens admin configurados usam valores reais."
+                if _configured_admin_tokens_are_real()
+                else "Há token admin ausente ou com valor placeholder."
+            ),
+            recommendation="Substituir todos os tokens admin placeholder antes de operar em produção."
+            if not _configured_admin_tokens_are_real()
+            else None,
+        )
+    )
+
     logging_status = "pass" if settings.log_json else "warn"
     checks.append(
         _make_check(
@@ -236,24 +324,58 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+    rate_limit_status = "pass" if settings.enable_rate_limiting else ("fail" if production_guard_enabled else "warn")
+    checks.append(
+        _make_check(
+            code="rate_limiting",
+            title="Proteção de rate limiting",
+            status=rate_limit_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                f"Rate limiting habilitado com janela de {settings.rate_limit_window_seconds}s."
+                if settings.enable_rate_limiting
+                else "Rate limiting desabilitado."
+            ),
+            recommendation="Ativar ENABLE_RATE_LIMITING e ajustar limites por superfície HTTP antes de expor a API publicamente."
+            if not settings.enable_rate_limiting
+            else None,
+        )
+    )
+    postgres_credentials_status = "pass" if _postgres_credentials_are_real() else ("fail" if production_guard_enabled else "warn")
+    checks.append(
+        _make_check(
+            code="postgres_credentials",
+            title="Segredo do Postgres",
+            status=postgres_credentials_status,
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Credenciais do Postgres configuradas com valores não-placeholder."
+                if _postgres_credentials_are_real()
+                else "DATABASE_URL/POSTGRES_DATABASE_URL usam senha ausente ou placeholder."
+            ),
+            recommendation="Substituir a senha do Postgres por valor forte e sincronizar DATABASE_URL, POSTGRES_DATABASE_URL e POSTGRES_PASSWORD."
+            if not _postgres_credentials_are_real()
+            else None,
+        )
+    )
 
     openai_required = (
         production_guard_enabled
         or settings.classification_provider == "openai"
         or settings.enable_finetuning_pipeline
     )
-    openai_status = "pass" if settings.openai_api_key else ("fail" if openai_required else "warn")
+    openai_status = "pass" if _has_real_secret(settings.openai_api_key) else ("fail" if openai_required else "warn")
     checks.append(
         _make_check(
             code="openai_configuration",
             title="Configuração OpenAI",
             status=openai_status,
             severity="blocker" if openai_required else "warning",
-            detail="OPENAI_API_KEY configurada."
-            if settings.openai_api_key
-            else "OPENAI_API_KEY ausente.",
+            detail="OPENAI_API_KEY configurada com valor não-placeholder."
+            if _has_real_secret(settings.openai_api_key)
+            else "OPENAI_API_KEY ausente ou usando valor placeholder.",
             recommendation="Definir OPENAI_API_KEY para usar classificação, reescrita e fine-tuning com provider real."
-            if not settings.openai_api_key
+            if not _has_real_secret(settings.openai_api_key)
             else None,
         )
     )
@@ -278,13 +400,7 @@ def get_system_readiness() -> dict[str, Any]:
     )
 
     whatsapp_required = settings.outbound_provider == "whatsapp" or production_guard_enabled
-    whatsapp_configured = all(
-        [
-            settings.whatsapp_api_base_url,
-            settings.whatsapp_api_token,
-            settings.whatsapp_phone_number_id,
-        ]
-    )
+    whatsapp_configured = _whatsapp_provider_credentials_are_real()
     whatsapp_status = "pass" if whatsapp_configured else ("fail" if whatsapp_required else "warn")
     checks.append(
         _make_check(
@@ -302,7 +418,7 @@ def get_system_readiness() -> dict[str, Any]:
     )
     whatsapp_webhook_verify_status = (
         "pass"
-        if settings.whatsapp_webhook_verify_token
+        if _has_real_secret(settings.whatsapp_webhook_verify_token)
         else ("fail" if production_guard_enabled else "warn")
     )
     checks.append(
@@ -313,17 +429,17 @@ def get_system_readiness() -> dict[str, Any]:
             severity="blocker" if production_guard_enabled else "warning",
             detail=(
                 "Token de verificação do webhook configurado."
-                if settings.whatsapp_webhook_verify_token
-                else "WHATSAPP_WEBHOOK_VERIFY_TOKEN ausente."
+                if _has_real_secret(settings.whatsapp_webhook_verify_token)
+                else "WHATSAPP_WEBHOOK_VERIFY_TOKEN ausente ou usando valor placeholder."
             ),
             recommendation="Definir WHATSAPP_WEBHOOK_VERIFY_TOKEN para concluir o handshake do provedor real."
-            if not settings.whatsapp_webhook_verify_token
+            if not _has_real_secret(settings.whatsapp_webhook_verify_token)
             else None,
         )
     )
     whatsapp_signature_status = (
         "pass"
-        if settings.whatsapp_app_secret
+        if _has_real_secret(settings.whatsapp_app_secret)
         else ("fail" if production_guard_enabled else "warn")
     )
     checks.append(
@@ -334,23 +450,25 @@ def get_system_readiness() -> dict[str, Any]:
             severity="blocker" if production_guard_enabled else "warning",
             detail=(
                 "App secret configurado para validar assinatura do webhook."
-                if settings.whatsapp_app_secret
-                else "WHATSAPP_APP_SECRET ausente."
+                if _has_real_secret(settings.whatsapp_app_secret)
+                else "WHATSAPP_APP_SECRET ausente ou usando valor placeholder."
             ),
             recommendation="Definir WHATSAPP_APP_SECRET para validar a origem do POST do Meta."
-            if not settings.whatsapp_app_secret
+            if not _has_real_secret(settings.whatsapp_app_secret)
             else None,
         )
     )
+    calendar_required = production_guard_enabled and settings.calendar_provider.strip().lower() != "mock"
+    calendar_ready = bool(calendar_profile["provider_readiness"]["ready"])
     checks.append(
         _make_check(
             code="calendar_provider",
             title="Canal de agenda",
-            status="pass" if calendar_profile["provider_readiness"]["ready"] else "warn",
-            severity="warning",
+            status="pass" if calendar_ready else ("fail" if calendar_required else "warn"),
+            severity="blocker" if calendar_required else "warning",
             detail=str(calendar_profile["provider_readiness"]["details"]),
             recommendation="Configurar integração Google Calendar ou CalDAV para agenda ao vivo."
-            if not calendar_profile["provider_readiness"]["ready"]
+            if not calendar_ready
             else None,
         )
     )
@@ -409,6 +527,29 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+    hygiene_counts = hygiene_summary["counts"]
+    hygiene_issue_count = sum(int(value) for value in hygiene_counts.values())
+    checks.append(
+        _make_check(
+            code="operational_hygiene",
+            title="Higiene operacional",
+            status="pass" if hygiene_issue_count == 0 else "warn",
+            severity="warning",
+            detail=(
+                "Base operacional sem placeholders ativos nem backlog obsoleto."
+                if hygiene_issue_count == 0
+                else (
+                    f"Encontrados {hygiene_counts['active_placeholder_companies']} placeholder(s) ativos, "
+                    f"{hygiene_counts['stale_pending_questions']} pending question(s) antigas, "
+                    f"{hygiene_counts['stale_outbound_messages']} outbound(s) pendentes antigas e "
+                    f"{hygiene_counts['stale_failed_finetuning_jobs']} job(s) de fine-tuning falhados antigos."
+                )
+            ),
+            recommendation="Executar limpeza operacional segura com backup previo antes do go-live."
+            if hygiene_issue_count > 0
+            else None,
+        )
+    )
 
     has_blockers = any(check["status"] == "fail" and check["severity"] == "blocker" for check in checks)
     has_warnings = any(check["status"] == "warn" for check in checks)
@@ -451,7 +592,7 @@ def get_onboarding_status(
     operational_snapshot = repository.get_operational_snapshot(company_id=resolved_company_id)
     finetuning_readiness = get_finetuning_readiness_report(company_id=resolved_company_id)
 
-    checklist: list[dict[str, str | int | bool | None]] = []
+    checklist: list[dict[str, Any]] = []
 
     if resolved_company:
         checklist.append(

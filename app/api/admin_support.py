@@ -50,13 +50,20 @@ def record_audit_event(
 ) -> None:
     actor_id = getattr(request.state, "admin_actor", "admin")
     request_id = get_request_context().get("request_id")
+    user_agent = str(request.headers.get("User-Agent") or "").strip() or None
     repository_getter().create_audit_event(
         actor_id=actor_id,
+        admin_role=getattr(request.state, "admin_role", None),
+        auth_mode=getattr(request.state, "admin_auth_mode", None),
         action=action,
         resource_type=resource_type,
         resource_id=resource_id,
         company_id=company_id,
         status=status,
         request_id=str(request_id) if request_id else None,
+        http_method=request.method,
+        http_path=request.url.path,
+        client_ip=str(get_request_context().get("client_ip") or "") or None,
+        user_agent=user_agent,
         metadata=metadata or {},
     )

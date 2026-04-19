@@ -489,11 +489,18 @@ class AdminApiClient:
             params["audience"] = audience
         return self._request("POST", "/admin/reminders/dispatch-due", params=params)
 
-    def get_finetuning_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
-        return self._request("GET", "/admin/finetuning/jobs", params={"limit": limit})
+    def get_finetuning_jobs(
+        self,
+        limit: int = 10,
+        company_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {"limit": limit}
+        if company_id is not None:
+            params["company_id"] = company_id
+        return self._request("GET", "/admin/finetuning/jobs", params=params)
 
-    def create_finetuning_job(self) -> dict[str, Any]:
-        return self._request("POST", "/admin/finetuning/jobs")
+    def create_finetuning_job(self, company_id: int) -> dict[str, Any]:
+        return self._request("POST", "/admin/finetuning/jobs", params={"company_id": company_id})
 
     def get_finetuning_train_jsonl(
         self,

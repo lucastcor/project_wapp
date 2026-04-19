@@ -389,7 +389,11 @@ def _interpret_queue_membership_reply(
     return _fallback_interpret_queue_membership_reply(message)
 
 
-def _dispatch_queue_outbound_message(outbound_message_id: int) -> dict[str, Any] | None:
+def _dispatch_queue_outbound_message(
+    outbound_message_id: int,
+    *,
+    company_id: int | None = None,
+) -> dict[str, Any] | None:
     if not settings.appointment_queue_auto_dispatch:
         return None
 
@@ -397,6 +401,7 @@ def _dispatch_queue_outbound_message(outbound_message_id: int) -> dict[str, Any]
         return dispatch_outbound_message(
             outbound_message_id=outbound_message_id,
             channel=settings.reminder_worker_channel or settings.outbound_default_channel,
+            company_id=company_id,
         )
     except OutboundDispatchError as exc:
         log_event(
@@ -424,7 +429,10 @@ def _create_and_dispatch_outbound(
         source=source,
         status="pending",
     )
-    dispatch_result = _dispatch_queue_outbound_message(outbound_message_id)
+    dispatch_result = _dispatch_queue_outbound_message(
+        outbound_message_id,
+        company_id=company_id,
+    )
     return outbound_message_id, dispatch_result
 
 
@@ -504,7 +512,10 @@ def create_queue_entry(
     resolved_company_id = company_id
     resolved_timezone = (timezone or "").strip() or None
     if original_booking_id is not None:
-        original_booking = repository.get_appointment_booking(original_booking_id)
+        original_booking = repository.get_appointment_booking(
+            original_booking_id,
+            company_id=company_id,
+        )
         if not original_booking:
             raise AppointmentQueueError("original_booking_id must reference an existing booking.")
         if resolved_company_id is None:
@@ -547,7 +558,7 @@ def create_queue_entry(
         source=(source or "manual").strip() or "manual",
         notes=(notes or "").strip() or None,
     )
-    entry = repository.get_appointment_queue_entry(entry_id)
+    entry = repository.get_appointment_queue_entry(entry_id, company_id=resolved_company_id)
     if not entry:
         raise AppointmentQueueError("Queue entry not found after creation.")
     return entry
@@ -581,15 +592,15 @@ def offer_released_booking_slot(
     *,
     released_booking_id: int,
     response_window_minutes: int = DEFAULT_RESPONSE_WINDOW_MINUTES,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
-    booking = repository.get_appointment_booking(released_booking_id)
+    booking = repository.get_appointment_booking(released_booking_id, company_id=company_id)
     if not booking:
         raise AppointmentQueueError("Released booking not found.")
 
     company_id = booking.get("company_id")
     timezone_name = str(booking.get("timezone") or "UTC")
     slot_start = _parse_iso_datetime(str(booking["starts_at"]), timezone_name)
-    slot_end = _parse_iso_datetime(str(booking["ends_at"]), timezone_name)
 
     existing_offers = repository.get_appointment_queue_offers(
         company_id=company_id,
@@ -642,8 +653,9 @@ def offer_released_booking_slot(
     repository.update_appointment_queue_entry_status(
         int(selected_entry["id"]),
         status="contacted",
+        company_id=company_id,
     )
-    created_offer = repository.get_appointment_queue_offer(offer_id)
+    created_offer = repository.get_appointment_queue_offer(offer_id, company_id=company_id)
     if not created_offer:
         raise AppointmentQueueError("Queue offer not found after creation.")
 
@@ -658,15 +670,16 @@ def offer_released_booking_slot(
 def release_booking_slot(
     *,
     booking_id: int,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
     from app.services.calendar_service import CalendarProviderError, cancel_calendar_booking
 
     try:
-        cancellation_result = cancel_calendar_booking(booking_id=booking_id)
+        cancellation_result = cancel_calendar_booking(booking_id=booking_id, company_id=company_id)
     except CalendarProviderError as exc:
         raise AppointmentQueueError(str(exc)) from exc
 
-    next_offer = offer_released_booking_slot(released_booking_id=booking_id)
+    next_offer = offer_released_booking_slot(released_booking_id=booking_id, company_id=company_id)
 
     return {
         "booking": cancellation_result["booking"],
@@ -684,6 +697,7 @@ def respond_to_queue_offer(
     response_notes: str | None = None,
     queue_membership_after_decline: str = "ask",
     send_customer_followup: bool = True,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
     normalized_response = response_status.strip().lower()
     if normalized_response not in {"accepted", "declined", "waiting"}:
@@ -693,13 +707,17 @@ def respond_to_queue_offer(
     if normalized_queue_membership not in {"ask", "keep", "remove"}:
         raise AppointmentQueueError("queue_membership_after_decline must be ask, keep or remove.")
 
-    offer = repository.get_appointment_queue_offer(offer_id)
+    offer = repository.get_appointment_queue_offer(offer_id, company_id=company_id)
     if not offer:
         raise AppointmentQueueError("Queue offer not found.")
     if str(offer.get("status") or "") not in {"pending", "waiting"}:
         raise AppointmentQueueError("Only pending or waiting offers can be updated.")
 
-    entry = repository.get_appointment_queue_entry(int(offer["queue_entry_id"]))
+    offer_company_id = offer.get("company_id")
+    entry = repository.get_appointment_queue_entry(
+        int(offer["queue_entry_id"]),
+        company_id=offer_company_id,
+    )
     if not entry:
         raise AppointmentQueueError("Queue entry not found for offer.")
 
@@ -715,6 +733,7 @@ def respond_to_queue_offer(
             follow_up_after=follow_up_after,
             responded_at=responded_at,
             response_notes=(response_notes or "").strip() or None,
+            company_id=offer_company_id,
         )
         dispatch_result = None
         if send_customer_followup:
@@ -725,8 +744,8 @@ def respond_to_queue_offer(
                 source="appointment_queue_waiting_ack",
             )
         return {
-            "offer": repository.get_appointment_queue_offer(offer_id),
-            "entry": repository.get_appointment_queue_entry(int(entry["id"])),
+            "offer": repository.get_appointment_queue_offer(offer_id, company_id=offer_company_id),
+            "entry": repository.get_appointment_queue_entry(int(entry["id"]), company_id=offer_company_id),
             "next_offer": None,
             "dispatch_result": dispatch_result,
         }
@@ -739,24 +758,28 @@ def respond_to_queue_offer(
             follow_up_after=None,
             responded_at=responded_at,
             response_notes=(response_notes or "").strip() or None,
+            company_id=offer_company_id,
         )
         if normalized_queue_membership == "keep":
             repository.update_appointment_queue_entry_status(
                 int(entry["id"]),
                 status="active",
                 notes="Customer declined the current slot but chose to remain in the appointment queue.",
+                company_id=offer_company_id,
             )
         elif normalized_queue_membership == "remove":
             repository.update_appointment_queue_entry_status(
                 int(entry["id"]),
                 status="removed",
                 notes="Customer declined the current slot and chose to leave the appointment queue.",
+                company_id=offer_company_id,
             )
         else:
             repository.update_appointment_queue_entry_status(
                 int(entry["id"]),
                 status="awaiting_confirmation",
                 notes="Awaiting keep-waiting confirmation after declined slot offer.",
+                company_id=offer_company_id,
             )
         continuation_dispatch_result = None
         if send_customer_followup and normalized_queue_membership == "ask":
@@ -768,10 +791,13 @@ def respond_to_queue_offer(
                 ),
                 source="appointment_queue_keep_waiting",
             )
-        next_offer = offer_released_booking_slot(released_booking_id=int(offer["released_booking_id"]))
+        next_offer = offer_released_booking_slot(
+            released_booking_id=int(offer["released_booking_id"]),
+            company_id=offer_company_id,
+        )
         return {
-            "offer": repository.get_appointment_queue_offer(offer_id),
-            "entry": repository.get_appointment_queue_entry(int(entry["id"])),
+            "offer": repository.get_appointment_queue_offer(offer_id, company_id=offer_company_id),
+            "entry": repository.get_appointment_queue_entry(int(entry["id"]), company_id=offer_company_id),
             "next_offer": next_offer.get("created_offer"),
             "dispatch_result": continuation_dispatch_result,
         }
@@ -793,6 +819,7 @@ def respond_to_queue_offer(
             scheduling_profile_key=str(entry.get("scheduling_profile_key") or "").strip() or None,
             customer_profile=str(entry.get("customer_profile")) if entry.get("customer_profile") is not None else None,
             request_context=request_summary,
+            company_id=offer_company_id,
         )
     else:
         booking = create_calendar_booking(
@@ -816,11 +843,16 @@ def respond_to_queue_offer(
         follow_up_after=None,
         responded_at=responded_at,
         response_notes=(response_notes or "").strip() or None,
+        company_id=offer_company_id,
     )
-    repository.update_appointment_queue_entry_status(int(entry["id"]), status="converted")
+    repository.update_appointment_queue_entry_status(
+        int(entry["id"]),
+        status="converted",
+        company_id=offer_company_id,
+    )
     return {
-        "offer": repository.get_appointment_queue_offer(offer_id),
-        "entry": repository.get_appointment_queue_entry(int(entry["id"])),
+        "offer": repository.get_appointment_queue_offer(offer_id, company_id=offer_company_id),
+        "entry": repository.get_appointment_queue_entry(int(entry["id"]), company_id=offer_company_id),
         "new_booking": booking,
         "rescheduled_booking_id": rescheduled_booking_id,
         "next_offer": None,
@@ -848,7 +880,11 @@ def process_due_queue_offers() -> list[dict[str, Any]]:
     ]
 
     for offer in due_waiting_offers:
-        entry = repository.get_appointment_queue_entry(int(offer["queue_entry_id"]))
+        offer_company_id = offer.get("company_id")
+        entry = repository.get_appointment_queue_entry(
+            int(offer["queue_entry_id"]),
+            company_id=offer_company_id,
+        )
         if not entry:
             continue
         follow_up_message = _build_waiting_followup_message(
@@ -873,6 +909,7 @@ def process_due_queue_offers() -> list[dict[str, Any]]:
             follow_up_after=None,
             responded_at=None,
             response_notes="Automatic follow-up sent after waiting window.",
+            company_id=offer_company_id,
         )
         processed.append(
             {
@@ -884,6 +921,7 @@ def process_due_queue_offers() -> list[dict[str, Any]]:
         )
 
     for offer in due_expired_offers:
+        offer_company_id = offer.get("company_id")
         repository.update_appointment_queue_offer(
             int(offer["id"]),
             status="expired",
@@ -891,15 +929,23 @@ def process_due_queue_offers() -> list[dict[str, Any]]:
             follow_up_after=None,
             responded_at=_to_utc_iso(reference_time),
             response_notes="Offer expired without customer confirmation.",
+            company_id=offer_company_id,
         )
-        entry = repository.get_appointment_queue_entry(int(offer["queue_entry_id"]))
+        entry = repository.get_appointment_queue_entry(
+            int(offer["queue_entry_id"]),
+            company_id=offer_company_id,
+        )
         if entry and str(entry.get("status") or "") == "contacted":
             repository.update_appointment_queue_entry_status(
                 int(entry["id"]),
                 status="active",
                 notes="Reactivated after queue offer expiration.",
+                company_id=offer_company_id,
             )
-        next_offer = offer_released_booking_slot(released_booking_id=int(offer["released_booking_id"]))
+        next_offer = offer_released_booking_slot(
+            released_booking_id=int(offer["released_booking_id"]),
+            company_id=offer_company_id,
+        )
         processed.append(
             {
                 "offer_id": offer["id"],
@@ -919,7 +965,11 @@ def process_queue_contact_message(
 ) -> dict[str, Any] | None:
     pending_offer = _find_offer_for_contact(contact_id=contact_id, company_id=company_id)
     if pending_offer:
-        entry = repository.get_appointment_queue_entry(int(pending_offer["queue_entry_id"]))
+        pending_offer_company_id = pending_offer.get("company_id")
+        entry = repository.get_appointment_queue_entry(
+            int(pending_offer["queue_entry_id"]),
+            company_id=pending_offer_company_id,
+        )
         if not entry:
             raise AppointmentQueueError("Queue entry not found for pending offer.")
 
@@ -936,6 +986,7 @@ def process_queue_contact_message(
                 response_status="accepted",
                 response_notes=str(interpretation.get("reason") or "").strip() or None,
                 send_customer_followup=False,
+                company_id=pending_offer_company_id,
             )
             new_booking = result.get("new_booking") or {}
             booking_time = ""
@@ -965,6 +1016,7 @@ def process_queue_contact_message(
                 response_notes=str(interpretation.get("reason") or "").strip()
                 or "Customer asked for time to check availability.",
                 send_customer_followup=False,
+                company_id=pending_offer_company_id,
             )
             return {
                 "reply": _build_waiting_ack_message(wait_minutes=wait_minutes),
@@ -980,6 +1032,7 @@ def process_queue_contact_message(
                 response_notes=str(interpretation.get("reason") or "").strip()
                 or "Customer declined the released slot.",
                 send_customer_followup=False,
+                company_id=pending_offer_company_id,
             )
             return {
                 "reply": _build_keep_waiting_message(
@@ -998,6 +1051,7 @@ def process_queue_contact_message(
                 response_notes=str(interpretation.get("reason") or "").strip()
                 or "Customer declined the released slot but chose to remain in the queue.",
                 send_customer_followup=False,
+                company_id=pending_offer_company_id,
             )
             return {
                 "reply": (
@@ -1017,6 +1071,7 @@ def process_queue_contact_message(
                 response_notes=str(interpretation.get("reason") or "").strip()
                 or "Customer declined the released slot and chose to leave the queue.",
                 send_customer_followup=False,
+                company_id=pending_offer_company_id,
             )
             return {
                 "reply": (
@@ -1055,6 +1110,7 @@ def process_queue_contact_message(
                 int(queue_confirmation_entry["id"]),
                 status="active",
                 notes="Customer chose to remain in the appointment queue.",
+                company_id=queue_confirmation_entry.get("company_id"),
             )
             return {
                 "reply": "Perfeito. Vou te manter na fila de prioridade e te aviso assim que surgir uma vaga compatível.",
@@ -1067,6 +1123,7 @@ def process_queue_contact_message(
                 int(queue_confirmation_entry["id"]),
                 status="removed",
                 notes="Customer chose to leave the appointment queue.",
+                company_id=queue_confirmation_entry.get("company_id"),
             )
             return {
                 "reply": "Tudo certo. Tirei você da fila de prioridade. Se quiser voltar depois, é só me avisar.",

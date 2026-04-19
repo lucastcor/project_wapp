@@ -226,3 +226,66 @@ class InternalReminderPayload(BaseModel):
     owner_contact_id: str = Field(..., min_length=1)
     message_text: str = Field(..., min_length=1)
     timezone: str | None = None
+
+
+class BookingOutcomePayload(BaseModel):
+    outcome: str = Field(..., pattern="^(attended|no_show|late_arrival)$")
+    notes: str | None = None
+
+
+class CancellationReasonPayload(BaseModel):
+    reason: str = Field(..., min_length=1, max_length=500)
+
+
+class OnboardingServiceItem(BaseModel):
+    name: str = Field(..., min_length=1)
+    duration_minutes: int | None = None
+    price: float | None = None
+    description: str | None = None
+    category: str | None = None
+
+
+class OnboardingSetupPayload(BaseModel):
+    company_name: str = Field(..., min_length=2, max_length=200)
+    business_type_key: str = Field(..., min_length=1)
+    segment: str | None = None
+    company_description: str | None = None
+    phone: str | None = None
+    email: str | None = None
+    instagram: str | None = None
+    website: str | None = None
+    timezone: str = "America/Sao_Paulo"
+    weekday_hours: str = "08:00-18:00"
+    saturday_hours: str = "fechado"
+    sunday_hours: str = "fechado"
+    slot_duration_minutes: int = Field(default=60, ge=10, le=480)
+    minimum_notice_minutes: int = Field(default=120, ge=0, le=10080)
+    reminder_offsets_days: list[int] | None = None
+    brand_style: str | None = None
+    custom_rules: list[str] | None = None
+    services: list[OnboardingServiceItem] | None = None
+    calendar_provider: str | None = None
+    calendar_config: dict[str, Any] | None = None
+
+
+class SubscriptionActivatePayload(BaseModel):
+    plan_key: str = Field(..., min_length=1)
+    billing_cycle: str = Field(default="monthly", pattern="^(monthly|annual)$")
+
+
+class PlanChangePayload(BaseModel):
+    new_plan_key: str = Field(..., min_length=1)
+
+
+class CancelSubscriptionPayload(BaseModel):
+    reason: str | None = None
+
+
+class ReactivateSubscriptionPayload(BaseModel):
+    plan_key: str | None = None
+    billing_cycle: str = Field(default="monthly", pattern="^(monthly|annual)$")
+
+
+class UsageRecordPayload(BaseModel):
+    metric: str = Field(..., min_length=1)
+    quantity: int = Field(default=1, ge=1)

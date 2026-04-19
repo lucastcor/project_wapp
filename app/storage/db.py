@@ -21,6 +21,10 @@ SQLITE_ID_TABLES = {
     "customer_reminders",
     "appointment_queue_entries",
     "appointment_queue_offers",
+    "billing_plans",
+    "billing_subscriptions",
+    "billing_usage_records",
+    "inbound_message_receipts",
 }
 Migration = tuple[str, str, Callable[[Any], None]]
 _POSTGRES_POOL = None
@@ -97,11 +101,14 @@ def _normalize_postgres_query(
     query: str,
     params: Sequence[Any] | Mapping[str, Any] | None,
 ) -> tuple[str, Sequence[Any] | Mapping[str, Any] | None, str | None]:
-    normalized_query = query.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-    normalized_query = normalized_query.replace(
-        "VALUES (?, ?, ?)",
-        "VALUES (%s, %s, %s) ON CONFLICT (contact_id) DO NOTHING",
-    ) if "INSERT OR IGNORE INTO contacts" in query else normalized_query
+    if "INSERT OR IGNORE INTO contacts" in query:
+        normalized_query = query.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+        normalized_query = normalized_query.replace("?", "%s")
+        if " ON CONFLICT " not in normalized_query.upper():
+            normalized_query = f"{normalized_query.rstrip()} ON CONFLICT (contact_id) DO NOTHING"
+    else:
+        normalized_query = query.replace("INSERT OR IGNORE INTO", "INSERT INTO")
+
     normalized_query = normalized_query.replace(
         "datetime('now', ?)",
         "(CURRENT_TIMESTAMP + CAST(%s AS interval))",
@@ -200,6 +207,17 @@ def _get_postgres_pool() -> Any:
 
     _POSTGRES_POOL = ConnectionPool(**_get_postgres_connect_kwargs())
     return _POSTGRES_POOL
+
+
+def close_postgres_pool() -> None:
+    global _POSTGRES_POOL
+    if _POSTGRES_POOL is None:
+        return
+
+    try:
+        _POSTGRES_POOL.close()
+    finally:
+        _POSTGRES_POOL = None
 
 
 def get_connection() -> Any:
@@ -662,12 +680,18 @@ def _create_audit_tables(cursor: Any) -> None:
             CREATE TABLE IF NOT EXISTS audit_events (
                 id BIGSERIAL PRIMARY KEY,
                 actor_id TEXT NOT NULL,
+                admin_role TEXT,
+                auth_mode TEXT,
                 action TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 resource_id TEXT,
                 company_id INTEGER,
                 status TEXT NOT NULL,
                 request_id TEXT,
+                http_method TEXT,
+                http_path TEXT,
+                client_ip TEXT,
+                user_agent TEXT,
                 metadata_json TEXT,
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             )
@@ -680,12 +704,18 @@ def _create_audit_tables(cursor: Any) -> None:
             CREATE TABLE IF NOT EXISTS audit_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor_id TEXT NOT NULL,
+                admin_role TEXT,
+                auth_mode TEXT,
                 action TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 resource_id TEXT,
                 company_id INTEGER,
                 status TEXT NOT NULL,
                 request_id TEXT,
+                http_method TEXT,
+                http_path TEXT,
+                client_ip TEXT,
+                user_agent TEXT,
                 metadata_json TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -694,12 +724,18 @@ def _create_audit_tables(cursor: Any) -> None:
         ensure_column = _ensure_sqlite_column
 
     ensure_column(cursor, "audit_events", "actor_id", "TEXT NOT NULL DEFAULT 'unknown'")
+    ensure_column(cursor, "audit_events", "admin_role", "TEXT")
+    ensure_column(cursor, "audit_events", "auth_mode", "TEXT")
     ensure_column(cursor, "audit_events", "action", "TEXT NOT NULL DEFAULT 'unknown'")
     ensure_column(cursor, "audit_events", "resource_type", "TEXT NOT NULL DEFAULT 'unknown'")
     ensure_column(cursor, "audit_events", "resource_id", "TEXT")
     ensure_column(cursor, "audit_events", "company_id", "INTEGER")
     ensure_column(cursor, "audit_events", "status", "TEXT NOT NULL DEFAULT 'success'")
     ensure_column(cursor, "audit_events", "request_id", "TEXT")
+    ensure_column(cursor, "audit_events", "http_method", "TEXT")
+    ensure_column(cursor, "audit_events", "http_path", "TEXT")
+    ensure_column(cursor, "audit_events", "client_ip", "TEXT")
+    ensure_column(cursor, "audit_events", "user_agent", "TEXT")
     ensure_column(cursor, "audit_events", "metadata_json", "TEXT")
     ensure_column(cursor, "audit_events", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
@@ -790,6 +826,139 @@ def _create_scale_indexes(cursor: Any) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_audit_events_company_created_at
         ON audit_events (company_id, created_at)
+        """
+    )
+
+
+def _create_contact_company_profiles(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contact_company_profiles (
+                contact_id TEXT NOT NULL REFERENCES contacts(contact_id),
+                company_id INTEGER NOT NULL,
+                contact_name TEXT,
+                last_classification TEXT,
+                last_interaction_at TIMESTAMPTZ,
+                conversation_summary TEXT,
+                pipeline_stage TEXT,
+                next_action TEXT,
+                lead_temperature TEXT,
+                customer_profile TEXT,
+                notes TEXT,
+                updated_at TIMESTAMPTZ,
+                PRIMARY KEY (contact_id, company_id)
+            )
+            """
+        )
+        ensure_column = _ensure_postgres_column
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS contact_company_profiles (
+                contact_id TEXT NOT NULL,
+                company_id INTEGER NOT NULL,
+                contact_name TEXT,
+                last_classification TEXT,
+                last_interaction_at TIMESTAMP,
+                conversation_summary TEXT,
+                pipeline_stage TEXT,
+                next_action TEXT,
+                lead_temperature TEXT,
+                customer_profile TEXT,
+                notes TEXT,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (contact_id, company_id),
+                FOREIGN KEY (contact_id) REFERENCES contacts(contact_id)
+            )
+            """
+        )
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "contact_company_profiles", "contact_name", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "last_classification", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "last_interaction_at", "TIMESTAMP")
+    ensure_column(cursor, "contact_company_profiles", "conversation_summary", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "pipeline_stage", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "next_action", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "lead_temperature", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "customer_profile", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "notes", "TEXT")
+    ensure_column(cursor, "contact_company_profiles", "updated_at", "TIMESTAMP")
+
+    ensure_column(cursor, "contacts", "last_classification", "TEXT")
+    ensure_column(cursor, "contacts", "last_interaction_at", "TIMESTAMP")
+    ensure_column(cursor, "contacts", "conversation_summary", "TEXT")
+    ensure_column(cursor, "contacts", "pipeline_stage", "TEXT")
+    ensure_column(cursor, "contacts", "next_action", "TEXT")
+    ensure_column(cursor, "contacts", "lead_temperature", "TEXT")
+    ensure_column(cursor, "contacts", "customer_profile", "TEXT")
+    ensure_column(cursor, "contacts", "notes", "TEXT")
+    ensure_column(cursor, "contacts", "updated_at", "TIMESTAMP")
+    ensure_column(cursor, "contacts", "company_id", "INTEGER")
+
+    profile_columns = (
+        "contact_id, company_id, contact_name, last_classification, last_interaction_at, "
+        "conversation_summary, pipeline_stage, next_action, lead_temperature, customer_profile, notes, updated_at"
+    )
+    profile_select = (
+        "SELECT contact_id, company_id, contact_name, last_classification, last_interaction_at, "
+        "conversation_summary, pipeline_stage, next_action, lead_temperature, customer_profile, notes, updated_at "
+        "FROM contacts WHERE company_id IS NOT NULL"
+    )
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            f"""
+            INSERT INTO contact_company_profiles ({profile_columns})
+            {profile_select}
+            ON CONFLICT (contact_id, company_id) DO NOTHING
+            """
+        )
+    else:
+        cursor.execute(
+            f"""
+            INSERT OR IGNORE INTO contact_company_profiles ({profile_columns})
+            {profile_select}
+            """
+        )
+
+
+def _create_contact_company_profile_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_contact_company_profiles_company_contact
+        ON contact_company_profiles (company_id, contact_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_contact_company_profiles_company_updated_at
+        ON contact_company_profiles (company_id, updated_at)
+        """
+    )
+
+
+def _add_audit_event_context_columns(cursor: Any) -> None:
+    _create_audit_tables(cursor)
+
+
+def _create_audit_event_context_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_events_request_id
+        ON audit_events (request_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_events_actor_created_at
+        ON audit_events (actor_id, created_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_audit_events_http_path_created_at
+        ON audit_events (http_path, created_at)
         """
     )
 
@@ -1182,6 +1351,39 @@ def _create_queue_tables(cursor: Any) -> None:
     ensure_column(cursor, "appointment_queue_offers", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
 
+def _add_booking_outcome_columns(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        ensure_column = _ensure_postgres_column
+    else:
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "appointment_bookings", "booking_outcome", "TEXT")
+    ensure_column(cursor, "appointment_bookings", "booking_outcome_at", "TIMESTAMP")
+    ensure_column(cursor, "appointment_bookings", "booking_outcome_notes", "TEXT")
+    ensure_column(cursor, "appointment_bookings", "cancellation_reason", "TEXT")
+
+
+def _create_analytics_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bookings_outcome_company
+        ON appointment_bookings (company_id, booking_outcome, starts_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_bookings_status_starts_at
+        ON appointment_bookings (status, starts_at, company_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_reminders_booking_status
+        ON customer_reminders (appointment_booking_id, status, audience)
+        """
+    )
+
+
 def _create_queue_indexes(cursor: Any) -> None:
     cursor.execute(
         """
@@ -1215,6 +1417,234 @@ def _create_queue_indexes(cursor: Any) -> None:
     )
 
 
+def _create_billing_tables(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_plans (
+                id BIGSERIAL PRIMARY KEY,
+                plan_key TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                price_monthly_cents INTEGER NOT NULL,
+                price_annual_monthly_cents INTEGER,
+                limits_json TEXT NOT NULL DEFAULT '{}',
+                features_json TEXT NOT NULL DEFAULT '{}',
+                display_order INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_subscriptions (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER NOT NULL,
+                plan_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'trial',
+                billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+                trial_ends_at TIMESTAMPTZ,
+                current_period_start TIMESTAMPTZ NOT NULL,
+                current_period_end TIMESTAMPTZ NOT NULL,
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT,
+                cancelled_at TIMESTAMPTZ,
+                cancel_reason TEXT,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_usage_records (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER NOT NULL,
+                subscription_id BIGINT,
+                metric TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                period_start TIMESTAMPTZ NOT NULL,
+                period_end TIMESTAMPTZ NOT NULL,
+                recorded_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        ensure_column = _ensure_postgres_column
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_plans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_key TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                price_monthly_cents INTEGER NOT NULL,
+                price_annual_monthly_cents INTEGER,
+                limits_json TEXT NOT NULL DEFAULT '{}',
+                features_json TEXT NOT NULL DEFAULT '{}',
+                display_order INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_subscriptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                plan_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'trial',
+                billing_cycle TEXT NOT NULL DEFAULT 'monthly',
+                trial_ends_at TIMESTAMP,
+                current_period_start TIMESTAMP NOT NULL,
+                current_period_end TIMESTAMP NOT NULL,
+                stripe_customer_id TEXT,
+                stripe_subscription_id TEXT,
+                cancelled_at TIMESTAMP,
+                cancel_reason TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_usage_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                subscription_id INTEGER,
+                metric TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 1,
+                period_start TIMESTAMP NOT NULL,
+                period_end TIMESTAMP NOT NULL,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "billing_subscriptions", "company_id", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(cursor, "billing_subscriptions", "plan_key", "TEXT NOT NULL DEFAULT 'essencial'")
+    ensure_column(cursor, "billing_subscriptions", "status", "TEXT NOT NULL DEFAULT 'trial'")
+    ensure_column(cursor, "billing_subscriptions", "billing_cycle", "TEXT NOT NULL DEFAULT 'monthly'")
+    ensure_column(cursor, "billing_subscriptions", "trial_ends_at", "TIMESTAMP")
+    ensure_column(cursor, "billing_subscriptions", "current_period_start", "TIMESTAMP")
+    ensure_column(cursor, "billing_subscriptions", "current_period_end", "TIMESTAMP")
+    ensure_column(cursor, "billing_subscriptions", "stripe_customer_id", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "stripe_subscription_id", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "cancelled_at", "TIMESTAMP")
+    ensure_column(cursor, "billing_subscriptions", "cancel_reason", "TEXT")
+
+    ensure_column(cursor, "billing_usage_records", "company_id", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(cursor, "billing_usage_records", "subscription_id", "INTEGER")
+    ensure_column(cursor, "billing_usage_records", "metric", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(cursor, "billing_usage_records", "quantity", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(cursor, "billing_usage_records", "period_start", "TIMESTAMP")
+    ensure_column(cursor, "billing_usage_records", "period_end", "TIMESTAMP")
+
+
+def _create_billing_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_subscriptions_company_status
+        ON billing_subscriptions (company_id, status)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_usage_company_metric_period
+        ON billing_usage_records (company_id, metric, period_start, period_end)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_usage_subscription_metric
+        ON billing_usage_records (subscription_id, metric, recorded_at)
+        """
+    )
+
+
+def _create_inbound_message_receipts(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbound_message_receipts (
+                id BIGSERIAL PRIMARY KEY,
+                provider TEXT NOT NULL,
+                provider_message_id TEXT NOT NULL,
+                company_id INTEGER,
+                contact_id TEXT,
+                payload_mode TEXT,
+                status TEXT NOT NULL DEFAULT 'processing',
+                last_error TEXT,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, provider_message_id)
+            )
+            """
+        )
+        ensure_column = _ensure_postgres_column
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS inbound_message_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                provider_message_id TEXT NOT NULL,
+                company_id INTEGER,
+                contact_id TEXT,
+                payload_mode TEXT,
+                status TEXT NOT NULL DEFAULT 'processing',
+                last_error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(provider, provider_message_id)
+            )
+            """
+        )
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "inbound_message_receipts", "company_id", "INTEGER")
+    ensure_column(cursor, "inbound_message_receipts", "contact_id", "TEXT")
+    ensure_column(cursor, "inbound_message_receipts", "payload_mode", "TEXT")
+    ensure_column(cursor, "inbound_message_receipts", "status", "TEXT NOT NULL DEFAULT 'processing'")
+    ensure_column(cursor, "inbound_message_receipts", "last_error", "TEXT")
+    ensure_column(cursor, "inbound_message_receipts", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "inbound_message_receipts", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+
+def _create_inbound_message_receipt_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_inbound_receipts_company_status
+        ON inbound_message_receipts (company_id, status)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_inbound_receipts_contact_status
+        ON inbound_message_receipts (contact_id, status)
+        """
+    )
+
+
+SQLITE_ID_TABLES_BILLING = {"billing_plans", "billing_subscriptions", "billing_usage_records"}
+
+
+def _repair_queue_columns(cursor: Any) -> None:
+    """Ensure all queue columns exist for databases created before migration 011."""
+    if get_database_backend() == "postgres":
+        ensure_column = _ensure_postgres_column
+    else:
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "appointment_queue_entries", "scheduling_profile_key", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "customer_profile", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "request_summary", "TEXT")
+    ensure_column(cursor, "appointment_queue_entries", "source", "TEXT NOT NULL DEFAULT 'manual'")
+    ensure_column(cursor, "appointment_queue_entries", "notes", "TEXT")
+
+
 MIGRATIONS: list[Migration] = [
     ("001_runtime_tables", "Create runtime tables and columns", _create_runtime_tables),
     ("002_audit_events", "Create audit events table", _create_audit_tables),
@@ -1228,6 +1658,17 @@ MIGRATIONS: list[Migration] = [
     ("010_reminder_booking_index", "Add reminder booking index", _create_workflow_indexes),
     ("011_queue_tables", "Create appointment queue tables", _create_queue_tables),
     ("012_queue_indexes", "Create appointment queue indexes", _create_queue_indexes),
+    ("013_booking_outcome", "Add booking outcome tracking columns", _add_booking_outcome_columns),
+    ("014_analytics_indexes", "Create analytics-oriented indexes", _create_analytics_indexes),
+    ("015_billing_tables", "Create billing plans, subscriptions and usage tables", _create_billing_tables),
+    ("016_billing_indexes", "Create billing indexes", _create_billing_indexes),
+    ("017_repair_queue_columns", "Ensure queue entry columns exist", _repair_queue_columns),
+    ("018_inbound_message_receipts", "Create inbound message receipts table", _create_inbound_message_receipts),
+    ("019_inbound_message_receipt_indexes", "Create inbound message receipt indexes", _create_inbound_message_receipt_indexes),
+    ("020_audit_event_context_columns", "Add admin and HTTP context columns to audit events", _add_audit_event_context_columns),
+    ("021_audit_event_context_indexes", "Create audit event context indexes", _create_audit_event_context_indexes),
+    ("022_contact_company_profiles", "Create tenant-scoped contact profiles", _create_contact_company_profiles),
+    ("023_contact_company_profile_indexes", "Create contact profile indexes", _create_contact_company_profile_indexes),
 ]
 
 

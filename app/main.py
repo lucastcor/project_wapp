@@ -12,7 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.api.admin_routes import admin_router
 from app.api.platform_routes import PLATFORM_ASSETS_DIR, platform_router
 from app.api.routes import router
-from app.core.config import settings
+from app.core.config import is_missing_or_placeholder, settings
 from app.core.logging import (
     clear_request_context,
     configure_logging,
@@ -20,19 +20,48 @@ from app.core.logging import (
     log_event,
     set_request_context,
 )
+from app.services.rate_limit_service import build_rate_limit_headers, evaluate_rate_limit, get_request_client_ip
 from app.services.runtime_guard_service import get_runtime_blockers, validate_runtime_environment
 from app.services.system_readiness_service import get_system_readiness
-from app.storage.db import check_runtime_database_connection, init_db
+from app.storage.db import check_runtime_database_connection, close_postgres_pool, init_db
 
 configure_logging()
 logger = get_logger(__name__)
 
 
+def _validate_production_config() -> None:
+    warnings = []
+    if settings.environment == "production":
+        if is_missing_or_placeholder(settings.platform_session_secret):
+            warnings.append("PLATFORM_SESSION_SECRET is not set or uses placeholder value")
+        if settings.enable_admin_auth:
+            tokens = [settings.admin_api_token, settings.admin_viewer_token,
+                      settings.admin_operator_token, settings.admin_superadmin_token]
+            if all(t is None for t in tokens):
+                warnings.append("ENABLE_ADMIN_AUTH=true but no admin tokens configured")
+            for t in tokens:
+                if t and is_missing_or_placeholder(t):
+                    warnings.append("Admin token uses placeholder 'change-me' value")
+                    break
+        if is_missing_or_placeholder(settings.openai_api_key) and settings.classification_provider == "openai":
+            warnings.append("CLASSIFICATION_PROVIDER=openai but OPENAI_API_KEY is not set")
+    if settings.outbound_provider == "mock":
+        warnings.append("OUTBOUND_PROVIDER=mock — WhatsApp messages will not be delivered")
+    if settings.calendar_provider == "mock":
+        warnings.append("CALENDAR_PROVIDER=mock — calendar operations use fake data")
+    for w in warnings:
+        logger.warning(f"[CONFIG] {w}")
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _validate_production_config()
     init_db()
     validate_runtime_environment("api")
-    yield
+    try:
+        yield
+    finally:
+        close_postgres_pool()
 
 
 app = FastAPI(
@@ -47,19 +76,48 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-ID", "").strip() or uuid.uuid4().hex
         start_time = time.perf_counter()
+        client_ip = get_request_client_ip(request)
 
         set_request_context(
             request_id=request_id,
             http_method=request.method,
             http_path=request.url.path,
+            client_ip=client_ip,
         )
         request.state.request_id = request_id
+
+        rate_limit_decision = evaluate_rate_limit(request)
+        if rate_limit_decision and not rate_limit_decision.allowed:
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            log_event(
+                logger,
+                logging.WARNING,
+                "http.request.rate_limited",
+                client_ip=client_ip,
+                rate_limit_scope=rate_limit_decision.scope,
+                rate_limit_limit=rate_limit_decision.limit,
+                retry_after=rate_limit_decision.retry_after,
+                duration_ms=duration_ms,
+            )
+            response = JSONResponse(
+                status_code=429,
+                content={
+                    "detail": "Too many requests.",
+                    "request_id": request_id,
+                    "retry_after_seconds": rate_limit_decision.retry_after,
+                },
+            )
+            response.headers["X-Request-ID"] = request_id
+            for header_name, header_value in build_rate_limit_headers(rate_limit_decision).items():
+                response.headers[header_name] = header_value
+            clear_request_context()
+            return response
 
         log_event(
             logger,
             logging.INFO,
             "http.request.started",
-            client_ip=request.client.host if request.client else None,
+            client_ip=client_ip,
             query_string=str(request.url.query) or None,
         )
 
@@ -78,6 +136,9 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
 
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
         response.headers["X-Request-ID"] = request_id
+        if rate_limit_decision:
+            for header_name, header_value in build_rate_limit_headers(rate_limit_decision).items():
+                response.headers[header_name] = header_value
         log_event(
             logger,
             logging.INFO,

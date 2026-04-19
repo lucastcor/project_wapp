@@ -31,13 +31,11 @@ def _fallback_business_reply(
     company_context = get_company_context(company_slug=company_slug)
 
     business_identity = company_context.get("business_identity", {})
-    business_hours = company_context.get("business_hours", {})
     commercial_policy = company_context.get("commercial_policy", {})
     catalog = company_context.get("catalog", {})
     items = catalog.get("items", [])
 
     service_area = business_identity.get("service_area", "atendimento conforme disponibilidade")
-    weekday_hours = business_hours.get("weekdays", "horário comercial")
     budget_policy = commercial_policy.get("budget_policy", "valores sob consulta")
 
     if classification == "lead_novo":

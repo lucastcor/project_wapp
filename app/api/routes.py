@@ -1,7 +1,7 @@
 import logging
 import hashlib
 import hmac
-from typing import Any
+from typing import Any, TypedDict
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
@@ -17,6 +17,7 @@ from app.core.orchestrator import (
 )
 from app.core.logging import get_logger, log_event
 from app.services.outbound_dispatch_service import OutboundDispatchError, dispatch_outbound_message
+from app.services.realtime_service import broadcast_event
 from app.storage.repository import RuntimeRepository
 
 router = APIRouter(tags=["chat"])
@@ -24,12 +25,17 @@ logger = get_logger(__name__)
 repository = RuntimeRepository()
 
 
+class RequestCompanyScope(TypedDict):
+    company_id: int | None
+    company_slug: str | None
+
+
 def _resolve_request_company(
     company_id: int | None = None,
     company_slug: str | None = None,
     x_company_id: str | None = None,
     x_company_slug: str | None = None,
-) -> dict[str, int | str | None]:
+) -> RequestCompanyScope:
     resolved_company_id = company_id
     if resolved_company_id is None and x_company_id:
         try:
@@ -165,6 +171,7 @@ def _dispatch_whatsapp_auto_reply(result: dict[str, Any]) -> dict[str, Any] | No
         dispatch_result = dispatch_outbound_message(
             outbound_message_id=outbound_message_id,
             channel="whatsapp",
+            company_id=result.get("company_id"),
         )
         return {
             "outbound_message_id": outbound_message_id,
@@ -190,6 +197,44 @@ def _dispatch_whatsapp_auto_reply(result: dict[str, Any]) -> dict[str, Any] | No
         }
 
 
+def _begin_whatsapp_idempotent_processing(
+    *,
+    normalized_payload: dict[str, Any],
+    request_company: RequestCompanyScope,
+    payload_mode: str,
+) -> tuple[bool, dict[str, Any] | None]:
+    provider_message_id = str(normalized_payload.get("provider_message_id") or "").strip()
+    if not provider_message_id:
+        return True, None
+
+    status = repository.begin_inbound_message_processing(
+        provider="whatsapp",
+        provider_message_id=provider_message_id,
+        company_id=request_company.get("company_id"),
+        contact_id=str(normalized_payload.get("from_number") or "").strip() or None,
+        payload_mode=payload_mode,
+    )
+    if status == "started":
+        return True, None
+
+    log_event(
+        logger,
+        logging.INFO,
+        "api.whatsapp.webhook.duplicate_ignored",
+        provider_message_id=provider_message_id,
+        duplicate_status=status,
+        company_id=request_company.get("company_id"),
+        company_slug=request_company.get("company_slug"),
+    )
+    return False, {
+        "processed": False,
+        "reason": "duplicate_provider_message_id",
+        "duplicate_status": status,
+        "payload_mode": payload_mode,
+        "provider_message_id": provider_message_id,
+    }
+
+
 @router.post("/messages/incoming", response_model=IncomingMessageResponse)
 def incoming_message(
     payload: IncomingMessageRequest,
@@ -208,20 +253,22 @@ def incoming_message(
         x_company_id=x_company_id,
         x_company_slug=x_company_slug,
     )
+    resolved_company_id = request_company["company_id"]
+    resolved_company_slug = request_company["company_slug"]
     log_event(
         logger,
         logging.INFO,
         "api.messages.incoming.received",
-        company_id=request_company["company_id"],
-        company_slug=request_company["company_slug"],
+        company_id=resolved_company_id,
+        company_slug=resolved_company_slug,
         has_contact_name=bool(payload.contact_name),
     )
-    result = process_incoming_message(
+    result: dict[str, Any] = process_incoming_message(
         contact_id=payload.contact_id,
         contact_name=payload.contact_name,
         message=normalized_message,
-        company_id=request_company["company_id"],
-        company_slug=request_company["company_slug"],
+        company_id=resolved_company_id,
+        company_slug=resolved_company_slug,
     )
     log_event(
         logger,
@@ -233,6 +280,11 @@ def incoming_message(
         auto_reply=result.get("auto_reply"),
         handoff_required=result.get("handoff_required"),
     )
+    broadcast_event("new_message", {
+        "contact_id": payload.contact_id,
+        "classification": result.get("classification"),
+        "handoff_required": result.get("handoff_required"),
+    })
     return IncomingMessageResponse(**result)
 
 
@@ -300,38 +352,65 @@ async def whatsapp_webhook(
         x_company_id=x_company_id,
         x_company_slug=x_company_slug,
     )
+    resolved_company_id = request_company["company_id"]
+    resolved_company_slug = request_company["company_slug"]
     log_event(
         logger,
         logging.INFO,
         "api.whatsapp.webhook.received",
         whatsapp_event=normalized_payload["event"],
-        company_id=request_company["company_id"],
-        company_slug=request_company["company_slug"],
+        company_id=resolved_company_id,
+        company_slug=resolved_company_slug,
         payload_mode=payload_mode,
         has_from_name=bool(normalized_payload.get("from_name")),
     )
-    result = process_whatsapp_webhook(
-        from_number=str(normalized_payload["from_number"]),
-        from_name=normalized_payload.get("from_name"),
-        text=str(normalized_payload["text"]),
-        company_id=request_company["company_id"],
-        company_slug=request_company["company_slug"],
+    should_process, duplicate_response = _begin_whatsapp_idempotent_processing(
+        normalized_payload=normalized_payload,
+        request_company=request_company,
+        payload_mode=payload_mode,
     )
-    auto_reply_dispatch = _dispatch_whatsapp_auto_reply(result)
-    log_event(
-        logger,
-        logging.INFO,
-        "api.whatsapp.webhook.completed",
-        company_id=result.get("company_id"),
-        company_slug=result.get("company_slug"),
-        classification=result.get("classification"),
-        auto_reply=result.get("auto_reply"),
-        handoff_required=result.get("handoff_required"),
-        auto_reply_dispatched=bool(auto_reply_dispatch),
-    )
-    return {
-        **result,
-        "payload_mode": payload_mode,
-        "provider_message_id": normalized_payload.get("provider_message_id"),
-        "auto_reply_dispatch": auto_reply_dispatch,
-    }
+    if not should_process:
+        return duplicate_response
+
+    provider_message_id = str(normalized_payload.get("provider_message_id") or "").strip()
+    try:
+        result = process_whatsapp_webhook(
+            from_number=str(normalized_payload["from_number"]),
+            from_name=normalized_payload.get("from_name"),
+            text=str(normalized_payload["text"]),
+            company_id=resolved_company_id,
+            company_slug=resolved_company_slug,
+        )
+        auto_reply_dispatch = _dispatch_whatsapp_auto_reply(result)
+        log_event(
+            logger,
+            logging.INFO,
+            "api.whatsapp.webhook.completed",
+            company_id=result.get("company_id"),
+            company_slug=result.get("company_slug"),
+            classification=result.get("classification"),
+            auto_reply=result.get("auto_reply"),
+            handoff_required=result.get("handoff_required"),
+            auto_reply_dispatched=bool(auto_reply_dispatch),
+        )
+        if provider_message_id:
+            repository.mark_inbound_message_processing_completed(
+                provider="whatsapp",
+                provider_message_id=provider_message_id,
+                company_id=resolved_company_id,
+            )
+        return {
+            **result,
+            "payload_mode": payload_mode,
+            "provider_message_id": normalized_payload.get("provider_message_id"),
+            "auto_reply_dispatch": auto_reply_dispatch,
+        }
+    except Exception as exc:
+        if provider_message_id:
+            repository.mark_inbound_message_processing_failed(
+                provider="whatsapp",
+                provider_message_id=provider_message_id,
+                error=f"{type(exc).__name__}: {exc}",
+                company_id=resolved_company_id,
+            )
+        raise

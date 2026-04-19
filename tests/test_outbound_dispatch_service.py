@@ -13,6 +13,7 @@ class FakeRepository:
             1: {
                 "id": 1,
                 "contact_id": "5511999991111",
+                "company_id": 7,
                 "pending_question_id": 10,
                 "message": "Mensagem pendente 1",
                 "source": "owner_resolution",
@@ -23,6 +24,7 @@ class FakeRepository:
             2: {
                 "id": 2,
                 "contact_id": "5511999992222",
+                "company_id": 8,
                 "pending_question_id": 11,
                 "message": "Mensagem pendente 2",
                 "source": "owner_resolution",
@@ -33,6 +35,7 @@ class FakeRepository:
             3: {
                 "id": 3,
                 "contact_id": "5511999993333",
+                "company_id": 7,
                 "pending_question_id": 12,
                 "message": "Mensagem já enviada",
                 "source": "owner_resolution",
@@ -42,16 +45,45 @@ class FakeRepository:
             },
         }
         self.marked_as_sent: list[int] = []
+        self.outbound_message_lookup_calls: list[dict] = []
+        self.outbound_messages_list_calls: list[dict] = []
 
-    def get_outbound_message(self, outbound_message_id: int) -> dict | None:
-        return self.messages.get(outbound_message_id)
+    def get_outbound_message(
+        self,
+        outbound_message_id: int,
+        *,
+        company_id: int | None = None,
+    ) -> dict | None:
+        self.outbound_message_lookup_calls.append(
+            {
+                "outbound_message_id": outbound_message_id,
+                "company_id": company_id,
+            }
+        )
+        message = self.messages.get(outbound_message_id)
+        if message is None:
+            return None
+        if company_id is not None and message.get("company_id") != company_id:
+            return None
+        return message
 
-    def get_outbound_messages(self) -> list[dict]:
-        return [self.messages[key] for key in sorted(self.messages)]
+    def get_outbound_messages(self, *, company_id: int | None = None) -> list[dict]:
+        self.outbound_messages_list_calls.append({"company_id": company_id})
+        messages = [self.messages[key] for key in sorted(self.messages)]
+        if company_id is not None:
+            messages = [message for message in messages if message.get("company_id") == company_id]
+        return messages
 
-    def mark_outbound_message_sent(self, outbound_message_id: int) -> None:
+    def mark_outbound_message_sent(
+        self,
+        outbound_message_id: int,
+        *,
+        company_id: int | None = None,
+    ) -> None:
         self.marked_as_sent.append(outbound_message_id)
         message = self.messages[outbound_message_id]
+        if company_id is not None and message.get("company_id") != company_id:
+            return
         message["status"] = "sent"
         message["sent_at"] = "2026-03-16 11:00:00"
 
@@ -88,6 +120,10 @@ def test_dispatch_outbound_message_with_mock_provider(monkeypatch) -> None:
     assert result["channel"] == "whatsapp"
     assert result["provider_response"]["provider"] == "mock"
     assert fake_repository.marked_as_sent == [1]
+    assert fake_repository.outbound_message_lookup_calls[0] == {
+        "outbound_message_id": 1,
+        "company_id": None,
+    }
 
 
 
@@ -116,6 +152,23 @@ def test_dispatch_pending_outbound_messages_dispatches_all_pending(monkeypatch) 
     assert len(results) == 2
     assert {result["outbound_message_id"] for result in results} == {1, 2}
     assert fake_repository.marked_as_sent == [1, 2]
+
+
+def test_dispatch_pending_outbound_messages_respects_company_scope(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(outbound_dispatch_service, "repository", fake_repository)
+    monkeypatch.setattr(settings, "outbound_provider", "mock")
+    monkeypatch.setattr(settings, "outbound_default_channel", "whatsapp")
+
+    results = dispatch_pending_outbound_messages(company_id=7)
+
+    assert {result["outbound_message_id"] for result in results} == {1}
+    assert fake_repository.marked_as_sent == [1]
+    assert fake_repository.outbound_messages_list_calls == [{"company_id": 7}]
+    assert fake_repository.outbound_message_lookup_calls[0] == {
+        "outbound_message_id": 1,
+        "company_id": 7,
+    }
 
 
 

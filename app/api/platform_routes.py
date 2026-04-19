@@ -1,7 +1,9 @@
+import asyncio
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
+from starlette.responses import StreamingResponse
 
 from app.api.schemas import PlatformSessionLoginPayload, PlatformSessionResponse
 from app.services.platform_session_service import (
@@ -12,6 +14,7 @@ from app.services.platform_session_service import (
     clear_platform_session_cookie,
     read_platform_session,
 )
+from app.services.realtime_service import hub
 
 
 PLATFORM_DIR = Path(__file__).resolve().parent.parent / "platform"
@@ -70,3 +73,35 @@ def read_platform_session_state(request: Request) -> PlatformSessionResponse:
 def delete_platform_session(response: Response) -> dict[str, bool]:
     clear_platform_session_cookie(response)
     return {"authenticated": False}
+
+
+@platform_router.get("/platform/events")
+async def sse_stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream for real-time platform notifications."""
+    queue = hub.subscribe()
+
+    async def event_generator():
+        try:
+            # Send initial heartbeat so the client knows the connection is alive
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=25.0)
+                    yield f"data: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    # Keep-alive ping every 25s to prevent proxy timeouts
+                    yield ": heartbeat\n\n"
+        finally:
+            hub.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

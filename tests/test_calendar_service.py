@@ -2,6 +2,68 @@ from app.core.config import settings
 from app.services import calendar_service
 
 
+def test_google_calendar_readiness_rejects_placeholder_credentials(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "google_calendar_id", "primary")
+    monkeypatch.setattr(settings, "google_calendar_client_id", "change-me-google-client-id")
+    monkeypatch.setattr(settings, "google_calendar_client_secret", "change-me-google-client-secret")
+    monkeypatch.setattr(settings, "google_calendar_refresh_token", "change-me-google-refresh-token")
+
+    provider = calendar_service.GoogleCalendarProvider(
+        {
+            "provider": "google_calendar",
+            "config": {},
+        }
+    )
+
+    readiness = provider.readiness()
+
+    assert readiness["ready"] is False
+    assert readiness["details"] == "Faltam credenciais reais do Google Calendar."
+
+
+def test_create_calendar_integration_returns_scoped_integration(monkeypatch) -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.integration_lookup_calls: list[dict] = []
+
+        def create_calendar_integration(self, **kwargs):
+            assert kwargs["company_id"] == 9
+            return 41
+
+        def get_calendar_integration(self, integration_id: int, *, company_id=None):
+            self.integration_lookup_calls.append(
+                {
+                    "integration_id": integration_id,
+                    "company_id": company_id,
+                }
+            )
+            return {
+                "id": integration_id,
+                "company_id": company_id,
+                "provider": "mock",
+                "active": 1,
+                "config": {"label": "Agenda Empresa 9"},
+            }
+
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(calendar_service, "repository", fake_repository)
+
+    result = calendar_service.create_calendar_integration(
+        provider="mock",
+        company_id=9,
+        config={"label": "Agenda Empresa 9"},
+    )
+
+    assert result["id"] == 41
+    assert result["company_id"] == 9
+    assert fake_repository.integration_lookup_calls == [
+        {
+            "integration_id": 41,
+            "company_id": 9,
+        }
+    ]
+
+
 def test_query_calendar_availability_respects_local_conflicts(monkeypatch) -> None:
     class FakeRepository:
         def get_active_calendar_integration(self, company_id=None):
@@ -233,16 +295,27 @@ def test_cancel_calendar_booking_syncs_external_event(monkeypatch) -> None:
         def get_company(self, company_id: int):
             return {"id": company_id, "slug": "empresa-teste"}
 
-        def get_appointment_booking(self, booking_id: int):
+        def get_appointment_booking(self, booking_id: int, *, company_id=None):
             return self.booking if booking_id == 9 else None
 
         def get_active_calendar_integration(self, company_id=None):
             return {"id": 1, "company_id": company_id, "provider": "google_calendar", "config": {}, "active": 1}
 
-        def update_appointment_booking_status(self, booking_id: int, status: str) -> None:
+        def update_appointment_booking_status(
+            self,
+            booking_id: int,
+            status: str,
+            *,
+            company_id=None,
+        ) -> None:
             self.booking["status"] = status
 
-        def cancel_customer_reminders_for_booking(self, appointment_booking_id: int) -> int:
+        def cancel_customer_reminders_for_booking(
+            self,
+            appointment_booking_id: int,
+            *,
+            company_id=None,
+        ) -> int:
             return 2
 
     class FakeProvider:
@@ -291,7 +364,7 @@ def test_reschedule_calendar_booking_updates_existing_booking_and_provider(monke
         def get_company(self, company_id: int):
             return {"id": company_id, "slug": "empresa-teste"}
 
-        def get_appointment_booking(self, booking_id: int):
+        def get_appointment_booking(self, booking_id: int, *, company_id=None):
             return self.booking if booking_id == 11 else None
 
         def get_active_calendar_integration(self, company_id=None):
@@ -301,9 +374,15 @@ def test_reschedule_calendar_booking_updates_existing_booking_and_provider(monke
             return [self.booking]
 
         def update_appointment_booking_schedule(self, booking_id: int, **kwargs) -> None:
+            kwargs.pop("company_id", None)
             self.booking.update(kwargs)
 
-        def cancel_customer_reminders_for_booking(self, appointment_booking_id: int) -> int:
+        def cancel_customer_reminders_for_booking(
+            self,
+            appointment_booking_id: int,
+            *,
+            company_id=None,
+        ) -> int:
             return 3
 
     class FakeProvider:

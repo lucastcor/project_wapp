@@ -1,3 +1,4 @@
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -8,8 +9,12 @@ from app.api.schemas import (
     AppointmentBookingReschedulePayload,
     AppointmentQueueEntryPayload,
     AppointmentQueueOfferResponsePayload,
+    BookingOutcomePayload,
     CalendarAvailabilityQueryPayload,
     CalendarIntegrationPayload,
+    CancelSubscriptionPayload,
+    CancellationReasonPayload,
+    OnboardingSetupPayload,
     CompanyContextPayload,
     CompanyCreatePayload,
     CompanyResponse,
@@ -17,7 +22,11 @@ from app.api.schemas import (
     InternalReminderPayload,
     MessageExampleCreatePayload,
     PendingQuestionAnswerPayload,
+    PlanChangePayload,
+    ReactivateSubscriptionPayload,
+    SubscriptionActivatePayload,
     TrainingImportPayload,
+    UsageRecordPayload,
 )
 from app.api.admin_security import (
     build_require_admin_access,
@@ -88,6 +97,7 @@ from app.services.appointment_queue_service import (
 )
 
 from app.core.config import settings
+from app.services.realtime_service import broadcast_event
 from app.services.finetuning_service import FineTuningError, FineTuningService
 from app.core.logging import get_logger, log_event
 
@@ -102,6 +112,21 @@ def _get_finetuning_service() -> FineTuningService:
 
 def _get_repository() -> RuntimeRepository:
     return repository
+
+
+def _resolve_company_scope(
+    *,
+    company_id: int | None = None,
+    company_slug: str | None = None,
+    required: bool = False,
+) -> int | None:
+    resolved_company_id = repository.resolve_company_id(
+        company_id=company_id,
+        company_slug=company_slug,
+    )
+    if required and resolved_company_id is None:
+        raise HTTPException(status_code=400, detail="company_id or company_slug must resolve to an existing company.")
+    return resolved_company_id
 
 
 def _record_audit_event(
@@ -188,12 +213,14 @@ def read_audit_events(
     limit: int = 100,
     action: str | None = Query(default=None),
     resource_type: str | None = Query(default=None),
+    company_id: int | None = Query(default=None),
 ) -> list[dict]:
     normalized_limit = max(1, min(limit, 500))
     return repository.get_audit_events(
         limit=normalized_limit,
         action=action,
         resource_type=resource_type,
+        company_id=company_id,
     )
 
 
@@ -489,7 +516,10 @@ def create_calendar_booking_endpoint(
                     status="pending",
                 )
                 try:
-                    dispatch_outbound_message(confirmation_outbound_id)
+                    dispatch_outbound_message(
+                        confirmation_outbound_id,
+                        company_id=booking.get("company_id") or company_id,
+                    )
                 except OutboundDispatchError as exc:
                     log_event(
                         logger,
@@ -534,6 +564,12 @@ def create_calendar_booking_endpoint(
             "confirmation_outbound_message_id": confirmation_outbound_id,
         },
     )
+    broadcast_event("new_booking", {
+        "booking_id": booking.get("id"),
+        "title": booking.get("title"),
+        "starts_at": booking.get("starts_at"),
+        "contact_id": booking.get("contact_id"),
+    })
     if confirmation_outbound_id is not None:
         return {**booking, "confirmation_outbound_message_id": confirmation_outbound_id}
     return booking
@@ -737,12 +773,14 @@ def dispatch_due_customer_reminders(
             "count": len(results),
         },
     )
+    if results:
+        broadcast_event("reminders_dispatched", {"count": len(results)})
     return results
 
 
 @admin_router.get("/messages")
-def read_messages() -> list[dict]:
-    return repository.get_messages()
+def read_messages(company_id: int | None = Query(default=None)) -> list[dict]:
+    return repository.get_messages(company_id=company_id)
 
 
 @admin_router.get("/contacts")
@@ -757,15 +795,16 @@ def read_contacts(
             company_id=company_id,
             limit=limit,
         )
-    contacts = repository.get_contacts()
-    if company_id is not None:
-        contacts = [contact for contact in contacts if contact.get("company_id") == company_id]
+    contacts = repository.get_contacts(company_id=company_id)
     return contacts[:limit]
 
 
 @admin_router.get("/contacts/{contact_id}")
-def read_contact(contact_id: str) -> dict:
-    contact = repository.get_contact(contact_id)
+def read_contact(
+    contact_id: str,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    contact = repository.get_contact(contact_id, company_id=company_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found.")
     return contact
@@ -781,7 +820,7 @@ def update_contact_endpoint(
     request: Request,
     company_id: int | None = Query(default=None),
 ) -> dict:
-    contact = repository.get_contact(contact_id)
+    contact = repository.get_contact(contact_id, company_id=company_id)
     if not contact:
         raise HTTPException(status_code=404, detail="Contact not found.")
 
@@ -792,7 +831,7 @@ def update_contact_endpoint(
         customer_profile=payload.customer_profile,
         notes=payload.notes,
     )
-    updated_contact = repository.get_contact(contact_id)
+    updated_contact = repository.get_contact(contact_id, company_id=company_id)
     if not updated_contact:
         raise HTTPException(status_code=404, detail="Contact not found after update.")
 
@@ -906,13 +945,16 @@ def update_company_context(
 
 
 @admin_router.get("/pending-questions")
-def read_pending_questions() -> list[dict]:
-    return repository.get_pending_questions()
+def read_pending_questions(company_id: int | None = Query(default=None)) -> list[dict]:
+    return repository.get_pending_questions(company_id=company_id)
 
 
 @admin_router.get("/pending-questions/{question_id}")
-def read_pending_question(question_id: int) -> dict:
-    pending_question = repository.get_pending_question(question_id)
+def read_pending_question(
+    question_id: int,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    pending_question = repository.get_pending_question(question_id, company_id=company_id)
     if not pending_question:
         raise HTTPException(status_code=404, detail="Pending question not found.")
     return pending_question
@@ -922,8 +964,13 @@ def read_pending_question(question_id: int) -> dict:
     "/pending-questions/{question_id}/answer",
     dependencies=[Depends(require_admin_role("operator"))],
 )
-def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayload, request: Request) -> dict:
-    pending_question = repository.get_pending_question(question_id)
+def answer_pending_question(
+    question_id: int,
+    payload: PendingQuestionAnswerPayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    pending_question = repository.get_pending_question(question_id, company_id=company_id)
     if not pending_question:
         raise HTTPException(status_code=404, detail="Pending question not found.")
 
@@ -950,6 +997,7 @@ def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayl
         customer_followup_question=normalized_resolution["customer_followup_question"],
         applies_globally=normalized_resolution["applies_globally"],
         knowledge_action=normalized_resolution["knowledge_action"],
+        company_id=pending_question.get("company_id"),
     )
     outbound_message_id: int | None = None
     if normalized_resolution["resolution_type"] in {"needs_customer_clarification", "final_answer"}:
@@ -982,7 +1030,10 @@ def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayl
             applies_globally=knowledge_entry["applies_globally"],
             status=knowledge_entry["status"],
         )
-    updated_pending_question = repository.get_pending_question(question_id)
+    updated_pending_question = repository.get_pending_question(
+        question_id,
+        company_id=pending_question.get("company_id"),
+    )
     if not updated_pending_question:
         raise HTTPException(status_code=404, detail="Pending question not found after update.")
 
@@ -1017,18 +1068,15 @@ def answer_pending_question(question_id: int, payload: PendingQuestionAnswerPayl
 
 @admin_router.get("/knowledge-entries")
 def read_knowledge_entries(company_id: int | None = Query(default=None)) -> list[dict]:
-    if company_id is None:
-        return repository.get_knowledge_entries()
-    return [
-        entry
-        for entry in repository.get_knowledge_entries()
-        if entry.get("company_id") == company_id
-    ]
+    return repository.get_knowledge_entries(company_id=company_id)
 
 
 @admin_router.get("/knowledge-entries/{knowledge_entry_id}")
-def read_knowledge_entry(knowledge_entry_id: int) -> dict:
-    knowledge_entry = repository.get_knowledge_entry(knowledge_entry_id)
+def read_knowledge_entry(
+    knowledge_entry_id: int,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    knowledge_entry = repository.get_knowledge_entry(knowledge_entry_id, company_id=company_id)
     if not knowledge_entry:
         raise HTTPException(status_code=404, detail="Knowledge entry not found.")
     return knowledge_entry
@@ -1055,7 +1103,7 @@ def create_message_example(
         active=payload.active,
     )
 
-    message_example = repository.get_message_example(message_example_id)
+    message_example = repository.get_message_example(message_example_id, company_id=company_id)
     if not message_example:
         raise HTTPException(status_code=404, detail="Message example not found after creation.")
     log_event(
@@ -1085,18 +1133,15 @@ def create_message_example(
 
 @admin_router.get("/message-examples")
 def read_message_examples(company_id: int | None = Query(default=None)) -> list[dict]:
-    if company_id is None:
-        return repository.get_message_examples()
-    return [
-        example
-        for example in repository.get_message_examples()
-        if example.get("company_id") == company_id
-    ]
+    return repository.get_message_examples(company_id=company_id)
 
 
 @admin_router.get("/message-examples/{message_example_id}")
-def read_message_example(message_example_id: int) -> dict:
-    message_example = repository.get_message_example(message_example_id)
+def read_message_example(
+    message_example_id: int,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    message_example = repository.get_message_example(message_example_id, company_id=company_id)
     if not message_example:
         raise HTTPException(status_code=404, detail="Message example not found.")
     return message_example
@@ -1184,13 +1229,16 @@ def read_finetuning_dataset_bundle(company_id: int | None = Query(default=None))
 
 
 @admin_router.get("/outbound-messages")
-def read_outbound_messages() -> list[dict]:
-    return repository.get_outbound_messages()
+def read_outbound_messages(company_id: int | None = Query(default=None)) -> list[dict]:
+    return repository.get_outbound_messages(company_id=company_id)
 
 
 @admin_router.get("/outbound-messages/{outbound_message_id}")
-def read_outbound_message(outbound_message_id: int) -> dict:
-    outbound_message = repository.get_outbound_message(outbound_message_id)
+def read_outbound_message(
+    outbound_message_id: int,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    outbound_message = repository.get_outbound_message(outbound_message_id, company_id=company_id)
     if not outbound_message:
         raise HTTPException(status_code=404, detail="Outbound message not found.")
     return outbound_message
@@ -1200,13 +1248,23 @@ def read_outbound_message(outbound_message_id: int) -> dict:
     "/outbound-messages/{outbound_message_id}/mark-sent",
     dependencies=[Depends(require_admin_role("operator"))],
 )
-def mark_outbound_message_sent(outbound_message_id: int, request: Request) -> dict:
-    outbound_message = repository.get_outbound_message(outbound_message_id)
+def mark_outbound_message_sent(
+    outbound_message_id: int,
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    outbound_message = repository.get_outbound_message(outbound_message_id, company_id=company_id)
     if not outbound_message:
         raise HTTPException(status_code=404, detail="Outbound message not found.")
 
-    repository.mark_outbound_message_sent(outbound_message_id)
-    updated_outbound_message = repository.get_outbound_message(outbound_message_id)
+    repository.mark_outbound_message_sent(
+        outbound_message_id,
+        company_id=outbound_message.get("company_id"),
+    )
+    updated_outbound_message = repository.get_outbound_message(
+        outbound_message_id,
+        company_id=outbound_message.get("company_id"),
+    )
     if not updated_outbound_message:
         raise HTTPException(status_code=404, detail="Outbound message not found after update.")
 
@@ -1225,11 +1283,17 @@ def mark_outbound_message_sent(outbound_message_id: int, request: Request) -> di
     "/outbound-messages/{outbound_message_id}/dispatch",
     dependencies=[Depends(require_admin_role("operator"))],
 )
-def dispatch_single_outbound_message(outbound_message_id: int, request: Request, channel: str = "generic") -> dict:
+def dispatch_single_outbound_message(
+    outbound_message_id: int,
+    request: Request,
+    channel: str = "generic",
+    company_id: int | None = Query(default=None),
+) -> dict:
     try:
         result = dispatch_outbound_message(
             outbound_message_id=outbound_message_id,
             channel=channel,
+            company_id=company_id,
         )
         log_event(
             logger,
@@ -1244,9 +1308,11 @@ def dispatch_single_outbound_message(outbound_message_id: int, request: Request,
             action="dispatch",
             resource_type="outbound_message",
             resource_id=str(outbound_message_id),
+            company_id=company_id,
             metadata={
                 "channel": channel,
                 "delivery_status": result.get("delivery_status"),
+                "company_id": company_id,
             },
         )
         return result
@@ -1286,9 +1352,18 @@ def dispatch_all_pending_outbound_messages(request: Request, channel: str = "gen
     "/finetuning/jobs",
     dependencies=[Depends(require_admin_role("operator"))],
 )
-def create_finetuning_job(request: Request) -> dict:
+def create_finetuning_job(
+    request: Request,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict:
+    resolved_company_id = _resolve_company_scope(
+        company_id=company_id,
+        company_slug=company_slug,
+        required=True,
+    )
     try:
-        result = _get_finetuning_service().create_finetuning_job()
+        result = _get_finetuning_service().create_finetuning_job(company_id=resolved_company_id)
         log_event(
             logger,
             logging.INFO,
@@ -1296,13 +1371,14 @@ def create_finetuning_job(request: Request) -> dict:
             job_id=result.get("job_id"),
             status=result.get("status"),
             base_model=result.get("base_model"),
+            company_id=resolved_company_id,
         )
         _record_audit_event(
             request=request,
             action="create",
             resource_type="finetuning_job",
             resource_id=str(result.get("job_id")),
-            company_id=1,
+            company_id=resolved_company_id,
             metadata={
                 "status": result.get("status"),
                 "base_model": result.get("base_model"),
@@ -1314,15 +1390,27 @@ def create_finetuning_job(request: Request) -> dict:
 
 
 @admin_router.get("/finetuning/jobs")
-def list_finetuning_jobs(limit: int = 10) -> list[dict]:
+def list_finetuning_jobs(
+    limit: int = 10,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> list[dict]:
+    resolved_company_id = _resolve_company_scope(
+        company_id=company_id,
+        company_slug=company_slug,
+    )
     try:
-        results = _get_finetuning_service().list_finetuning_jobs(limit=limit)
+        results = _get_finetuning_service().list_finetuning_jobs(
+            limit=limit,
+            company_id=resolved_company_id,
+        )
         log_event(
             logger,
             logging.INFO,
             "admin.finetuning.jobs.listed",
             limit=limit,
             results_count=len(results),
+            company_id=resolved_company_id,
         )
         return results
     except FineTuningError as exc:
@@ -1330,15 +1418,27 @@ def list_finetuning_jobs(limit: int = 10) -> list[dict]:
 
 
 @admin_router.get("/finetuning/jobs/{job_id}")
-def read_finetuning_job(job_id: str) -> dict:
+def read_finetuning_job(
+    job_id: str,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict:
+    resolved_company_id = _resolve_company_scope(
+        company_id=company_id,
+        company_slug=company_slug,
+    )
     try:
-        result = _get_finetuning_service().retrieve_finetuning_job(job_id)
+        result = _get_finetuning_service().retrieve_finetuning_job(
+            job_id,
+            company_id=resolved_company_id,
+        )
         log_event(
             logger,
             logging.INFO,
             "admin.finetuning.job.read",
             job_id=job_id,
             status=result.get("status"),
+            company_id=resolved_company_id,
         )
         return result
     except FineTuningError as exc:
@@ -1346,13 +1446,446 @@ def read_finetuning_job(job_id: str) -> dict:
 
 
 @admin_router.get("/finetuning/jobs-db")
-def read_persisted_finetuning_jobs() -> list[dict]:
-    return repository.get_finetuning_job_records()
+def read_persisted_finetuning_jobs(
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> list[dict]:
+    resolved_company_id = _resolve_company_scope(
+        company_id=company_id,
+        company_slug=company_slug,
+    )
+    return repository.get_finetuning_job_records(company_id=resolved_company_id)
 
 
 @admin_router.get("/finetuning/jobs-db/{job_id}")
-def read_persisted_finetuning_job(job_id: str) -> dict:
-    job_record = repository.get_finetuning_job_record(job_id)
+def read_persisted_finetuning_job(
+    job_id: str,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict:
+    resolved_company_id = _resolve_company_scope(
+        company_id=company_id,
+        company_slug=company_slug,
+    )
+    job_record = repository.get_finetuning_job_record(job_id, company_id=resolved_company_id)
     if not job_record:
         raise HTTPException(status_code=404, detail="Persisted fine-tuning job not found.")
     return job_record
+
+
+# ── Analytics ──────────────────────────────────────────────────────────
+
+
+@admin_router.get("/analytics/dashboard")
+def read_analytics_dashboard(
+    company_id: int | None = Query(default=None),
+    period: str = Query(default="30d"),
+) -> dict:
+    from app.services.analytics_service import AnalyticsError, get_no_show_dashboard
+
+    if period not in {"7d", "30d", "90d", "6m", "12m", "all"}:
+        raise HTTPException(status_code=400, detail="Invalid period. Use: 7d, 30d, 90d, 6m, 12m, all.")
+
+    try:
+        dashboard = get_no_show_dashboard(company_id=company_id, period=period)
+        log_event(
+            logger,
+            logging.INFO,
+            "admin.analytics.dashboard.read",
+            period=period,
+            company_id=company_id,
+            total_bookings=dashboard["kpis"]["total_bookings"],
+        )
+        return dashboard
+    except AnalyticsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post("/analytics/bookings/{booking_id}/outcome")
+def record_booking_outcome_endpoint(
+    booking_id: int,
+    payload: BookingOutcomePayload,
+    request: Request,
+) -> dict:
+    from app.services.analytics_service import AnalyticsError, record_booking_outcome
+
+    try:
+        result = record_booking_outcome(
+            booking_id,
+            outcome=payload.outcome,
+            notes=payload.notes,
+        )
+        _record_audit_event(
+            request=request,
+            action="record_outcome",
+            resource_type="appointment_booking",
+            resource_id=str(booking_id),
+            metadata={"outcome": payload.outcome},
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "admin.analytics.booking.outcome.recorded",
+            booking_id=booking_id,
+            outcome=payload.outcome,
+        )
+        return result
+    except AnalyticsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post("/analytics/bookings/{booking_id}/cancellation-reason")
+def record_cancellation_reason_endpoint(
+    booking_id: int,
+    payload: CancellationReasonPayload,
+    request: Request,
+) -> dict:
+    from app.services.analytics_service import AnalyticsError, record_cancellation_reason
+
+    try:
+        result = record_cancellation_reason(booking_id, reason=payload.reason)
+        _record_audit_event(
+            request=request,
+            action="record_cancellation_reason",
+            resource_type="appointment_booking",
+            resource_id=str(booking_id),
+            metadata={"reason": payload.reason},
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "admin.analytics.booking.cancellation_reason.recorded",
+            booking_id=booking_id,
+        )
+        return result
+    except AnalyticsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.get("/analytics/trend")
+def read_analytics_trend(
+    company_id: int | None = Query(default=None),
+    months: int = Query(default=6, ge=1, le=24),
+) -> list[dict]:
+    trend = repository.get_analytics_monthly_trend(
+        company_id=company_id,
+        months=months,
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.analytics.trend.read",
+        company_id=company_id,
+        months=months,
+        data_points=len(trend),
+    )
+    return trend
+
+
+@admin_router.get("/analytics/reminder-effectiveness")
+def read_reminder_effectiveness(
+    company_id: int | None = Query(default=None),
+    period: str = Query(default="30d"),
+) -> dict:
+    from app.services.analytics_service import _resolve_period
+
+    starts_after, starts_before = _resolve_period(period)
+    effectiveness = repository.get_analytics_reminder_effectiveness(
+        company_id=company_id,
+        starts_after=starts_after,
+        starts_before=starts_before,
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.analytics.reminder_effectiveness.read",
+        company_id=company_id,
+        period=period,
+    )
+    return effectiveness
+
+
+# ── Onboarding ─────────────────────────────────────────────────────────
+
+
+@admin_router.get("/onboarding/presets")
+def read_onboarding_presets() -> dict:
+    from app.services.onboarding_service import get_onboarding_presets
+
+    return get_onboarding_presets()
+
+
+@admin_router.post("/onboarding/setup")
+def run_onboarding_setup(
+    payload: OnboardingSetupPayload,
+    request: Request,
+) -> dict:
+    from app.services.onboarding_service import OnboardingError, setup_company
+
+    try:
+        result = setup_company(
+            company_name=payload.company_name,
+            business_type_key=payload.business_type_key,
+            segment=payload.segment,
+            company_description=payload.company_description,
+            phone=payload.phone,
+            email=payload.email,
+            instagram=payload.instagram,
+            website=payload.website,
+            timezone=payload.timezone,
+            weekday_hours=payload.weekday_hours,
+            saturday_hours=payload.saturday_hours,
+            sunday_hours=payload.sunday_hours,
+            slot_duration_minutes=payload.slot_duration_minutes,
+            minimum_notice_minutes=payload.minimum_notice_minutes,
+            reminder_offsets_days=payload.reminder_offsets_days,
+            brand_style=payload.brand_style,
+            custom_rules=payload.custom_rules,
+            services=[s.model_dump() for s in payload.services] if payload.services else None,
+            calendar_provider=payload.calendar_provider,
+            calendar_config=payload.calendar_config,
+        )
+        _record_audit_event(
+            request=request,
+            action="onboarding_setup",
+            resource_type="company",
+            resource_id=str(result["company"]["id"]),
+            metadata={
+                "company_name": payload.company_name,
+                "business_type_key": payload.business_type_key,
+            },
+        )
+        log_event(
+            logger,
+            logging.INFO,
+            "admin.onboarding.setup.completed",
+            company_name=payload.company_name,
+            business_type=payload.business_type_key,
+            company_id=result["company"]["id"],
+        )
+        return result
+    except OnboardingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.get("/onboarding/setup-status/{company_id}")
+def read_onboarding_setup_status(company_id: int) -> dict:
+    from app.services.onboarding_service import OnboardingError, get_setup_status
+
+    try:
+        return get_setup_status(company_id)
+    except OnboardingError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ── Billing ───────────────────────────────────────────────────────────
+
+
+@admin_router.get("/billing/plans")
+def read_billing_plans() -> list[dict]:
+    from app.services.billing_service import get_plans
+
+    plans = get_plans()
+    log_event(logger, logging.INFO, "admin.billing.plans.read", count=len(plans))
+    return plans
+
+
+@admin_router.post("/billing/trial")
+def start_billing_trial(
+    request: Request,
+    company_id: int = Query(...),
+) -> dict:
+    from app.services.billing_service import BillingError, start_trial
+
+    try:
+        result = start_trial(company_id)
+        _record_audit_event(
+            request=request,
+            action="start_trial",
+            resource_type="billing_subscription",
+            resource_id=str(result["subscription_id"]),
+            company_id=company_id,
+            metadata={"plan_key": result["plan_key"], "trial_days": result["trial_days"]},
+        )
+        log_event(
+            logger, logging.INFO, "admin.billing.trial.started",
+            company_id=company_id, subscription_id=result["subscription_id"],
+        )
+        return result
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post("/billing/activate")
+def activate_billing_subscription(
+    payload: SubscriptionActivatePayload,
+    request: Request,
+    company_id: int = Query(...),
+) -> dict:
+    from app.services.billing_service import BillingError, activate_subscription
+
+    try:
+        result = activate_subscription(
+            company_id=company_id,
+            plan_key=payload.plan_key,
+            billing_cycle=payload.billing_cycle,
+        )
+        _record_audit_event(
+            request=request,
+            action="activate",
+            resource_type="billing_subscription",
+            resource_id=str(result["subscription_id"]),
+            company_id=company_id,
+            metadata={
+                "plan_key": payload.plan_key,
+                "billing_cycle": payload.billing_cycle,
+                "price_monthly": result["price_monthly"],
+            },
+        )
+        log_event(
+            logger, logging.INFO, "admin.billing.subscription.activated",
+            company_id=company_id, plan_key=payload.plan_key,
+            billing_cycle=payload.billing_cycle,
+        )
+        return result
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post("/billing/cancel")
+def cancel_billing_subscription(
+    payload: CancelSubscriptionPayload,
+    request: Request,
+    company_id: int = Query(...),
+) -> dict:
+    from app.services.billing_service import BillingError, cancel_subscription
+
+    try:
+        result = cancel_subscription(company_id=company_id, reason=payload.reason)
+        _record_audit_event(
+            request=request,
+            action="cancel",
+            resource_type="billing_subscription",
+            resource_id=str(result["subscription_id"]),
+            company_id=company_id,
+            metadata={"reason": payload.reason},
+        )
+        log_event(
+            logger, logging.INFO, "admin.billing.subscription.cancelled",
+            company_id=company_id, subscription_id=result["subscription_id"],
+        )
+        return result
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post("/billing/reactivate")
+def reactivate_billing_subscription(
+    payload: ReactivateSubscriptionPayload,
+    request: Request,
+    company_id: int = Query(...),
+) -> dict:
+    from app.services.billing_service import BillingError, reactivate_subscription
+
+    try:
+        result = reactivate_subscription(
+            company_id=company_id,
+            plan_key=payload.plan_key,
+            billing_cycle=payload.billing_cycle,
+        )
+        _record_audit_event(
+            request=request,
+            action="reactivate",
+            resource_type="billing_subscription",
+            resource_id=str(result["subscription_id"]),
+            company_id=company_id,
+            metadata={
+                "plan_key": result["plan_key"],
+                "billing_cycle": result["billing_cycle"],
+            },
+        )
+        log_event(
+            logger, logging.INFO, "admin.billing.subscription.reactivated",
+            company_id=company_id, plan_key=result["plan_key"],
+        )
+        return result
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post("/billing/change-plan")
+def change_billing_plan(
+    payload: PlanChangePayload,
+    request: Request,
+    company_id: int = Query(...),
+) -> dict:
+    from app.services.billing_service import BillingError, change_plan
+
+    try:
+        result = change_plan(company_id=company_id, new_plan_key=payload.new_plan_key)
+        _record_audit_event(
+            request=request,
+            action="change_plan",
+            resource_type="billing_subscription",
+            resource_id=str(result["subscription_id"]),
+            company_id=company_id,
+            metadata={
+                "old_plan": result["old_plan"],
+                "new_plan": result["new_plan"],
+                "price_monthly": result["price_monthly"],
+            },
+        )
+        log_event(
+            logger, logging.INFO, "admin.billing.plan.changed",
+            company_id=company_id,
+            old_plan=result["old_plan"], new_plan=result["new_plan"],
+        )
+        return result
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.get("/billing/usage")
+def read_billing_usage(company_id: int = Query(...)) -> dict:
+    from app.services.billing_service import get_usage_dashboard
+
+    dashboard = get_usage_dashboard(company_id)
+    log_event(
+        logger, logging.INFO, "admin.billing.usage.read",
+        company_id=company_id,
+        has_subscription=dashboard["has_subscription"],
+    )
+    return dashboard
+
+
+@admin_router.post("/billing/usage/record")
+def record_billing_usage(
+    payload: UsageRecordPayload,
+    request: Request,
+    company_id: int = Query(...),
+) -> dict:
+    from app.services.billing_service import BillingError, record_usage
+
+    try:
+        result = record_usage(
+            company_id=company_id,
+            metric=payload.metric,
+            quantity=payload.quantity,
+        )
+        log_event(
+            logger, logging.INFO, "admin.billing.usage.recorded",
+            company_id=company_id, metric=payload.metric, quantity=payload.quantity,
+        )
+        return result
+    except BillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.get("/billing/check-limit")
+def check_billing_limit(
+    company_id: int = Query(...),
+    metric: str = Query(...),
+) -> dict:
+    from app.services.billing_service import check_limit
+
+    return check_limit(company_id=company_id, metric=metric)

@@ -1,4 +1,3 @@
-import json
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -7,7 +6,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.company_context import get_company_context
-from app.core.config import settings
+from app.core.config import is_missing_or_placeholder, settings
 from app.services.reminder_service import schedule_booking_customer_reminders
 from app.storage.repository import RuntimeRepository
 
@@ -62,6 +61,11 @@ class BusyInterval:
 
 def _get_timezone() -> ZoneInfo:
     return ZoneInfo(settings.calendar_timezone)
+
+
+def _has_real_provider_value(value: Any) -> bool:
+    normalized = str(value or "").strip()
+    return bool(normalized) and not is_missing_or_placeholder(normalized)
 
 
 def _resolve_company_context(company_id: int | None) -> dict[str, Any]:
@@ -632,16 +636,24 @@ class GoogleCalendarProvider(BaseCalendarProvider):
 
     def readiness(self) -> dict[str, Any]:
         config = self.integration.get("config") or {}
+        calendar_id = config.get("calendar_id") or self.integration.get("external_calendar_id") or settings.google_calendar_id
+        client_id = config.get("client_id") or settings.google_calendar_client_id
+        client_secret = config.get("client_secret") or settings.google_calendar_client_secret
+        refresh_token = config.get("refresh_token") or settings.google_calendar_refresh_token
         ready = bool(
-            (config.get("calendar_id") or self.integration.get("external_calendar_id") or settings.google_calendar_id)
-            and (config.get("client_id") or settings.google_calendar_client_id)
-            and (config.get("client_secret") or settings.google_calendar_client_secret)
-            and (config.get("refresh_token") or settings.google_calendar_refresh_token)
+            _has_real_provider_value(calendar_id)
+            and _has_real_provider_value(client_id)
+            and _has_real_provider_value(client_secret)
+            and _has_real_provider_value(refresh_token)
         )
         return {
             "provider": self.provider_name,
             "ready": ready,
-            "details": "Credenciais Google Calendar encontradas." if ready else "Faltam credenciais do Google Calendar.",
+            "details": (
+                "Credenciais Google Calendar encontradas."
+                if ready
+                else "Faltam credenciais reais do Google Calendar."
+            ),
         }
 
     def list_busy_intervals(self, window_start: datetime, window_end: datetime) -> list[BusyInterval]:
@@ -783,14 +795,18 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
     def readiness(self) -> dict[str, Any]:
         config = self.integration.get("config") or {}
         ready = bool(
-            (config.get("url") or settings.caldav_url)
-            and (config.get("username") or settings.caldav_username)
-            and (config.get("password") or settings.caldav_password)
+            _has_real_provider_value(config.get("url") or settings.caldav_url)
+            and _has_real_provider_value(config.get("username") or settings.caldav_username)
+            and _has_real_provider_value(config.get("password") or settings.caldav_password)
         )
         return {
             "provider": self.provider_name,
             "ready": ready,
-            "details": "Credenciais CalDAV encontradas." if ready else "Faltam credenciais do servidor CalDAV.",
+            "details": (
+                "Credenciais CalDAV encontradas."
+                if ready
+                else "Faltam credenciais reais do servidor CalDAV."
+            ),
         }
 
     def list_busy_intervals(self, window_start: datetime, window_end: datetime) -> list[BusyInterval]:
@@ -1313,25 +1329,37 @@ def _sync_booking_cancellation(
 def cancel_calendar_booking(
     *,
     booking_id: int,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
-    booking = repository.get_appointment_booking(booking_id)
+    booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
         raise CalendarProviderError("Booking not found.")
     if str(booking.get("status") or "") not in {"confirmed", "pending"}:
         raise CalendarProviderError("Only confirmed or pending bookings can be cancelled.")
 
-    integration = _resolve_calendar_integration(company_id=booking.get("company_id"))
+    booking_company_id = booking.get("company_id")
+    integration = _resolve_calendar_integration(company_id=booking_company_id)
     provider = _get_provider(integration)
     external_sync = _sync_booking_cancellation(
         booking=booking,
         provider=provider,
         integration=integration,
     )
-    repository.update_appointment_booking_status(booking_id, "cancelled")
-    cancelled_reminders = repository.cancel_customer_reminders_for_booking(booking_id)
+    repository.update_appointment_booking_status(
+        booking_id,
+        "cancelled",
+        company_id=booking_company_id,
+    )
+    cancelled_reminders = repository.cancel_customer_reminders_for_booking(
+        booking_id,
+        company_id=booking_company_id,
+    )
 
     return {
-        "booking": repository.get_appointment_booking(booking_id),
+        "booking": repository.get_appointment_booking(
+            booking_id,
+            company_id=booking_company_id,
+        ),
         "cancelled_reminders": cancelled_reminders,
         "external_sync": external_sync,
     }
@@ -1348,8 +1376,9 @@ def reschedule_calendar_booking(
     scheduling_profile_key: str | None = None,
     customer_profile: str | None = None,
     request_context: str | None = None,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
-    booking = repository.get_appointment_booking(booking_id)
+    booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
         raise CalendarProviderError("Booking not found.")
     if str(booking.get("status") or "") not in {"confirmed", "pending"}:
@@ -1413,9 +1442,13 @@ def reschedule_calendar_booking(
         customer_profile=str(resolved_customer_profile) if resolved_customer_profile is not None else None,
         title=resolved_title,
         description=str(resolved_description) if resolved_description is not None else None,
+        company_id=company_id,
     )
-    cancelled_reminders = repository.cancel_customer_reminders_for_booking(booking_id)
-    updated_booking = repository.get_appointment_booking(booking_id)
+    cancelled_reminders = repository.cancel_customer_reminders_for_booking(
+        booking_id,
+        company_id=company_id,
+    )
+    updated_booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not updated_booking:
         raise CalendarProviderError("Booking not found after reschedule.")
     scheduled_reminders = schedule_booking_customer_reminders(updated_booking)
@@ -1453,7 +1486,10 @@ def create_calendar_integration(
         config=config,
         active=active,
     )
-    integration = repository.get_calendar_integration(integration_id)
+    integration = repository.get_calendar_integration(
+        integration_id,
+        company_id=company_id,
+    )
     if not integration:
         raise CalendarProviderError("Calendar integration not found after creation.")
     return integration

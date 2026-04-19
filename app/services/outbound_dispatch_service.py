@@ -82,6 +82,8 @@ def _send_via_provider(channel: str, outbound_message: dict[str, Any]) -> dict[s
 def dispatch_outbound_message(
     outbound_message_id: int,
     channel: str | None = None,
+    *,
+    company_id: int | None = None,
 ) -> dict[str, Any]:
     normalized_channel = _normalize_channel(channel)
     log_event(
@@ -91,7 +93,10 @@ def dispatch_outbound_message(
         outbound_message_id=outbound_message_id,
         channel=normalized_channel,
     )
-    outbound_message = repository.get_outbound_message(outbound_message_id)
+    outbound_message = repository.get_outbound_message(
+        outbound_message_id,
+        company_id=company_id,
+    )
 
     if not outbound_message:
         raise OutboundDispatchError("Outbound message not found.")
@@ -116,8 +121,15 @@ def dispatch_outbound_message(
         outbound_message=outbound_message,
     )
 
-    repository.mark_outbound_message_sent(outbound_message_id)
-    updated_outbound_message = repository.get_outbound_message(outbound_message_id)
+    outbound_company_id = outbound_message.get("company_id")
+    repository.mark_outbound_message_sent(
+        outbound_message_id,
+        company_id=outbound_company_id,
+    )
+    updated_outbound_message = repository.get_outbound_message(
+        outbound_message_id,
+        company_id=outbound_company_id,
+    )
     if not updated_outbound_message:
         raise OutboundDispatchError("Outbound message not found after dispatch update.")
 
@@ -141,9 +153,11 @@ def dispatch_outbound_message(
 
 def dispatch_pending_outbound_messages(
     channel: str | None = None,
+    *,
+    company_id: int | None = None,
 ) -> list[dict[str, Any]]:
     normalized_channel = _normalize_channel(channel)
-    outbound_messages = repository.get_outbound_messages()
+    outbound_messages = repository.get_outbound_messages(company_id=company_id)
     pending_messages = [
         message for message in outbound_messages if message.get("status") == "pending"
     ]
@@ -154,6 +168,7 @@ def dispatch_pending_outbound_messages(
             dispatch_outbound_message(
                 outbound_message_id=int(pending_message["id"]),
                 channel=normalized_channel,
+                company_id=company_id,
             )
         )
 

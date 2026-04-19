@@ -61,6 +61,9 @@ const ICONS = {
   target: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
   handoff: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 11V7a5 5 0 0 0-10 0v4"/><rect x="5" y="11" width="14" height="10" rx="2"/></svg>',
   tag: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4L13.4 20.6a2 2 0 0 1-2.8 0l-8.2-8.2V2h10.4l8.2 8.2a2 2 0 0 1 0 2.8z"/><circle cx="7.5" cy="7.5" r="1.2"/></svg>',
+  menu: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12h18M3 6h18M3 18h18"/></svg>',
+  close: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>',
+  bell: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>',
 }
 
 const FLOW_NODE_TEMPLATES = [
@@ -96,11 +99,14 @@ const FLOW_NODE_TEMPLATES = [
 
 const NAV_ITEMS = [
   { key: "dashboard", label: "Control Tower", caption: "Readiness e postura operacional", icon: "dashboard" },
+  { key: "analytics", label: "Analytics", caption: "No-show, lembretes e funil", icon: "target" },
   { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
   { key: "flows", label: "Flow Studio", caption: "Pipelines, playbooks e respostas", icon: "flow" },
   { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
   { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
   { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
+  { key: "billing", label: "Billing", caption: "Planos, uso e assinatura", icon: "tag" },
+  { key: "onboarding", label: "Setup Wizard", caption: "Configurar nova empresa", icon: "spark" },
 ]
 
 const DEFAULT_PIPELINES = [
@@ -146,6 +152,7 @@ const state = {
   loading: false,
   loadingMessage: "",
   settingsOpen: false,
+  mobileMenuOpen: false,
   manualBookingOpen: false,
   connected: false,
   session: null,
@@ -167,6 +174,36 @@ const state = {
   contacts: [],
   trainingReview: null,
   finetuningJobs: [],
+  analyticsDashboard: null,
+  analyticsPeriod: "30d",
+  onboardingPresets: null,
+  onboardingWizard: {
+    step: 0,
+    completed: false,
+    result: null,
+    draft: {
+      company_name: "",
+      business_type_key: "",
+      segment: "",
+      company_description: "",
+      phone: "",
+      email: "",
+      instagram: "",
+      website: "",
+      timezone: "America/Sao_Paulo",
+      weekday_hours: "08:00-18:00",
+      saturday_hours: "09:00-12:00",
+      sunday_hours: "fechado",
+      slot_duration_minutes: 60,
+      minimum_notice_minutes: 120,
+      reminder_offsets_days: "2,1",
+      brand_style: "",
+      custom_rules: "",
+      services: [],
+    },
+  },
+  billingPlans: null,
+  billingUsage: null,
   trainingImportResult: null,
   availabilityResult: null,
   simulator: {
@@ -502,9 +539,13 @@ async function logoutPlatformSession() {
   state.connected = false
 }
 
-async function loadCompanies() {
+let _companiesLoaded = false
+
+async function loadCompanies(force = false) {
+  if (_companiesLoaded && state.companies.length > 0 && !force) return
   const companies = await apiRequest("/admin/companies")
   state.companies = Array.isArray(companies) ? companies : []
+  _companiesLoaded = true
 
   const selected = getSelectedCompany()
   if (!selected && state.companies.length > 0 && !state.config.companySlug) {
@@ -529,6 +570,29 @@ async function loadDashboardData() {
   state.readiness = readiness
   state.systemProfile = systemProfile
   state.onboarding = onboarding
+}
+
+async function loadAnalyticsData() {
+  await loadCompanies()
+  const params = { ...getCompanyParams(), period: state.analyticsPeriod }
+  const dashboard = await apiRequest("/admin/analytics/dashboard", { params })
+  state.analyticsDashboard = dashboard
+}
+
+async function loadOnboardingData() {
+  if (!state.onboardingPresets) {
+    state.onboardingPresets = await apiRequest("/admin/onboarding/presets")
+  }
+}
+
+async function loadBillingData() {
+  const companyId = state.config.companyId || 1
+  const [plans, usage] = await Promise.all([
+    apiRequest("/admin/billing/plans"),
+    apiRequest("/admin/billing/usage", { params: { company_id: companyId } }),
+  ])
+  state.billingPlans = plans
+  state.billingUsage = usage
 }
 
 async function loadStudioData() {
@@ -598,7 +662,10 @@ async function loadTrainingData() {
       params: getAdminCompanyParams(),
     }),
     apiRequest("/admin/finetuning/jobs", {
-      params: { limit: 10 },
+      params: {
+        ...getAdminCompanyParams(),
+        limit: 10,
+      },
     }),
   ])
   state.trainingReview = safeJsonParse(reviewPayload?.dataset || "{}", {})
@@ -627,14 +694,32 @@ function ensureConversationPipelines(context) {
   return normalizedContext
 }
 
+let _refreshInFlight = null
+
 async function refreshCurrentView({ silent = false } = {}) {
-  state.loading = !silent
-  state.loadingMessage = viewLoadingLabel(state.view)
-  renderApp()
+  // Deduplicate: if a refresh is already running, return the same promise
+  if (_refreshInFlight) return _refreshInFlight
+  _refreshInFlight = _doRefreshCurrentView({ silent })
+  try { return await _refreshInFlight } finally { _refreshInFlight = null }
+}
+
+async function _doRefreshCurrentView({ silent = false } = {}) {
+  if (!silent) {
+    state.loading = true
+    state.loadingMessage = viewLoadingLabel(state.view)
+    // Don't re-render the whole page — just inject the loading banner
+    const existingBanner = document.querySelector(".loading-banner")
+    if (!existingBanner) {
+      const bannerHtml = renderLoadingBanner()
+      if (bannerHtml) root.insertAdjacentHTML("beforeend", bannerHtml)
+    }
+  }
 
   try {
     if (state.view === "dashboard") {
       await loadDashboardData()
+    } else if (state.view === "analytics") {
+      await loadAnalyticsData()
     } else if (state.view === "studio") {
       await loadCompanies()
       await loadStudioData()
@@ -650,6 +735,10 @@ async function refreshCurrentView({ silent = false } = {}) {
     } else if (state.view === "training") {
       await loadCompanies()
       await loadTrainingData()
+    } else if (state.view === "billing") {
+      await loadBillingData()
+    } else if (state.view === "onboarding") {
+      await loadOnboardingData()
     }
     state.connected = true
     state.errorMessage = ""
@@ -670,6 +759,9 @@ async function refreshCurrentView({ silent = false } = {}) {
 
 function viewLoadingLabel(view) {
   if (view === "dashboard") return "Carregando panorama operacional..."
+  if (view === "analytics") return "Calculando métricas de no-show e agendamento..."
+  if (view === "billing") return "Carregando planos e uso..."
+  if (view === "onboarding") return "Preparando wizard de configuração..."
   if (view === "studio") return "Abrindo ambiente de simulação..."
   if (view === "flows") return "Montando playbooks e respostas aprovadas..."
   if (view === "agenda") return "Buscando agenda e fila de prioridade..."
@@ -712,20 +804,23 @@ function renderTopbar() {
 
   return `
     <header class="topbar">
-      <div>
-        <h1 class="topbar-title">${renderViewTitle()}</h1>
-        <p class="topbar-copy">${renderViewCopy()}</p>
+      <div class="topbar-left">
+        <button class="button-icon mobile-menu-toggle" id="mobile-menu-toggle" aria-label="Abrir menu">${ICONS.menu}</button>
+        <div>
+          <h1 class="topbar-title">${renderViewTitle()}</h1>
+          <p class="topbar-copy topbar-copy-desktop">${renderViewCopy()}</p>
+        </div>
       </div>
       <div class="topbar-controls">
         ${renderReadinessPill()}
-        <label class="pill">
+        <label class="pill pill-desktop">
           <span>Empresa</span>
           <select id="company-select" style="background: transparent; border: 0; color: inherit;">
             ${scopeOptions}
           </select>
         </label>
-        <span class="pill"><strong>Sessão</strong>${escapeHtml(sessionRole)}</span>
-        <span class="pill"><strong>Escopo</strong>${escapeHtml(getCompanyScopeLabel())}</span>
+        <span class="pill pill-desktop"><strong>Sessão</strong>${escapeHtml(sessionRole)}</span>
+        <span class="pill pill-desktop"><strong>Escopo</strong>${escapeHtml(getCompanyScopeLabel())}</span>
         <button class="button-ghost" id="open-settings">${state.session ? "Sessão" : "Entrar"}</button>
         ${state.session ? '<button class="button-danger" id="logout-session">Sair</button>' : ""}
       </div>
@@ -735,6 +830,9 @@ function renderTopbar() {
 
 function renderViewTitle() {
   if (state.view === "dashboard") return "Uma camada premium para operar o bot como produto"
+  if (state.view === "analytics") return "Analytics de no-show, lembretes e funil de agendamento"
+  if (state.view === "billing") return "Billing — planos, assinatura e consumo"
+  if (state.view === "onboarding") return "Setup Wizard — configure uma nova empresa passo a passo"
   if (state.view === "studio") return "Bot Studio para testar conversa real antes de publicar"
   if (state.view === "flows") return "Flow Studio para lapidar regras, playbooks e respostas"
   if (state.view === "agenda") return "Agenda Console com controle manual e visão operacional"
@@ -745,6 +843,9 @@ function renderViewTitle() {
 
 function renderViewCopy() {
   if (state.view === "dashboard") return "Readiness, observabilidade, onboarding e comando central da operação."
+  if (state.view === "analytics") return "Meça impacto real: taxa de no-show, eficácia dos lembretes e recuperação via fila."
+  if (state.view === "billing") return "Gerencie plano, acompanhe limites de uso e controle sua assinatura."
+  if (state.view === "onboarding") return "Preencha os dados, configure horários e ative o bot em minutos."
   if (state.view === "studio") return "Simule cliente, operador e fluxos de agendamento na mesma interface."
   if (state.view === "flows") return "Desenhe a experiência do bot, organize pipelines e promova mensagens aprovadas."
   if (state.view === "agenda") return "Monitore disponibilidade, bookings, remanejamento e ajustes manuais."
@@ -754,8 +855,18 @@ function renderViewCopy() {
 }
 
 function renderSidebar() {
+  const openClass = state.mobileMenuOpen ? "sidebar-open" : ""
   return `
-    <aside class="sidebar">
+    ${state.mobileMenuOpen ? '<div class="sidebar-overlay" id="sidebar-overlay"></div>' : ''}
+    <aside class="sidebar ${openClass}">
+      <div class="sidebar-mobile-header">
+        <div class="brand-logo">
+          <span class="brand-logo-mark">${ICONS.spark}</span>
+          <span>WAPP</span>
+        </div>
+        <button class="button-icon sidebar-close-btn" id="sidebar-close" aria-label="Fechar menu">${ICONS.close}</button>
+      </div>
+
       <div class="brand-card">
         <div class="brand-logo">
           <span class="brand-logo-mark">${ICONS.spark}</span>
@@ -784,7 +895,7 @@ function renderSidebar() {
       </nav>
 
       <div class="sidebar-footnote">
-        Streamlit continua como contingência. Superfície principal é <span class="mono">/platform</span>.
+        v1.0 · Superfície principal <span class="mono">/platform</span>
       </div>
     </aside>
   `
@@ -928,6 +1039,974 @@ function renderDashboardView() {
           <div class="meta-row">
             <span class="meta-chip">Exemplos elegíveis: ${formatNumber(state.onboarding?.finetuning_readiness?.eligible_examples_count || 0)}</span>
             <span class="meta-chip">Mensagens: ${formatNumber(state.onboarding?.operational_snapshot?.counts?.messages || 0)}</span>
+          </div>
+        </div>
+      </article>
+    </section>
+  `
+}
+
+// ── Onboarding Wizard ──────────────────────────────────────────────────
+
+// ── Billing View ────────────────────────────────────────────────────────
+
+function billingUsageBar(metric, label, used, limit) {
+  if (limit <= 0) return ""
+  const pct = Math.min(Math.round((used / limit) * 100), 100)
+  const tone = pct >= 100 ? "danger" : pct >= 80 ? "warn" : "success"
+  return `
+    <div class="billing-usage-row">
+      <div class="billing-usage-header">
+        <span class="billing-usage-label">${escapeHtml(label)}</span>
+        <span class="billing-usage-numbers">${formatNumber(used)} / ${formatNumber(limit)}</span>
+      </div>
+      <div class="billing-usage-track">
+        <div class="billing-usage-fill billing-usage-${tone}" style="width:${pct}%"></div>
+      </div>
+      <span class="billing-usage-pct billing-usage-${tone}">${pct}%</span>
+    </div>
+  `
+}
+
+function renderBillingPlanCards(plans, currentPlanKey, billingCycle) {
+  if (!plans || plans.length === 0) return '<div class="empty-state">Nenhum plano disponível.</div>'
+
+  const sorted = [...plans].sort((a, b) => (a.display_order || 0) - (b.display_order || 0))
+
+  return `
+    <div class="billing-plans-grid">
+      ${sorted.map(p => {
+        const isCurrent = p.plan_key === currentPlanKey
+        const price = billingCycle === "annual" ? p.price_annual_monthly : p.price_monthly
+        const limits = p.limits || {}
+        return `
+          <div class="billing-plan-card ${isCurrent ? 'billing-plan-current' : ''}">
+            ${isCurrent ? '<span class="billing-plan-badge">Plano atual</span>' : ''}
+            <h4 class="billing-plan-name">${escapeHtml(p.name)}</h4>
+            <div class="billing-plan-price">
+              <span class="billing-plan-amount">R$ ${price.toLocaleString("pt-BR", { minimumFractionDigits: 2 })}</span>
+              <span class="billing-plan-period">/mês</span>
+            </div>
+            <ul class="billing-plan-features">
+              <li>${formatNumber(limits.messages || 0)} mensagens</li>
+              <li>${formatNumber(limits.bookings || 0)} agendamentos</li>
+              <li>${formatNumber(limits.outbound_campaigns || 0)} campanhas</li>
+              <li>${formatNumber(limits.classified_contacts || 0)} contatos classificados</li>
+              <li>${formatNumber(limits.handoffs || 0)} handoffs</li>
+              <li>${limits.reminders_per_booking || 0} lembretes/agendamento</li>
+              <li>${limits.finetuning_jobs || 0} fine-tuning/mês</li>
+              ${p.features?.priority_support ? '<li>Suporte prioritário</li>' : ''}
+              ${p.features?.dedicated_support ? '<li>Suporte dedicado</li>' : ''}
+            </ul>
+            ${!isCurrent ? `<button class="button billing-change-plan-btn" data-plan-key="${escapeHtml(p.plan_key)}">Selecionar</button>` : ''}
+          </div>
+        `
+      }).join("")}
+    </div>
+  `
+}
+
+function renderBillingView() {
+  const usage = state.billingUsage
+  const plans = state.billingPlans
+
+  if (!usage) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Billing</span>
+        <h2 class="hero-title">Carregando planos e uso...</h2>
+        <div class="hero-actions">
+          <button class="button-ghost" data-refresh-view>Atualizar</button>
+        </div>
+      </section>
+      ${renderSkeletonCards(2)}
+    `
+  }
+
+  if (!usage.has_subscription) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Billing</span>
+        <h2 class="hero-title">Nenhuma assinatura ativa.</h2>
+        <p class="hero-copy">Inicie um trial gratuito de 7 dias para testar o plano Avançado completo, sem cartão de crédito.</p>
+        <div class="hero-actions">
+          <button class="button" id="billing-start-trial">Iniciar trial gratuito</button>
+        </div>
+      </section>
+
+      <section class="grid-one">
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Planos disponíveis</h3>
+              <p class="card-copy">Escolha o plano ideal para o volume do seu negócio.</p>
+            </div>
+          </div>
+          ${renderBillingPlanCards(plans, null, "monthly")}
+        </article>
+      </section>
+    `
+  }
+
+  const sub = usage.subscription || {}
+  const usageData = usage.usage || {}
+  const alerts = usage.alerts || []
+  const features = usage.features || {}
+  const billingCycle = sub.billing_cycle || "monthly"
+
+  const METRIC_LABELS = {
+    messages: "Mensagens",
+    bookings: "Agendamentos",
+    outbound_campaigns: "Campanhas",
+    handoffs: "Handoffs",
+    finetuning_jobs: "Fine-tuning",
+  }
+
+  const statusLabels = {
+    trial: "Trial",
+    active: "Ativa",
+    cancelled: "Cancelada",
+  }
+  const statusTone = {
+    trial: "tag-warn",
+    active: "tag-success",
+    cancelled: "tag-danger",
+  }
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">Billing</span>
+      <h2 class="hero-title">Gerencie sua assinatura e acompanhe o consumo.</h2>
+      <p class="hero-copy">Plano, ciclo de cobrança, limites de uso e alertas em um só lugar.</p>
+      <div class="hero-actions">
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
+      </div>
+    </section>
+
+    ${alerts.length > 0 ? `
+      <section class="grid-one">
+        <article class="card billing-alerts-card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Alertas de uso</h3>
+            </div>
+          </div>
+          <div class="billing-alerts">
+            ${alerts.map(a => `
+              <div class="billing-alert billing-alert-${a.type === 'exceeded' ? 'danger' : 'warn'}">
+                <span>${escapeHtml(a.message)}</span>
+              </div>
+            `).join("")}
+          </div>
+        </article>
+      </section>
+    ` : ''}
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Assinatura</h3>
+            <p class="card-copy">Detalhes do plano e ciclo atual.</p>
+          </div>
+          <span class="tag ${statusTone[sub.status] || ''}">${escapeHtml(statusLabels[sub.status] || sub.status)}</span>
+        </div>
+        <div class="billing-sub-details">
+          <div class="billing-detail-row">
+            <span>Plano</span>
+            <strong>${escapeHtml(sub.plan_name || sub.plan_key)}</strong>
+          </div>
+          <div class="billing-detail-row">
+            <span>Ciclo</span>
+            <strong>${billingCycle === "annual" ? "Anual (fidelidade)" : "Mensal"}</strong>
+          </div>
+          <div class="billing-detail-row">
+            <span>Valor</span>
+            <strong>R$ ${(sub.price_monthly || 0).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}/mês</strong>
+          </div>
+          ${sub.trial_days_remaining !== null && sub.trial_days_remaining !== undefined ? `
+            <div class="billing-detail-row">
+              <span>Trial expira em</span>
+              <strong>${sub.trial_days_remaining} dia${sub.trial_days_remaining !== 1 ? 's' : ''}</strong>
+            </div>
+          ` : ''}
+          <div class="billing-detail-row">
+            <span>Período atual até</span>
+            <strong>${sub.current_period_end ? new Date(sub.current_period_end).toLocaleDateString("pt-BR") : '-'}</strong>
+          </div>
+        </div>
+        <div class="billing-sub-actions">
+          ${sub.status !== "cancelled" ? `<button class="button-ghost billing-cancel-btn" id="billing-cancel">Cancelar assinatura</button>` : ''}
+          ${sub.status === "cancelled" ? `<button class="button" id="billing-reactivate">Reativar assinatura</button>` : ''}
+          ${sub.status === "trial" ? `<button class="button" id="billing-activate">Ativar plano</button>` : ''}
+          ${sub.expired ? `<span class="tag tag-danger">Expirada</span>` : ''}
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Consumo do período</h3>
+            <p class="card-copy">Uso acumulado dentro do ciclo atual.</p>
+          </div>
+        </div>
+        <div class="billing-usage-list">
+          ${Object.entries(usageData).map(([metric, data]) => {
+            const label = METRIC_LABELS[metric] || metric
+            return billingUsageBar(metric, label, data.used, data.limit)
+          }).join("")}
+        </div>
+      </article>
+    </section>
+
+    <section class="grid-one">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Planos disponíveis</h3>
+            <p class="card-copy">Compare os planos e faça upgrade ou downgrade quando quiser.</p>
+          </div>
+        </div>
+        ${renderBillingPlanCards(plans, sub.plan_key, billingCycle)}
+      </article>
+    </section>
+  `
+}
+
+const ONBOARDING_STEPS = [
+  { key: "business", label: "Dados do negócio", icon: "tag" },
+  { key: "hours", label: "Horário de atendimento", icon: "clock" },
+  { key: "scheduling", label: "Agenda e lembretes", icon: "calendar" },
+  { key: "services", label: "Serviços", icon: "studio" },
+  { key: "review", label: "Revisar e ativar", icon: "check" },
+]
+
+function renderOnboardingStepIndicator() {
+  const current = state.onboardingWizard.step
+  return `
+    <div class="wizard-steps">
+      ${ONBOARDING_STEPS.map((s, i) => `
+        <div class="wizard-step ${i === current ? 'active' : ''} ${i < current ? 'done' : ''}">
+          <span class="wizard-step-num">${i < current ? ICONS.check : i + 1}</span>
+          <span class="wizard-step-label">${s.label}</span>
+        </div>
+        ${i < ONBOARDING_STEPS.length - 1 ? '<div class="wizard-step-line"></div>' : ''}
+      `).join("")}
+    </div>
+  `
+}
+
+function renderOnboardingStep0() {
+  const d = state.onboardingWizard.draft
+  const presets = state.onboardingPresets?.business_types || {}
+  const typeEntries = Object.entries(presets)
+
+  return `
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Tipo de negócio</h3>
+      <p class="wizard-section-copy">Selecione o que mais se aproxima. Isso pré-configura módulos e catálogo.</p>
+      <div class="wizard-type-grid">
+        ${typeEntries.map(([key, info]) => `
+          <button class="wizard-type-card ${d.business_type_key === key ? 'selected' : ''}" data-onboarding-type="${key}">
+            <span class="wizard-type-icon">${ICONS[key === "clinica" ? "target" : key === "salao" ? "spark" : key === "escritorio" ? "tag" : key === "academia" ? "refresh" : "dashboard"]}</span>
+            <span class="wizard-type-label">${escapeHtml(info.label)}</span>
+          </button>
+        `).join("")}
+      </div>
+    </div>
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Dados da empresa</h3>
+      <div class="form-grid-two">
+        <div class="field">
+          <label>Nome da empresa *</label>
+          <input name="company_name" value="${escapeHtml(d.company_name)}" placeholder="Ex: Clínica Dra. Maria" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Segmento</label>
+          <input name="segment" value="${escapeHtml(d.segment)}" placeholder="Ex: Odontologia, Estética" data-onboarding-field />
+        </div>
+        <div class="field" style="grid-column: 1 / -1">
+          <label>Descrição breve</label>
+          <input name="company_description" value="${escapeHtml(d.company_description)}" placeholder="Uma frase sobre o que sua empresa faz" data-onboarding-field />
+        </div>
+      </div>
+    </div>
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Contato</h3>
+      <div class="form-grid-two">
+        <div class="field">
+          <label>Telefone / WhatsApp</label>
+          <input name="phone" value="${escapeHtml(d.phone)}" placeholder="+55 62 99999-9999" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Email</label>
+          <input name="email" value="${escapeHtml(d.email)}" placeholder="contato@empresa.com" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Instagram</label>
+          <input name="instagram" value="${escapeHtml(d.instagram)}" placeholder="@empresa" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Website</label>
+          <input name="website" value="${escapeHtml(d.website)}" placeholder="https://www.empresa.com" data-onboarding-field />
+        </div>
+      </div>
+    </div>
+  `
+}
+
+function renderOnboardingStep1() {
+  const d = state.onboardingWizard.draft
+  const timezones = state.onboardingPresets?.timezones || ["America/Sao_Paulo"]
+
+  return `
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Fuso horário</h3>
+      <div class="field">
+        <label>Timezone</label>
+        <select name="timezone" data-onboarding-field>
+          ${timezones.map(tz => `<option value="${tz}" ${d.timezone === tz ? "selected" : ""}>${tz}</option>`).join("")}
+        </select>
+      </div>
+    </div>
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Horários de funcionamento</h3>
+      <p class="wizard-section-copy">Use o formato HH:MM-HH:MM ou "fechado".</p>
+      <div class="form-grid-three">
+        <div class="field">
+          <label>Segunda a sexta</label>
+          <input name="weekday_hours" value="${escapeHtml(d.weekday_hours)}" placeholder="08:00-18:00" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Sábado</label>
+          <input name="saturday_hours" value="${escapeHtml(d.saturday_hours)}" placeholder="09:00-12:00" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Domingo</label>
+          <input name="sunday_hours" value="${escapeHtml(d.sunday_hours)}" placeholder="fechado" data-onboarding-field />
+        </div>
+      </div>
+    </div>
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Tom da marca</h3>
+      <div class="field">
+        <label>Estilo de comunicação</label>
+        <input name="brand_style" value="${escapeHtml(d.brand_style)}" placeholder="Ex: profissional e acolhedor" data-onboarding-field />
+      </div>
+    </div>
+  `
+}
+
+function renderOnboardingStep2() {
+  const d = state.onboardingWizard.draft
+
+  return `
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Configuração de agenda</h3>
+      <p class="wizard-section-copy">Defina a duração padrão dos slots e a antecedência mínima para agendamento.</p>
+      <div class="form-grid-two">
+        <div class="field">
+          <label>Duração padrão do slot (minutos)</label>
+          <input name="slot_duration_minutes" type="number" min="10" max="480" value="${d.slot_duration_minutes}" data-onboarding-field />
+        </div>
+        <div class="field">
+          <label>Antecedência mínima (minutos)</label>
+          <input name="minimum_notice_minutes" type="number" min="0" max="10080" value="${d.minimum_notice_minutes}" data-onboarding-field />
+        </div>
+      </div>
+    </div>
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Lembretes automáticos</h3>
+      <p class="wizard-section-copy">O bot envia lembretes por WhatsApp antes de cada consulta. Defina quantos dias antes.</p>
+      <div class="field">
+        <label>Dias antes do agendamento (separados por vírgula)</label>
+        <input name="reminder_offsets_days" value="${escapeHtml(d.reminder_offsets_days)}" placeholder="2,1" data-onboarding-field />
+      </div>
+    </div>
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Regras do bot</h3>
+      <p class="wizard-section-copy">Instruções que o bot deve seguir. Uma por linha.</p>
+      <div class="field">
+        <textarea name="custom_rules" rows="4" placeholder="Não inventar preços&#10;Sempre confirmar horário antes de agendar" data-onboarding-field>${escapeHtml(d.custom_rules)}</textarea>
+      </div>
+    </div>
+  `
+}
+
+function renderOnboardingStep3() {
+  const d = state.onboardingWizard.draft
+  const services = d.services || []
+
+  return `
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Serviços oferecidos</h3>
+      <p class="wizard-section-copy">Cadastre os serviços que o bot vai oferecer para agendamento. Você pode adicionar mais depois.</p>
+      <div class="wizard-services-list">
+        ${services.map((svc, i) => `
+          <div class="wizard-service-row" data-service-index="${i}">
+            <div class="form-grid-two">
+              <div class="field">
+                <label>Nome do serviço</label>
+                <input name="svc_name" value="${escapeHtml(svc.name || "")}" data-service-field="${i}" />
+              </div>
+              <div class="field">
+                <label>Duração (min)</label>
+                <input name="svc_duration" type="number" value="${svc.duration_minutes || ""}" data-service-field="${i}" />
+              </div>
+              <div class="field">
+                <label>Preço (R$)</label>
+                <input name="svc_price" type="number" step="0.01" value="${svc.price || ""}" data-service-field="${i}" />
+              </div>
+              <div class="field" style="display:flex;align-items:flex-end">
+                <button class="button-ghost" data-remove-service="${i}">Remover</button>
+              </div>
+            </div>
+          </div>
+        `).join("")}
+        ${services.length === 0 ? '<p class="wizard-section-copy">Nenhum serviço adicionado ainda. Clique abaixo para começar.</p>' : ''}
+      </div>
+      <button class="button-ghost" id="add-onboarding-service" style="margin-top:8px">${ICONS.plus} Adicionar serviço</button>
+    </div>
+  `
+}
+
+function renderOnboardingStep4() {
+  const d = state.onboardingWizard.draft
+  const preset = state.onboardingPresets?.business_types?.[d.business_type_key]
+  const services = d.services || []
+  const offsets = d.reminder_offsets_days || "2,1"
+
+  return `
+    <div class="wizard-section">
+      <h3 class="wizard-section-title">Revisão final</h3>
+      <p class="wizard-section-copy">Confira tudo antes de ativar. Você pode voltar e editar qualquer passo.</p>
+
+      <div class="wizard-review-grid">
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Empresa</span>
+          <span class="wizard-review-value">${escapeHtml(d.company_name || "—")}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Tipo</span>
+          <span class="wizard-review-value">${escapeHtml(preset?.label || d.business_type_key || "—")}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Segmento</span>
+          <span class="wizard-review-value">${escapeHtml(d.segment || "Padrão do tipo")}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Telefone</span>
+          <span class="wizard-review-value">${escapeHtml(d.phone || "—")}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Timezone</span>
+          <span class="wizard-review-value">${escapeHtml(d.timezone)}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Seg-Sex</span>
+          <span class="wizard-review-value">${escapeHtml(d.weekday_hours)}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Sábado</span>
+          <span class="wizard-review-value">${escapeHtml(d.saturday_hours)}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Domingo</span>
+          <span class="wizard-review-value">${escapeHtml(d.sunday_hours)}</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Slot padrão</span>
+          <span class="wizard-review-value">${d.slot_duration_minutes} min</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Antecedência</span>
+          <span class="wizard-review-value">${d.minimum_notice_minutes} min</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Lembretes</span>
+          <span class="wizard-review-value">${escapeHtml(offsets)} dias antes</span>
+        </div>
+        <div class="wizard-review-item">
+          <span class="wizard-review-label">Serviços</span>
+          <span class="wizard-review-value">${services.length} cadastrado(s)</span>
+        </div>
+      </div>
+
+      ${services.length > 0 ? `
+        <div class="wizard-review-services">
+          <h4 style="font-size:13px;font-weight:700;color:var(--text-muted);margin-bottom:8px">Serviços cadastrados</h4>
+          ${services.map(s => `
+            <div class="wizard-review-service-chip">
+              ${escapeHtml(s.name)}${s.duration_minutes ? ` · ${s.duration_minutes}min` : ""}${s.price ? ` · R$${s.price}` : ""}
+            </div>
+          `).join("")}
+        </div>
+      ` : ""}
+    </div>
+  `
+}
+
+function renderOnboardingSuccess() {
+  const result = state.onboardingWizard.result
+  const company = result?.company || {}
+  const nextSteps = result?.next_steps || []
+
+  return `
+    <section class="hero" style="text-align:center">
+      <span class="brand-eyebrow" style="color:var(--brand)">Setup completo</span>
+      <h2 class="hero-title">${escapeHtml(company.name || "Empresa")} está pronta para operar.</h2>
+      <p class="hero-copy">O contexto foi gerado, os módulos ativados e a empresa já está na plataforma.</p>
+      <div class="hero-actions" style="justify-content:center">
+        <button class="button" data-jump-view="studio">Testar o bot agora</button>
+        <button class="button-ghost" data-jump-view="agenda">Abrir agenda</button>
+        <button class="button-ghost" id="onboarding-reset">Configurar outra empresa</button>
+      </div>
+    </section>
+
+    ${nextSteps.length > 0 ? `
+      <section class="grid-one">
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <h3 class="card-title">Próximos passos recomendados</h3>
+              <p class="card-copy">Ações para completar a ativação e ir ao vivo.</p>
+            </div>
+          </div>
+          <div class="timeline">
+            ${nextSteps.map(s => `
+              <div class="timeline-item">
+                <strong>${escapeHtml(s.title)}</strong>
+                <p>${escapeHtml(s.description)}</p>
+              </div>
+            `).join("")}
+          </div>
+        </article>
+      </section>
+    ` : ""}
+  `
+}
+
+function renderOnboardingView() {
+  if (state.onboardingWizard.completed && state.onboardingWizard.result) {
+    return renderOnboardingSuccess()
+  }
+
+  const step = state.onboardingWizard.step
+  const totalSteps = ONBOARDING_STEPS.length
+  const isFirst = step === 0
+  const isLast = step === totalSteps - 1
+
+  let stepContent = ""
+  if (step === 0) stepContent = renderOnboardingStep0()
+  else if (step === 1) stepContent = renderOnboardingStep1()
+  else if (step === 2) stepContent = renderOnboardingStep2()
+  else if (step === 3) stepContent = renderOnboardingStep3()
+  else if (step === 4) stepContent = renderOnboardingStep4()
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">Setup Wizard</span>
+      <h2 class="hero-title">Configure uma nova empresa em minutos.</h2>
+      <p class="hero-copy">Preencha os dados e o bot será configurado automaticamente com contexto, agenda, lembretes e catálogo.</p>
+    </section>
+
+    <section class="grid-one">
+      <article class="card">
+        ${renderOnboardingStepIndicator()}
+
+        <div class="wizard-body">
+          ${stepContent}
+        </div>
+
+        <div class="wizard-nav">
+          ${!isFirst ? '<button class="button-ghost" id="wizard-prev">Voltar</button>' : '<span></span>'}
+          ${isLast
+            ? '<button class="button" id="wizard-submit">Ativar empresa</button>'
+            : '<button class="button" id="wizard-next">Próximo</button>'
+          }
+        </div>
+      </article>
+    </section>
+  `
+}
+
+// ── Analytics View ──────────────────────────────────────────────────────
+
+function analyticsKpiCard(label, value, subtitle, tone = "default") {
+  const toneClass = tone === "success" ? "analytics-kpi-success" : tone === "danger" ? "analytics-kpi-danger" : tone === "warn" ? "analytics-kpi-warn" : ""
+  return `
+    <div class="analytics-kpi ${toneClass}">
+      <span class="analytics-kpi-value">${escapeHtml(value)}</span>
+      <span class="analytics-kpi-label">${escapeHtml(label)}</span>
+      <span class="analytics-kpi-subtitle">${escapeHtml(subtitle)}</span>
+    </div>
+  `
+}
+
+function renderAnalyticsBar(segments, height = 32) {
+  const total = segments.reduce((sum, s) => sum + s.value, 0) || 1
+  return `
+    <div class="analytics-bar" style="height:${height}px">
+      ${segments.map(s => {
+        const pct = Math.max((s.value / total) * 100, 0)
+        return pct > 0 ? `<div class="analytics-bar-segment analytics-bar-${s.tone}" style="width:${pct}%" title="${escapeHtml(s.label)}: ${formatNumber(s.value)} (${pct.toFixed(1)}%)"></div>` : ""
+      }).join("")}
+    </div>
+    <div class="analytics-bar-legend">
+      ${segments.map(s => `<span class="analytics-legend-item"><span class="analytics-legend-dot analytics-bar-${s.tone}"></span>${escapeHtml(s.label)}: ${formatNumber(s.value)}</span>`).join("")}
+    </div>
+  `
+}
+
+function renderAnalyticsTrendChart(trend) {
+  if (!trend || trend.length === 0) {
+    return '<div class="empty-state">Sem dados de tendência para o período selecionado.</div>'
+  }
+
+  const maxVal = Math.max(...trend.map(m => m.total), 1)
+  const chartHeight = 180
+  const barWidth = Math.max(Math.min(Math.floor(600 / trend.length) - 8, 56), 20)
+
+  return `
+    <div class="analytics-chart-container">
+      <div class="analytics-chart" style="height:${chartHeight + 40}px">
+        ${trend.map((m, i) => {
+          const totalH = Math.round((m.total / maxVal) * chartHeight)
+          const attendedH = m.total > 0 ? Math.round((m.attended / m.total) * totalH) : 0
+          const noShowH = m.total > 0 ? Math.round((m.no_show / m.total) * totalH) : 0
+          const cancelledH = m.total > 0 ? Math.round((m.cancelled / m.total) * totalH) : 0
+          const otherH = Math.max(totalH - attendedH - noShowH - cancelledH, 0)
+
+          return `
+            <div class="analytics-chart-col" style="width:${barWidth}px">
+              <div class="analytics-chart-bar" style="height:${chartHeight}px">
+                <div class="analytics-chart-stack">
+                  ${otherH > 0 ? `<div class="analytics-bar-neutral" style="height:${otherH}px" title="Pendente: ${m.total - m.attended - m.no_show - m.cancelled}"></div>` : ""}
+                  ${cancelledH > 0 ? `<div class="analytics-bar-warn" style="height:${cancelledH}px" title="Cancelados: ${m.cancelled}"></div>` : ""}
+                  ${noShowH > 0 ? `<div class="analytics-bar-danger" style="height:${noShowH}px" title="No-show: ${m.no_show}"></div>` : ""}
+                  ${attendedH > 0 ? `<div class="analytics-bar-success" style="height:${attendedH}px" title="Compareceu: ${m.attended}"></div>` : ""}
+                </div>
+              </div>
+              <span class="analytics-chart-label">${escapeHtml(m.month)}</span>
+              <span class="analytics-chart-sublabel">${m.no_show_rate}%</span>
+            </div>
+          `
+        }).join("")}
+      </div>
+      <div class="analytics-bar-legend" style="margin-top:8px">
+        <span class="analytics-legend-item"><span class="analytics-legend-dot analytics-bar-success"></span>Compareceu</span>
+        <span class="analytics-legend-item"><span class="analytics-legend-dot analytics-bar-danger"></span>No-show</span>
+        <span class="analytics-legend-item"><span class="analytics-legend-dot analytics-bar-warn"></span>Cancelado</span>
+        <span class="analytics-legend-item"><span class="analytics-legend-dot analytics-bar-neutral"></span>Pendente</span>
+      </div>
+    </div>
+  `
+}
+
+function renderAnalyticsFunnel(funnel) {
+  const steps = [
+    { label: "Agendamentos criados", value: funnel.bookings_created, tone: "neutral" },
+    { label: "Ainda confirmados", value: funnel.still_confirmed, tone: "neutral" },
+    { label: "Outcome registrado", value: funnel.outcome_recorded, tone: "neutral" },
+    { label: "Compareceu", value: funnel.attended, tone: "success" },
+    { label: "No-show", value: funnel.no_show, tone: "danger" },
+  ]
+  const maxVal = Math.max(...steps.map(s => s.value), 1)
+
+  return `
+    <div class="analytics-funnel">
+      ${steps.map(s => {
+        const pct = Math.round((s.value / maxVal) * 100)
+        return `
+          <div class="analytics-funnel-step">
+            <div class="analytics-funnel-bar-wrap">
+              <div class="analytics-funnel-bar analytics-bar-${s.tone}" style="width:${Math.max(pct, 4)}%"></div>
+            </div>
+            <span class="analytics-funnel-label">${escapeHtml(s.label)}</span>
+            <span class="analytics-funnel-value">${formatNumber(s.value)}</span>
+          </div>
+        `
+      }).join("")}
+    </div>
+  `
+}
+
+function renderReminderComparison(effectiveness) {
+  const withR = effectiveness.with_reminder || {}
+  const withoutR = effectiveness.without_reminder || {}
+  const impact = effectiveness.reminder_impact || {}
+
+  return `
+    <div class="analytics-comparison">
+      <div class="analytics-comparison-col">
+        <h4 class="analytics-comparison-title">Com lembrete</h4>
+        <div class="analytics-comparison-stat">
+          <span class="analytics-comparison-big analytics-text-success">${withR.attendance_rate ?? 0}%</span>
+          <span class="analytics-comparison-caption">comparecimento</span>
+        </div>
+        <div class="analytics-comparison-stat">
+          <span class="analytics-comparison-big analytics-text-danger">${withR.no_show_rate ?? 0}%</span>
+          <span class="analytics-comparison-caption">no-show</span>
+        </div>
+        <span class="analytics-comparison-meta">${formatNumber(withR.total || 0)} agendamentos</span>
+      </div>
+      <div class="analytics-comparison-divider"></div>
+      <div class="analytics-comparison-col">
+        <h4 class="analytics-comparison-title">Sem lembrete</h4>
+        <div class="analytics-comparison-stat">
+          <span class="analytics-comparison-big">${withoutR.attendance_rate ?? 0}%</span>
+          <span class="analytics-comparison-caption">comparecimento</span>
+        </div>
+        <div class="analytics-comparison-stat">
+          <span class="analytics-comparison-big analytics-text-danger">${withoutR.no_show_rate ?? 0}%</span>
+          <span class="analytics-comparison-caption">no-show</span>
+        </div>
+        <span class="analytics-comparison-meta">${formatNumber(withoutR.total || 0)} agendamentos</span>
+      </div>
+    </div>
+    ${impact.no_show_reduction_pp !== undefined ? `
+      <div class="analytics-impact-banner ${impact.no_show_reduction_pp > 0 ? 'analytics-impact-positive' : 'analytics-impact-neutral'}">
+        <strong>${impact.no_show_reduction_pp > 0 ? '-' : ''}${Math.abs(impact.no_show_reduction_pp)}pp</strong>
+        <span>${impact.no_show_reduction_pp > 0 ? 'de redução no no-show com lembretes ativos' : 'Sem diferença significativa ainda — acumule dados'}</span>
+      </div>
+    ` : ""}
+  `
+}
+
+function renderCancellationReasons(reasons) {
+  const entries = Object.entries(reasons || {})
+  if (entries.length === 0) {
+    return '<div class="empty-state">Nenhum motivo de cancelamento registrado ainda.</div>'
+  }
+  const maxVal = Math.max(...entries.map(([, v]) => v), 1)
+  return `
+    <div class="analytics-reasons">
+      ${entries.slice(0, 8).map(([reason, count]) => {
+        const pct = Math.round((count / maxVal) * 100)
+        return `
+          <div class="analytics-reason-row">
+            <span class="analytics-reason-label">${escapeHtml(reason)}</span>
+            <div class="analytics-reason-bar-wrap">
+              <div class="analytics-reason-bar" style="width:${Math.max(pct, 4)}%"></div>
+            </div>
+            <span class="analytics-reason-count">${formatNumber(count)}</span>
+          </div>
+        `
+      }).join("")}
+    </div>
+  `
+}
+
+function renderQueueRecovery(queue) {
+  const offers = queue?.offers || {}
+  const entries = queue?.entries || {}
+  return `
+    <div class="analytics-queue-grid">
+      <div class="analytics-queue-stat">
+        <span class="analytics-queue-num">${formatNumber(entries.total || 0)}</span>
+        <span class="analytics-queue-label">Na fila</span>
+      </div>
+      <div class="analytics-queue-stat">
+        <span class="analytics-queue-num">${formatNumber(offers.total || 0)}</span>
+        <span class="analytics-queue-label">Ofertas feitas</span>
+      </div>
+      <div class="analytics-queue-stat">
+        <span class="analytics-queue-num analytics-text-success">${formatNumber(offers.accepted || 0)}</span>
+        <span class="analytics-queue-label">Aceitas</span>
+      </div>
+      <div class="analytics-queue-stat">
+        <span class="analytics-queue-num">${formatNumber(offers.expired || 0)}</span>
+        <span class="analytics-queue-label">Expiradas</span>
+      </div>
+    </div>
+    <div class="analytics-recovery-rate">
+      <div class="analytics-recovery-bar-wrap">
+        <div class="analytics-recovery-bar" style="width:${Math.min(queue?.recovery_rate || 0, 100)}%"></div>
+      </div>
+      <span class="analytics-recovery-label">${queue?.recovery_rate ?? 0}% taxa de recuperação</span>
+    </div>
+  `
+}
+
+function renderAnalyticsView() {
+  const d = state.analyticsDashboard
+  const periods = [
+    { key: "7d", label: "7 dias" },
+    { key: "30d", label: "30 dias" },
+    { key: "90d", label: "90 dias" },
+    { key: "6m", label: "6 meses" },
+    { key: "12m", label: "12 meses" },
+    { key: "all", label: "Tudo" },
+  ]
+
+  if (!d) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">No-Show Analytics</span>
+        <h2 class="hero-title">Calculando métricas...</h2>
+        <div class="hero-actions">
+          <div class="analytics-period-selector">
+            ${periods.map(p => `
+              <button class="analytics-period-btn ${state.analyticsPeriod === p.key ? 'active' : ''}" data-analytics-period="${p.key}">
+                ${p.label}
+              </button>
+            `).join("")}
+          </div>
+          <button class="button-ghost" data-refresh-view>Atualizar</button>
+        </div>
+      </section>
+      <section class="grid-four">
+        ${Array.from({ length: 4 }, () => '<article class="card"><div class="skeleton-group"><div class="skeleton-line skeleton-header" style="width:50%"></div><div class="skeleton-line" style="width:70%"></div></div></article>').join("")}
+      </section>
+      ${renderSkeletonCards(2)}
+    `
+  }
+
+  const kpis = d.kpis || {}
+  const funnel = d.funnel || {}
+  const reminders = d.reminders || {}
+  const queue = d.queue_recovery || {}
+  const trend = d.monthly_trend || []
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">No-Show Analytics</span>
+      <h2 class="hero-title">Reduza faltas com dados, não com achismo.</h2>
+      <p class="hero-copy">
+        Visualize taxas de comparecimento, impacto dos lembretes e recuperação de vagas canceladas. Cada métrica aqui é prova de valor para o negócio.
+      </p>
+      <div class="hero-actions">
+        <div class="analytics-period-selector">
+          ${periods.map(p => `
+            <button class="analytics-period-btn ${state.analyticsPeriod === p.key ? 'active' : ''}" data-analytics-period="${p.key}">
+              ${p.label}
+            </button>
+          `).join("")}
+        </div>
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
+      </div>
+    </section>
+
+    <section class="grid-four">
+      ${analyticsKpiCard("Total agendamentos", formatNumber(kpis.total_bookings), "No período selecionado")}
+      ${analyticsKpiCard("Taxa de comparecimento", kpis.attendance_rate + "%", "Dos que tiveram outcome", "success")}
+      ${analyticsKpiCard("Taxa de no-show", kpis.no_show_rate + "%", "Dos que tiveram outcome", kpis.no_show_rate > 15 ? "danger" : kpis.no_show_rate > 5 ? "warn" : "success")}
+      ${analyticsKpiCard("Taxa de cancelamento", kpis.cancellation_rate + "%", "Do total de agendamentos", kpis.cancellation_rate > 30 ? "danger" : kpis.cancellation_rate > 15 ? "warn" : "success")}
+    </section>
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Distribuição de outcomes</h3>
+            <p class="card-copy">Como os agendamentos se resolveram no período.</p>
+          </div>
+        </div>
+        ${renderAnalyticsBar([
+          { label: "Compareceu", value: kpis.attended || 0, tone: "success" },
+          { label: "No-show", value: kpis.no_show || 0, tone: "danger" },
+          { label: "Atrasado", value: kpis.late_arrival || 0, tone: "warn" },
+          { label: "Cancelado", value: kpis.cancelled || 0, tone: "neutral" },
+          { label: "Pendente", value: kpis.pending_outcome || 0, tone: "faint" },
+        ], 36)}
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Funil de agendamento</h3>
+            <p class="card-copy">Da criação ao comparecimento.</p>
+          </div>
+        </div>
+        ${renderAnalyticsFunnel(funnel)}
+      </article>
+    </section>
+
+    <section class="grid-one">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Tendência mensal</h3>
+            <p class="card-copy">Evolução da taxa de no-show (%) ao longo do tempo. Barras mostram volume absoluto.</p>
+          </div>
+        </div>
+        ${renderAnalyticsTrendChart(trend)}
+      </article>
+    </section>
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Impacto dos lembretes</h3>
+            <p class="card-copy">Comparação direta: agendamentos com vs. sem lembrete enviado.</p>
+          </div>
+          <span class="tag tag-success">${formatNumber(reminders.total_sent || 0)} enviados</span>
+        </div>
+        ${renderReminderComparison(reminders.effectiveness || {})}
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Recuperação via fila</h3>
+            <p class="card-copy">Vagas canceladas que foram reaproveitadas pela fila de espera.</p>
+          </div>
+        </div>
+        ${renderQueueRecovery(queue)}
+      </article>
+    </section>
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Motivos de cancelamento</h3>
+            <p class="card-copy">Os motivos mais recorrentes registrados nos cancelamentos.</p>
+          </div>
+        </div>
+        ${renderCancellationReasons(d.cancellation_reasons)}
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Resumo operacional</h3>
+            <p class="card-copy">KPIs complementares do período.</p>
+          </div>
+        </div>
+        <div class="analytics-summary-grid">
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Confirmados ativos</span>
+            <span class="analytics-summary-value">${formatNumber(kpis.confirmed)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Cancelados</span>
+            <span class="analytics-summary-value">${formatNumber(kpis.cancelled)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Compareceram</span>
+            <span class="analytics-summary-value analytics-text-success">${formatNumber(kpis.attended)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">No-show</span>
+            <span class="analytics-summary-value analytics-text-danger">${formatNumber(kpis.no_show)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Chegada tardia</span>
+            <span class="analytics-summary-value">${formatNumber(kpis.late_arrival)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Lembretes enviados</span>
+            <span class="analytics-summary-value">${formatNumber(reminders.total_sent || 0)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Lembretes pendentes</span>
+            <span class="analytics-summary-value">${formatNumber(reminders.total_pending || 0)}</span>
+          </div>
+          <div class="analytics-summary-item">
+            <span class="analytics-summary-label">Período</span>
+            <span class="analytics-summary-value">${escapeHtml(d.period)}</span>
           </div>
         </div>
       </article>
@@ -2359,11 +3438,14 @@ function renderTrainingView() {
 
 function renderCurrentView() {
   if (state.view === "dashboard") return renderDashboardView()
+  if (state.view === "analytics") return renderAnalyticsView()
   if (state.view === "studio") return renderStudioView()
   if (state.view === "flows") return renderFlowsView()
   if (state.view === "agenda") return renderAgendaView()
   if (state.view === "contacts") return renderContactsView()
   if (state.view === "training") return renderTrainingView()
+  if (state.view === "billing") return renderBillingView()
+  if (state.view === "onboarding") return renderOnboardingView()
   return ""
 }
 
@@ -2432,13 +3514,43 @@ function renderToasts() {
 }
 
 function renderLoadingBanner() {
-  if (!state.loading) {
-    return ""
-  }
+  if (!state.loading) return ""
   return `
-    <div class="pill" style="position: fixed; left: 50%; top: 20px; transform: translateX(-50%); z-index: 150; background: rgba(8, 16, 24, 0.95);">
+    <div class="loading-banner">
       <span class="loader"></span>
       <strong>${escapeHtml(state.loadingMessage || "Carregando")}</strong>
+    </div>
+  `
+}
+
+function renderSkeleton(lines = 3, withHeader = true) {
+  return `
+    <div class="skeleton-group">
+      ${withHeader ? '<div class="skeleton-line skeleton-header"></div>' : ''}
+      ${Array.from({ length: lines }, (_, i) => `<div class="skeleton-line" style="width:${85 - i * 12}%"></div>`).join("")}
+    </div>
+  `
+}
+
+function renderSkeletonCards(count = 3) {
+  return `
+    <section class="grid-${count <= 2 ? 'two' : 'three'}">
+      ${Array.from({ length: count }, () => `
+        <article class="card">
+          ${renderSkeleton(2)}
+        </article>
+      `).join("")}
+    </section>
+  `
+}
+
+function renderEmptyState(icon, title, description, ctaLabel, ctaAction) {
+  return `
+    <div class="empty-state-box">
+      <span class="empty-state-icon">${ICONS[icon] || ICONS.search}</span>
+      <h4 class="empty-state-title">${escapeHtml(title)}</h4>
+      <p class="empty-state-description">${escapeHtml(description)}</p>
+      ${ctaLabel ? `<button class="button" ${ctaAction ? `data-jump-view="${escapeHtml(ctaAction)}"` : ''}>${escapeHtml(ctaLabel)}</button>` : ''}
     </div>
   `
 }
@@ -2462,25 +3574,327 @@ function renderApp() {
 }
 
 function bindEvents() {
-  document.querySelectorAll("[data-view]").forEach((button) => {
+  // Analytics period buttons (re-bound each render because DOM is replaced)
+  document.querySelectorAll("[data-analytics-period]").forEach((button) => {
     button.addEventListener("click", async () => {
-      state.view = button.dataset.view
+      state.analyticsPeriod = button.dataset.analyticsPeriod
+      state.analyticsDashboard = null
       renderApp()
       await refreshCurrentView()
     })
   })
 
-  document.querySelectorAll("[data-jump-view]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      state.view = button.dataset.jumpView
+  // ── Onboarding wizard events ──
+  document.querySelectorAll("[data-onboarding-type]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.onboardingWizard.draft.business_type_key = btn.dataset.onboardingType
       renderApp()
-      await refreshCurrentView()
     })
   })
 
-  document.querySelectorAll("[data-refresh-view]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      await refreshCurrentView()
+  document.querySelectorAll("[data-onboarding-field]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const key = input.name
+      if (key === "slot_duration_minutes" || key === "minimum_notice_minutes") {
+        state.onboardingWizard.draft[key] = parseInt(input.value) || 0
+      } else {
+        state.onboardingWizard.draft[key] = input.value
+      }
+    })
+  })
+
+  document.querySelectorAll("[data-service-field]").forEach((input) => {
+    input.addEventListener("input", () => {
+      const idx = parseInt(input.dataset.serviceField)
+      const svc = state.onboardingWizard.draft.services[idx]
+      if (!svc) return
+      if (input.name === "svc_name") svc.name = input.value
+      else if (input.name === "svc_duration") svc.duration_minutes = parseInt(input.value) || null
+      else if (input.name === "svc_price") svc.price = parseFloat(input.value) || null
+    })
+  })
+
+  document.querySelectorAll("[data-remove-service]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const idx = parseInt(btn.dataset.removeService)
+      state.onboardingWizard.draft.services.splice(idx, 1)
+      renderApp()
+    })
+  })
+
+  const addService = document.getElementById("add-onboarding-service")
+  if (addService) {
+    addService.addEventListener("click", () => {
+      state.onboardingWizard.draft.services.push({ name: "", duration_minutes: null, price: null })
+      renderApp()
+    })
+  }
+
+  const wizardPrev = document.getElementById("wizard-prev")
+  if (wizardPrev) {
+    wizardPrev.addEventListener("click", () => {
+      if (state.onboardingWizard.step > 0) {
+        state.onboardingWizard.step--
+        renderApp()
+      }
+    })
+  }
+
+  const wizardNext = document.getElementById("wizard-next")
+  if (wizardNext) {
+    wizardNext.addEventListener("click", () => {
+      const d = state.onboardingWizard.draft
+      if (state.onboardingWizard.step === 0) {
+        if (!d.company_name.trim()) { pushToast("Informe o nome da empresa.", "error"); return }
+        if (!d.business_type_key) { pushToast("Selecione o tipo de negócio.", "error"); return }
+      }
+      if (state.onboardingWizard.step < ONBOARDING_STEPS.length - 1) {
+        state.onboardingWizard.step++
+        renderApp()
+      }
+    })
+  }
+
+  const wizardSubmit = document.getElementById("wizard-submit")
+  if (wizardSubmit) {
+    wizardSubmit.addEventListener("click", async () => {
+      const d = state.onboardingWizard.draft
+      if (!d.company_name.trim()) { pushToast("Informe o nome da empresa.", "error"); return }
+      if (!d.business_type_key) { pushToast("Selecione o tipo de negócio.", "error"); return }
+
+      state.loading = true
+      state.loadingMessage = "Configurando empresa..."
+      renderApp()
+
+      try {
+        const offsets = (d.reminder_offsets_days || "2,1")
+          .split(",")
+          .map(s => parseInt(s.trim()))
+          .filter(n => !isNaN(n) && n > 0)
+
+        const rules = (d.custom_rules || "")
+          .split("\n")
+          .map(s => s.trim())
+          .filter(s => s.length > 0)
+
+        const services = d.services.filter(s => s.name && s.name.trim())
+
+        const payload = {
+          company_name: d.company_name.trim(),
+          business_type_key: d.business_type_key,
+          segment: d.segment || undefined,
+          company_description: d.company_description || undefined,
+          phone: d.phone || undefined,
+          email: d.email || undefined,
+          instagram: d.instagram || undefined,
+          website: d.website || undefined,
+          timezone: d.timezone,
+          weekday_hours: d.weekday_hours,
+          saturday_hours: d.saturday_hours,
+          sunday_hours: d.sunday_hours,
+          slot_duration_minutes: d.slot_duration_minutes,
+          minimum_notice_minutes: d.minimum_notice_minutes,
+          reminder_offsets_days: offsets.length > 0 ? offsets : undefined,
+          brand_style: d.brand_style || undefined,
+          custom_rules: rules.length > 0 ? rules : undefined,
+          services: services.length > 0 ? services.map(s => ({
+            name: s.name.trim(),
+            duration_minutes: s.duration_minutes || undefined,
+            price: s.price || undefined,
+          })) : undefined,
+        }
+
+        const result = await apiRequest("/admin/onboarding/setup", {
+          method: "POST",
+          body: payload,
+        })
+        state.onboardingWizard.result = result
+        state.onboardingWizard.completed = true
+        pushToast("Empresa configurada com sucesso!")
+        await loadCompanies()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const onboardingReset = document.getElementById("onboarding-reset")
+  if (onboardingReset) {
+    onboardingReset.addEventListener("click", () => {
+      state.onboardingWizard = {
+        step: 0,
+        completed: false,
+        result: null,
+        draft: {
+          company_name: "",
+          business_type_key: "",
+          segment: "",
+          company_description: "",
+          phone: "",
+          email: "",
+          instagram: "",
+          website: "",
+          timezone: "America/Sao_Paulo",
+          weekday_hours: "08:00-18:00",
+          saturday_hours: "09:00-12:00",
+          sunday_hours: "fechado",
+          slot_duration_minutes: 60,
+          minimum_notice_minutes: 120,
+          reminder_offsets_days: "2,1",
+          brand_style: "",
+          custom_rules: "",
+          services: [],
+        },
+      }
+      renderApp()
+    })
+  }
+
+  // ── Billing bindings ──
+  const billingStartTrial = document.getElementById("billing-start-trial")
+  if (billingStartTrial) {
+    billingStartTrial.addEventListener("click", async () => {
+      const companyId = state.config.companyId || 1
+      state.loading = true
+      state.loadingMessage = "Iniciando trial..."
+      renderApp()
+      try {
+        await apiRequest("/admin/billing/trial", { method: "POST", params: { company_id: companyId } })
+        pushToast("Trial de 7 dias iniciado com sucesso!")
+        await loadBillingData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const billingActivate = document.getElementById("billing-activate")
+  if (billingActivate) {
+    billingActivate.addEventListener("click", async () => {
+      const companyId = state.config.companyId || 1
+      const planKey = state.billingUsage?.subscription?.plan_key || "avancado"
+      state.loading = true
+      state.loadingMessage = "Ativando assinatura..."
+      renderApp()
+      try {
+        await apiRequest("/admin/billing/activate", {
+          method: "POST",
+          params: { company_id: companyId },
+          body: { plan_key: planKey, billing_cycle: "monthly" },
+        })
+        pushToast("Assinatura ativada com sucesso!")
+        await loadBillingData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const billingCancel = document.getElementById("billing-cancel")
+  if (billingCancel) {
+    billingCancel.addEventListener("click", async () => {
+      if (!confirm("Tem certeza que deseja cancelar sua assinatura? Você manterá acesso até o fim do período atual.")) return
+      const companyId = state.config.companyId || 1
+      state.loading = true
+      state.loadingMessage = "Cancelando assinatura..."
+      renderApp()
+      try {
+        await apiRequest("/admin/billing/cancel", {
+          method: "POST",
+          params: { company_id: companyId },
+          body: { reason: null },
+        })
+        pushToast("Assinatura cancelada. Acesso mantido até o fim do período.")
+        await loadBillingData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const billingReactivate = document.getElementById("billing-reactivate")
+  if (billingReactivate) {
+    billingReactivate.addEventListener("click", async () => {
+      if (!confirm("Deseja reativar sua assinatura?")) return
+      const companyId = state.config.companyId || 1
+      const planKey = state.billingUsage?.subscription?.plan_key || "avancado"
+      state.loading = true
+      state.loadingMessage = "Reativando assinatura..."
+      renderApp()
+      try {
+        await apiRequest("/admin/billing/reactivate", {
+          method: "POST",
+          params: { company_id: companyId },
+          body: { plan_key: planKey, billing_cycle: "monthly" },
+        })
+        pushToast("Assinatura reativada com sucesso!")
+        await loadBillingData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  document.querySelectorAll(".billing-change-plan-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const planKey = btn.dataset.planKey
+      const companyId = state.config.companyId || 1
+      const hasSub = state.billingUsage?.has_subscription
+      const isCancelled = state.billingUsage?.subscription?.status === "cancelled"
+      const actionLabel = isCancelled ? 'reativar com' : (hasSub ? 'trocar para' : 'ativar')
+      if (!confirm(`Deseja ${actionLabel} o plano ${planKey}?`)) return
+      state.loading = true
+      state.loadingMessage = "Atualizando plano..."
+      renderApp()
+      try {
+        if (isCancelled) {
+          await apiRequest("/admin/billing/reactivate", {
+            method: "POST",
+            params: { company_id: companyId },
+            body: { plan_key: planKey, billing_cycle: "monthly" },
+          })
+        } else if (hasSub) {
+          await apiRequest("/admin/billing/change-plan", {
+            method: "POST",
+            params: { company_id: companyId },
+            body: { new_plan_key: planKey },
+          })
+        } else {
+          await apiRequest("/admin/billing/activate", {
+            method: "POST",
+            params: { company_id: companyId },
+            body: { plan_key: planKey, billing_cycle: "monthly" },
+          })
+        }
+        pushToast("Plano atualizado com sucesso!")
+        await loadBillingData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
     })
   })
 
@@ -3651,12 +5065,17 @@ function bindTrainingEvents() {
   const createFinetuningJob = document.getElementById("create-finetuning-job")
   if (createFinetuningJob) {
     createFinetuningJob.addEventListener("click", async () => {
+      if (!state.config.companyId) {
+        pushToast("Selecione uma empresa antes de criar um job de fine-tuning.", "error")
+        return
+      }
       state.loading = true
       state.loadingMessage = "Criando job de fine-tuning..."
       renderApp()
       try {
         await apiRequest("/admin/finetuning/jobs", {
           method: "POST",
+          params: getAdminCompanyParams(),
         })
         pushToast("Job de fine-tuning criado.")
         await loadTrainingData()
@@ -3671,12 +5090,125 @@ function bindTrainingEvents() {
   }
 }
 
+// ── Global event delegation (registered ONCE, survives innerHTML swaps) ───
+
+root.addEventListener("click", async (e) => {
+  const viewBtn = e.target.closest("[data-view]")
+  if (viewBtn) {
+    state.view = viewBtn.dataset.view
+    state.mobileMenuOpen = false
+    renderApp()
+    await refreshCurrentView()
+    return
+  }
+
+  const jumpBtn = e.target.closest("[data-jump-view]")
+  if (jumpBtn) {
+    state.view = jumpBtn.dataset.jumpView
+    state.mobileMenuOpen = false
+    renderApp()
+    await refreshCurrentView()
+    return
+  }
+
+  const refreshBtn = e.target.closest("[data-refresh-view]")
+  if (refreshBtn) {
+    await refreshCurrentView()
+    return
+  }
+
+  // Mobile menu
+  if (e.target.closest("#mobile-menu-toggle")) {
+    state.mobileMenuOpen = true
+    renderApp()
+    return
+  }
+  if (e.target.closest("#sidebar-close") || e.target.closest("#sidebar-overlay")) {
+    state.mobileMenuOpen = false
+    renderApp()
+    return
+  }
+})
+
+// ── Real-time SSE connection ──────────────────────────────────────────
+
+let _eventSource = null
+
+function connectSSE() {
+  if (_eventSource) return
+  try {
+    _eventSource = new EventSource("/platform/events")
+
+    _eventSource.addEventListener("connected", () => {
+      state.connected = true
+    })
+
+    _eventSource.onmessage = (ev) => {
+      try {
+        const event = JSON.parse(ev.data)
+        handleRealtimeEvent(event)
+      } catch {
+        // ignore malformed events
+      }
+    }
+
+    _eventSource.onerror = () => {
+      _eventSource?.close()
+      _eventSource = null
+      // Reconnect after 5 seconds
+      setTimeout(connectSSE, 5000)
+    }
+  } catch {
+    // SSE not supported or connection failed
+  }
+}
+
+const SSE_LABELS = {
+  new_message: "Nova mensagem recebida",
+  new_booking: "Novo agendamento criado",
+  reminders_dispatched: "Lembretes enviados",
+  booking_cancelled: "Agendamento cancelado",
+  handoff_required: "Handoff solicitado",
+}
+
+function handleRealtimeEvent(event) {
+  const label = SSE_LABELS[event.type]
+  if (!label) return
+
+  let detail = ""
+  if (event.type === "new_message") {
+    detail = event.data?.contact_id ? ` — ${event.data.contact_id}` : ""
+    if (event.data?.handoff_required) {
+      pushToast("Handoff solicitado" + detail, "warn")
+    }
+  }
+  if (event.type === "new_booking") {
+    detail = event.data?.title ? ` — ${event.data.title}` : ""
+  }
+  if (event.type === "reminders_dispatched") {
+    detail = event.data?.count ? ` (${event.data.count})` : ""
+  }
+
+  pushToast(label + detail, "success")
+
+  // Auto-refresh if viewing relevant data
+  const refreshViews = {
+    new_message: ["dashboard", "contacts"],
+    new_booking: ["agenda", "dashboard", "analytics"],
+    reminders_dispatched: ["agenda", "dashboard"],
+  }
+  if (refreshViews[event.type]?.includes(state.view)) {
+    refreshCurrentView({ silent: true })
+  }
+}
+
 async function bootstrap() {
   renderApp()
   try {
     await fetchPlatformSession()
     await refreshCurrentView()
     state.settingsOpen = false
+    connectSSE()
     renderApp()
   } catch {
     state.settingsOpen = true

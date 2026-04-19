@@ -22,7 +22,6 @@ TRANSIENT_PROVIDER_ERROR_CODES = {"server_error", "internal_error"}
 MAX_FINETUNING_JOB_RETRIES = 2
 RETRY_DELAY_SECONDS = 3
 repository = RuntimeRepository()
-DEFAULT_COMPANY_ID = 1
 logger = get_logger(__name__)
 
 
@@ -46,8 +45,11 @@ class FineTuningService:
                 error_payload = payload.get("error", {}) if isinstance(payload, dict) else {}
                 error_code = error_payload.get("code")
                 error_message = error_payload.get("message") or error_message
-            except Exception:
-                pass
+            except Exception as parse_exc:
+                logger.debug(
+                    "finetuning.provider_error_payload_unavailable",
+                    exc_info=parse_exc,
+                )
 
         return error_code, error_message
 
@@ -89,23 +91,28 @@ class FineTuningService:
             "filename": getattr(uploaded_file, "filename", None),
         }
 
-    def create_finetuning_job(self) -> dict[str, Any]:
+    def _require_company_id(self, company_id: int | None) -> int:
+        if company_id is None or int(company_id) <= 0:
+            raise FineTuningError("company_id must be provided for fine-tuning operations.")
+        return int(company_id)
+
+    def create_finetuning_job(self, *, company_id: int | None) -> dict[str, Any]:
         if not settings.enable_finetuning_pipeline:
             raise FineTuningError(
                 "Fine-tuning pipeline is disabled. Set ENABLE_FINETUNING_PIPELINE=true to enable it."
             )
 
-        company_id = DEFAULT_COMPANY_ID
+        resolved_company_id = self._require_company_id(company_id)
         log_event(
             logger,
             logging.INFO,
             "finetuning.job.creation.started",
-            company_id=company_id,
+            company_id=resolved_company_id,
             base_model=self.base_model,
             suffix=self.suffix,
         )
-        train_jsonl = export_finetuning_train_jsonl()
-        validation_jsonl = export_finetuning_validation_jsonl()
+        train_jsonl = export_finetuning_train_jsonl(company_id=resolved_company_id)
+        validation_jsonl = export_finetuning_validation_jsonl(company_id=resolved_company_id)
 
         training_file_id = self._upload_jsonl_content(
             content=train_jsonl,
@@ -132,7 +139,7 @@ class FineTuningService:
                 )
                 repository.create_finetuning_job_record(
                     job_id=job.id,
-                    company_id=company_id,
+                    company_id=resolved_company_id,
                     status=job.status,
                     base_model=self.base_model,
                     suffix=self.suffix,
@@ -143,7 +150,7 @@ class FineTuningService:
                     logger,
                     logging.INFO,
                     "finetuning.job.creation.completed",
-                    company_id=company_id,
+                    company_id=resolved_company_id,
                     job_id=job.id,
                     status=job.status,
                     attempts_used=attempt,
@@ -165,7 +172,7 @@ class FineTuningService:
                     logger,
                     logging.WARNING,
                     "finetuning.job.creation.retryable_error",
-                    company_id=company_id,
+                    company_id=resolved_company_id,
                     attempt=attempt,
                     provider_error_code=last_error_code,
                     provider_error_message=last_error_message,
@@ -187,7 +194,7 @@ class FineTuningService:
             f"provider_error_message={last_error_message or 'unknown'}"
         )
 
-    def retrieve_finetuning_job(self, job_id: str) -> dict[str, Any]:
+    def retrieve_finetuning_job(self, job_id: str, *, company_id: int | None = None) -> dict[str, Any]:
         if not job_id.strip():
             raise FineTuningError("job_id must be a non-empty string.")
 
@@ -203,7 +210,6 @@ class FineTuningService:
         except Exception as exc:
             raise FineTuningError(f"Failed to retrieve fine-tuning job: {exc}") from exc
 
-        company_id = DEFAULT_COMPANY_ID
         error_payload = getattr(job, "error", None)
         provider_error_code = None
         provider_error_message = None
@@ -214,11 +220,34 @@ class FineTuningService:
         finished_at_value = getattr(job, "finished_at", None)
         finished_at_str = str(finished_at_value) if finished_at_value is not None else None
 
-        existing_record = repository.get_finetuning_job_record(job.id)
+        resolved_company_id: int | None
+        if company_id is not None:
+            resolved_company_id = self._require_company_id(company_id)
+            existing_record = repository.get_finetuning_job_record(
+                job.id,
+                company_id=resolved_company_id,
+            )
+            if existing_record is None:
+                raise FineTuningError(
+                    f"Fine-tuning job {job.id} is not associated with company_id={resolved_company_id}."
+                )
+            record_company_id = existing_record.get("company_id")
+            if record_company_id is None or int(record_company_id) != resolved_company_id:
+                raise FineTuningError(
+                    f"Fine-tuning job {job.id} is not associated with company_id={resolved_company_id}."
+                )
+        else:
+            existing_record = repository.get_finetuning_job_record(job.id)
+            resolved_company_id = (
+                int(existing_record["company_id"])
+                if existing_record and existing_record.get("company_id") is not None
+                else None
+            )
+
         if existing_record is None:
             repository.create_finetuning_job_record(
                 job_id=job.id,
-                company_id=company_id,
+                company_id=resolved_company_id,
                 status=job.status,
                 base_model=getattr(job, "model", None),
                 training_file_id=getattr(job, "training_file", None),
@@ -267,7 +296,12 @@ class FineTuningService:
         )
         return result
 
-    def list_finetuning_jobs(self, limit: int = 10) -> list[dict[str, Any]]:
+    def list_finetuning_jobs(
+        self,
+        limit: int = 10,
+        *,
+        company_id: int | None = None,
+    ) -> list[dict[str, Any]]:
         if limit <= 0:
             raise FineTuningError("limit must be greater than zero.")
 
@@ -283,7 +317,7 @@ class FineTuningService:
         except Exception as exc:
             raise FineTuningError(f"Failed to list fine-tuning jobs: {exc}") from exc
 
-        company_id = DEFAULT_COMPANY_ID
+        resolved_company_id = self._require_company_id(company_id) if company_id is not None else None
         results: list[dict[str, Any]] = []
         for job in jobs.data:
             error_payload = getattr(job, "error", None)
@@ -296,11 +330,22 @@ class FineTuningService:
             finished_at_value = getattr(job, "finished_at", None)
             finished_at_str = str(finished_at_value) if finished_at_value is not None else None
 
-            existing_record = repository.get_finetuning_job_record(job.id)
+            existing_record = repository.get_finetuning_job_record(
+                job.id,
+                company_id=resolved_company_id,
+            )
+            record_company_id = (
+                int(existing_record["company_id"])
+                if existing_record and existing_record.get("company_id") is not None
+                else None
+            )
+            if resolved_company_id is not None and record_company_id != resolved_company_id:
+                continue
+
             if existing_record is None:
                 repository.create_finetuning_job_record(
                     job_id=job.id,
-                    company_id=company_id,
+                    company_id=resolved_company_id,
                     status=job.status,
                     base_model=getattr(job, "model", None),
                     training_file_id=getattr(job, "training_file", None),

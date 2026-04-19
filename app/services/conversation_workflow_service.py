@@ -8,7 +8,6 @@ from app.core.config import settings
 from app.llm.providers.openai_provider import OpenAIProvider
 from app.services.appointment_queue_service import process_queue_contact_message, release_booking_slot
 from app.services.calendar_service import (
-    cancel_calendar_booking,
     create_calendar_booking,
     query_calendar_availability,
     resolve_scheduling_profile,

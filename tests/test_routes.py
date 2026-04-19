@@ -7,6 +7,7 @@ from app import main as main_module
 from app.main import app
 from app.api import routes
 from app.core.config import settings
+from app.services.rate_limit_service import reset_rate_limit_state
 
 client = TestClient(app)
 
@@ -22,7 +23,7 @@ def test_platform_shell() -> None:
     response = client.get("/platform")
 
     assert response.status_code == 200
-    assert "Project WAPP Platform" in response.text
+    assert "WAPP Platform" in response.text
     assert "/platform/assets/app.js" in response.text
 
 
@@ -178,13 +179,71 @@ def test_incoming_message_empty_after_trim() -> None:
     assert response.status_code == 400
 
 
+def test_incoming_message_rate_limited(monkeypatch) -> None:
+    reset_rate_limit_state()
+    monkeypatch.setattr(settings, "enable_rate_limiting", True)
+    monkeypatch.setattr(settings, "rate_limit_window_seconds", 60)
+    monkeypatch.setattr(settings, "rate_limit_incoming_requests", 1)
+    monkeypatch.setattr(settings, "rate_limit_exempt_localhost", False)
+    monkeypatch.setattr(routes, "process_incoming_message", lambda **kwargs: {
+        "contact_id": kwargs["contact_id"],
+        "classification": "lead_novo",
+        "classification_reason": "Interesse comercial claro.",
+        "classification_confidence": 0.91,
+        "reply": "Olá, posso te ajudar com isso.",
+        "source": "openai",
+        "auto_reply": True,
+        "action": "auto_reply",
+        "priority": "high",
+        "pipeline_stage": "qualificando",
+        "next_action": "Entender escopo.",
+        "lead_temperature": "warm",
+        "handoff_required": False,
+        "pending_question_id": None,
+        "question_type": None,
+    })
+
+    payload = {
+        "contact_id": "5511999999999",
+        "contact_name": "Cliente Teste",
+        "message": "oi",
+    }
+    headers = {"X-Forwarded-For": "198.51.100.10"}
+    first_response = client.post("/messages/incoming", json=payload, headers=headers)
+    second_response = client.post("/messages/incoming", json=payload, headers=headers)
+
+    assert first_response.status_code == 200
+    assert first_response.headers["X-RateLimit-Scope"] == "incoming_message"
+    assert second_response.status_code == 429
+    assert second_response.json()["detail"] == "Too many requests."
+    assert second_response.headers["X-RateLimit-Scope"] == "incoming_message"
+    assert second_response.headers["Retry-After"]
+    reset_rate_limit_state()
+
+
 def test_whatsapp_webhook(monkeypatch) -> None:
     class FakeRepository:
+        def __init__(self) -> None:
+            self.receipts_started: list[dict] = []
+            self.completed_receipts: list[dict] = []
+            self.failed_receipts: list[dict] = []
+
+        def begin_inbound_message_processing(self, **kwargs):
+            self.receipts_started.append(kwargs)
+            return "started"
+
+        def mark_inbound_message_processing_completed(self, **kwargs):
+            self.completed_receipts.append(kwargs)
+
+        def mark_inbound_message_processing_failed(self, **kwargs):
+            self.failed_receipts.append(kwargs)
+
         def create_outbound_message(self, **kwargs):
             return 123
 
-    monkeypatch.setattr(routes, "repository", FakeRepository())
-    monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None: {
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(routes, "repository", fake_repository)
+    monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None, company_id=None: {
         "outbound_message_id": outbound_message_id,
         "delivery_status": "sent",
         "provider_message_id": "wamid.test.123",
@@ -215,6 +274,7 @@ def test_whatsapp_webhook(monkeypatch) -> None:
         "from_number": "5511999999999",
         "from_name": "Cliente Teste",
         "text": "Olá",
+        "provider_message_id": "wamid.normalized.123",
     }
     response = client.post("/webhooks/whatsapp", json=payload)
 
@@ -222,7 +282,17 @@ def test_whatsapp_webhook(monkeypatch) -> None:
     data = response.json()
     assert data["contact_id"] == "5511999999999"
     assert data["reply"] == "Recebi sua mensagem."
+    assert data["provider_message_id"] == "wamid.normalized.123"
     assert data["auto_reply_dispatch"]["delivery_status"] == "sent"
+    assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.normalized.123"
+    assert fake_repository.completed_receipts == [
+        {
+            "provider": "whatsapp",
+            "provider_message_id": "wamid.normalized.123",
+            "company_id": None,
+        }
+    ]
+    assert fake_repository.failed_receipts == []
     assert response.headers["X-Request-ID"]
 
 
@@ -230,6 +300,18 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     class FakeRepository:
         def __init__(self) -> None:
             self.created_messages: list[dict] = []
+            self.receipts_started: list[dict] = []
+            self.completed_receipts: list[dict] = []
+
+        def begin_inbound_message_processing(self, **kwargs):
+            self.receipts_started.append(kwargs)
+            return "started"
+
+        def mark_inbound_message_processing_completed(self, **kwargs):
+            self.completed_receipts.append(kwargs)
+
+        def mark_inbound_message_processing_failed(self, **kwargs):
+            raise AssertionError("Receipt should not be marked as failed on successful processing.")
 
         def create_outbound_message(self, **kwargs):
             self.created_messages.append(kwargs)
@@ -238,7 +320,7 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     fake_repository = FakeRepository()
     monkeypatch.setattr(routes, "repository", fake_repository)
     monkeypatch.setattr(settings, "whatsapp_app_secret", "meta-app-secret")
-    monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None: {
+    monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None, company_id=None: {
         "outbound_message_id": outbound_message_id,
         "delivery_status": "sent",
         "provider_message_id": "wamid.test.999",
@@ -264,33 +346,6 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
         "question_type": None,
     })
 
-    payload = {
-        "object": "whatsapp_business_account",
-        "entry": [
-            {
-                "changes": [
-                    {
-                        "value": {
-                            "contacts": [
-                                {
-                                    "wa_id": "5511999999999",
-                                    "profile": {"name": "Cliente Meta"},
-                                }
-                            ],
-                            "messages": [
-                                {
-                                    "id": "wamid.inbound.123",
-                                    "from": "5511999999999",
-                                    "type": "text",
-                                    "text": {"body": "Oi, gostaria de agendar"},
-                                }
-                            ],
-                        }
-                    }
-                ]
-            }
-        ],
-    }
     raw_payload = (
         '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
     ).encode("utf-8")
@@ -315,6 +370,60 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     assert data["auto_reply_dispatch"]["delivery_status"] == "sent"
     assert fake_repository.created_messages[0]["source"] == "whatsapp_auto_reply"
     assert fake_repository.created_messages[0]["contact_id"] == "5511999999999"
+    assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.inbound.123"
+    assert fake_repository.completed_receipts == [
+        {
+            "provider": "whatsapp",
+            "provider_message_id": "wamid.inbound.123",
+            "company_id": None,
+        }
+    ]
+
+
+def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.receipts_started: list[dict] = []
+
+        def begin_inbound_message_processing(self, **kwargs):
+            self.receipts_started.append(kwargs)
+            return "completed"
+
+        def mark_inbound_message_processing_completed(self, **kwargs):
+            raise AssertionError("Duplicate payload should not be marked as completed again.")
+
+        def mark_inbound_message_processing_failed(self, **kwargs):
+            raise AssertionError("Duplicate payload should not be marked as failed.")
+
+        def create_outbound_message(self, **kwargs):
+            raise AssertionError("Duplicate payload should not enqueue outbound messages.")
+
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(routes, "repository", fake_repository)
+    monkeypatch.setattr(
+        routes,
+        "process_whatsapp_webhook",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("Duplicate payload should not be processed.")),
+    )
+
+    payload = {
+        "event": "message.received",
+        "from_number": "5511999999999",
+        "from_name": "Cliente Teste",
+        "text": "Olá",
+        "provider_message_id": "wamid.normalized.duplicate",
+    }
+    response = client.post("/webhooks/whatsapp", json=payload)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "processed": False,
+        "reason": "duplicate_provider_message_id",
+        "duplicate_status": "completed",
+        "payload_mode": "normalized",
+        "provider_message_id": "wamid.normalized.duplicate",
+    }
+    assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.normalized.duplicate"
 
 
 def test_whatsapp_webhook_ignores_non_message_meta_events() -> None:

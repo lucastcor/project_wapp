@@ -84,14 +84,35 @@ class FakeQueueRepository:
         self.queue_offers: dict[int, dict] = {}
         self.created_outbound_messages: list[dict] = []
         self.cancelled_reminders: list[int] = []
+        self.booking_lookup_calls: list[dict] = []
+        self.queue_entry_lookup_calls: list[dict] = []
+        self.entry_status_updates: list[dict] = []
+        self.offer_updates: list[dict] = []
 
-    def get_appointment_booking(self, booking_id: int):
-        return self.bookings.get(booking_id)
+    def get_appointment_booking(self, booking_id: int, *, company_id=None):
+        self.booking_lookup_calls.append({"booking_id": booking_id, "company_id": company_id})
+        booking = self.bookings.get(booking_id)
+        if booking is None:
+            return None
+        if company_id is not None and booking.get("company_id") != company_id:
+            return None
+        return booking
 
-    def update_appointment_booking_status(self, booking_id: int, status: str) -> None:
+    def update_appointment_booking_status(
+        self,
+        booking_id: int,
+        status: str,
+        *,
+        company_id=None,
+    ) -> None:
         self.bookings[booking_id]["status"] = status
 
-    def cancel_customer_reminders_for_booking(self, appointment_booking_id: int) -> int:
+    def cancel_customer_reminders_for_booking(
+        self,
+        appointment_booking_id: int,
+        *,
+        company_id=None,
+    ) -> int:
         self.cancelled_reminders.append(appointment_booking_id)
         return 1
 
@@ -103,10 +124,31 @@ class FakeQueueRepository:
             entries = [entry for entry in entries if entry["status"] == status]
         return entries
 
-    def get_appointment_queue_entry(self, entry_id: int):
-        return self.queue_entries.get(entry_id)
+    def get_appointment_queue_entry(self, entry_id: int, *, company_id=None):
+        self.queue_entry_lookup_calls.append({"entry_id": entry_id, "company_id": company_id})
+        entry = self.queue_entries.get(entry_id)
+        if entry is None:
+            return None
+        if company_id is not None and entry.get("company_id") != company_id:
+            return None
+        return entry
 
-    def update_appointment_queue_entry_status(self, entry_id: int, *, status: str, notes=None) -> None:
+    def update_appointment_queue_entry_status(
+        self,
+        entry_id: int,
+        *,
+        status: str,
+        notes=None,
+        company_id=None,
+    ) -> None:
+        self.entry_status_updates.append(
+            {
+                "entry_id": entry_id,
+                "status": status,
+                "notes": notes,
+                "company_id": company_id,
+            }
+        )
         self.queue_entries[entry_id]["status"] = status
         if notes is not None:
             self.queue_entries[entry_id]["notes"] = notes
@@ -132,10 +174,22 @@ class FakeQueueRepository:
         self.queue_offers[offer_id] = {"id": offer_id, **kwargs}
         return offer_id
 
-    def get_appointment_queue_offer(self, offer_id: int):
-        return self.queue_offers.get(offer_id)
+    def create_appointment_queue_entry(self, **kwargs):
+        entry_id = 1000 + len(self.queue_entries) + 1
+        self.queue_entries[entry_id] = {"id": entry_id, **kwargs}
+        return entry_id
+
+    def get_appointment_queue_offer(self, offer_id: int, *, company_id=None):
+        offer = self.queue_offers.get(offer_id)
+        if offer is None:
+            return None
+        if company_id is not None and offer.get("company_id") != company_id:
+            return None
+        return offer
 
     def update_appointment_queue_offer(self, offer_id: int, **kwargs) -> None:
+        self.offer_updates.append({"offer_id": offer_id, **kwargs})
+        kwargs.pop("company_id", None)
         self.queue_offers[offer_id].update(kwargs)
 
 
@@ -152,6 +206,26 @@ class FakeQueueLLMProvider:
         }
 
 
+def test_create_queue_entry_uses_company_scope_for_original_booking_lookup(monkeypatch) -> None:
+    fake_repository = FakeQueueRepository()
+    monkeypatch.setattr(queue_service, "repository", fake_repository)
+
+    entry = queue_service.create_queue_entry(
+        company_id=1,
+        contact_id="cliente-novo",
+        desired_title="Consulta derivada",
+        original_booking_id=91,
+    )
+
+    assert entry["company_id"] == 1
+    assert entry["original_booking_id"] == 91
+    assert fake_repository.booking_lookup_calls == [{"booking_id": 91, "company_id": 1}]
+    assert fake_repository.queue_entry_lookup_calls[-1] == {
+        "entry_id": entry["id"],
+        "company_id": 1,
+    }
+
+
 def test_release_booking_slot_creates_offer_for_highest_priority_candidate(monkeypatch) -> None:
     fake_repository = FakeQueueRepository()
     monkeypatch.setattr(queue_service, "repository", fake_repository)
@@ -161,15 +235,16 @@ def test_release_booking_slot_creates_offer_for_highest_priority_candidate(monke
     monkeypatch.setattr(
         queue_service,
         "dispatch_outbound_message",
-        lambda outbound_message_id, channel=None: {
+        lambda outbound_message_id, channel=None, company_id=None: {
             "outbound_message_id": outbound_message_id,
             "channel": channel,
+            "company_id": company_id,
         },
     )
     monkeypatch.setattr(
         calendar_service,
         "cancel_calendar_booking",
-        lambda booking_id: {
+        lambda booking_id, company_id=None: {
             "booking": {**fake_repository.bookings[booking_id], "status": "cancelled"},
             "cancelled_reminders": 1,
             "external_sync": {"status": "not_required"},
@@ -183,6 +258,7 @@ def test_release_booking_slot_creates_offer_for_highest_priority_candidate(monke
     assert result["external_sync"]["status"] == "not_required"
     assert result["queue_recovery"]["created_offer"]["queue_entry_id"] == 1
     assert fake_repository.created_outbound_messages[0]["contact_id"] == "cliente-remanejamento"
+    assert fake_repository.created_outbound_messages[0]["company_id"] == 1
     assert fake_repository.queue_entries[1]["status"] == "contacted"
 
 
@@ -212,9 +288,10 @@ def test_respond_to_queue_offer_declined_moves_to_next_candidate(monkeypatch) ->
     monkeypatch.setattr(
         queue_service,
         "dispatch_outbound_message",
-        lambda outbound_message_id, channel=None: {
+        lambda outbound_message_id, channel=None, company_id=None: {
             "outbound_message_id": outbound_message_id,
             "channel": channel,
+            "company_id": company_id,
         },
     )
 
@@ -255,9 +332,10 @@ def test_respond_to_queue_offer_accepted_creates_booking(monkeypatch) -> None:
     monkeypatch.setattr(
         queue_service,
         "dispatch_outbound_message",
-        lambda outbound_message_id, channel=None: {
+        lambda outbound_message_id, channel=None, company_id=None: {
             "outbound_message_id": outbound_message_id,
             "channel": channel,
+            "company_id": company_id,
         },
     )
     monkeypatch.setattr(
@@ -316,9 +394,10 @@ def test_process_due_queue_offers_sends_followup_after_wait_window(monkeypatch) 
     monkeypatch.setattr(
         queue_service,
         "dispatch_outbound_message",
-        lambda outbound_message_id, channel=None: {
+        lambda outbound_message_id, channel=None, company_id=None: {
             "outbound_message_id": outbound_message_id,
             "channel": channel,
+            "company_id": company_id,
         },
     )
 
@@ -327,6 +406,7 @@ def test_process_due_queue_offers_sends_followup_after_wait_window(monkeypatch) 
     assert processed[0]["action"] == "follow_up_sent"
     assert fake_repository.queue_offers[201]["status"] == "pending"
     assert fake_repository.created_outbound_messages[0]["source"] == "appointment_queue_waiting_followup"
+    assert fake_repository.offer_updates[0]["company_id"] == 1
 
 
 def test_process_queue_contact_message_keeps_customer_in_queue_without_losing_priority(monkeypatch) -> None:

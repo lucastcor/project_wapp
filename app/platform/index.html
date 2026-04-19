@@ -2,12 +2,14 @@
 <html lang="pt-BR">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Project WAPP Platform</title>
-    <meta
-      name="description"
-      content="Painel premium do Project WAPP para operar atendimento, agenda, treino e testes conversacionais."
-    />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover" />
+    <title>WAPP Platform</title>
+    <meta name="description" content="Plataforma premium para operar bot de atendimento WhatsApp com agendamento, lembretes e redução de faltas." />
+    <meta name="theme-color" content="#07100f" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="WAPP" />
+    <link rel="manifest" href="/platform/assets/manifest.json" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -19,8 +21,8 @@
   <body>
     <div id="platform-root"></div>
     <noscript>
-      <div style="padding: 24px; color: #f5f7f8; background: #07131d;">
-        A plataforma dedicada precisa de JavaScript habilitado.
+      <div style="padding: 24px; color: #f5f7f8; background: #07131d; font-family: system-ui, sans-serif;">
+        A plataforma precisa de JavaScript habilitado para funcionar.
       </div>
     </noscript>
     <script type="module" src="/platform/assets/app.js"></script>
