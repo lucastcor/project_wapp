@@ -5,6 +5,12 @@ from typing import Any
 
 from fastapi import Header, HTTPException, Request
 
+from app.api.company_scope import (
+    POLICY_PLATFORM_GLOBAL,
+    POLICY_TENANT,
+    resolve_route_policy,
+    set_authorized_scope,
+)
 from app.core.logging import get_request_context, log_event
 from app.services.admin_auth_service import (
     ADMIN_ROLE_HIERARCHY,
@@ -149,40 +155,23 @@ def build_require_admin_access(
                 except ValueError:
                     target_company_id = None
 
-            global_identity_paths = {
-                "/admin/companies",
-                "/admin/system/migrations",
-                "/admin/system/profile",
-                "/admin/system/readiness",
-                "/admin/calendar/providers",
-                "/admin/onboarding/presets",
-                "/admin/billing/plans",
-            }
-            tenant_scoped_prefixes = (
-                "/admin/state",
-                "/admin/observability",
-                "/admin/audit-events",
-                "/admin/system/onboarding",
-                "/admin/calendar",
-                "/admin/messages",
-                "/admin/contacts",
-                "/admin/company-context",
-                "/admin/pending-questions",
-                "/admin/knowledge-entries",
-                "/admin/message-examples",
-                "/admin/training-",
-                "/admin/finetuning",
-                "/admin/outbound-messages",
-                "/admin/analytics",
-                "/admin/reminders",
-                "/admin/billing",
-                "/admin/whatsapp",
-            )
-            if (
-                target_company_id is None
-                and request.url.path not in global_identity_paths
-                and request.url.path.startswith(tenant_scoped_prefixes)
-            ):
+            # A política declarada substitui a allowlist por prefixo que havia
+            # aqui. A allowlist liberava por omissão: um caminho fora da tupla
+            # não exigia empresa nenhuma, e foi assim que `/admin/simulator`
+            # — que processa uma mensagem em nome de uma empresa — ficou sem
+            # exigência. Agora o não declarado cai em `POLICY_TENANT`, então
+            # uma rota nova nasce exigindo empresa. Ver app/api/company_scope.py.
+            policy = resolve_route_policy(request.url.path, request.method)
+
+            if policy == POLICY_PLATFORM_GLOBAL:
+                # Sessão de identidade é sempre tenant-scoped: quem opera a
+                # plataforma se autentica pelo token de break-glass.
+                raise HTTPException(
+                    status_code=403,
+                    detail="This operation requires platform-level credentials.",
+                )
+
+            if target_company_id is None and policy == POLICY_TENANT:
                 raise HTTPException(
                     status_code=400,
                     detail="An explicit company_id or company_slug is required.",
@@ -198,6 +187,34 @@ def build_require_admin_access(
                 request.state.admin_role = ADMIN_ROLE_MAP[identity_role]
                 request.state.admin_identity_role = identity_role
                 request.state.admin_company_id = target_company_id
+
+            # O escopo autorizado vira fonte única para os handlers. Um handler
+            # que refaz a resolução por conta própria pode chegar a uma resposta
+            # diferente da que foi autorizada aqui — tipicamente caindo na
+            # primeira empresa ativa quando nenhuma foi informada.
+            set_authorized_scope(
+                request,
+                company_id=target_company_id,
+                company_ids=frozenset(membership_roles),
+                effective_role=(
+                    membership_roles.get(target_company_id, "")
+                    if target_company_id is not None
+                    else ""
+                ),
+                is_global=False,
+                policy=policy,
+            )
+        else:
+            # Token de break-glass: opera a plataforma inteira. `company_ids`
+            # é None, que significa "sem restrição", e não "conjunto vazio".
+            set_authorized_scope(
+                request,
+                company_id=None,
+                company_ids=None,
+                effective_role=resolved_role,
+                is_global=True,
+                policy=resolve_route_policy(request.url.path, request.method),
+            )
 
         log_event(
             logger,
