@@ -39,6 +39,11 @@ SAFE_BUILDERS = frozenset({
     # strict pattern and raise before the value can reach SQL.
     "_assert_sql_identifier",
     "_assert_sql_column_definition",
+    # DDL boundary validators in app/storage/schema_utils.py: same contract —
+    # fullmatch a strict pattern and raise before the value reaches SQL.
+    "assert_identifier",
+    "assert_index_columns",
+    "assert_definition",
 })
 
 # Builtins that only re-shape an already-safe collection.

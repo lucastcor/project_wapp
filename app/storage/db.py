@@ -1,4 +1,5 @@
 import importlib.util
+import itertools
 import re
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -2722,6 +2723,49 @@ MIGRATIONS: list[Migration] = [
     ("036_reliable_reminder_state", "Add reminder claims, retries and dead letters", _create_reliable_reminder_state),
     ("037_reliable_reminder_indexes", "Create reminder dispatch claim indexes", _create_reliable_reminder_indexes),
 ]
+
+# As migrations 038+ vivem em módulos próprios para que este arquivo não cresça
+# sem limite. A ordem de concatenação é a ordem de aplicação, e a numeração é
+# contínua (038-066), então `_assert_migration_versions_are_ordered` abaixo
+# falha na importação se um módulo for inserido fora de ordem ou se duas
+# migrations colidirem numa mesma versão.
+#
+# O import é feito aqui, no fim do módulo, e não no topo: `schema_utils`
+# consulta `get_database_backend()`, definido neste arquivo, e um import no
+# topo fecharia o ciclo.
+from app.storage.migrations_automation import AUTOMATION_MIGRATIONS  # noqa: E402
+from app.storage.migrations_hardening import HARDENING_MIGRATIONS  # noqa: E402
+from app.storage.migrations_identity import IDENTITY_MIGRATIONS  # noqa: E402
+from app.storage.migrations_platform import PLATFORM_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(PLATFORM_MIGRATIONS)
+MIGRATIONS.extend(IDENTITY_MIGRATIONS)
+MIGRATIONS.extend(HARDENING_MIGRATIONS)
+MIGRATIONS.extend(AUTOMATION_MIGRATIONS)
+
+
+def _assert_migration_versions_are_ordered() -> None:
+    """Falha na importação se a numeração das migrations estiver inconsistente.
+
+    Uma versão duplicada é o erro mais caro possível aqui: a segunda nunca
+    roda, porque `schema_migrations` já registrou aquela versão, e a
+    divergência de esquema só aparece em produção. Verificar na importação
+    custa microssegundos e torna o erro impossível de mesclar.
+    """
+    versions = [version for version, _name, _fn in MIGRATIONS]
+    duplicates = {version for version in versions if versions.count(version) > 1}
+    if duplicates:
+        raise RuntimeError(f"Duplicate migration versions: {sorted(duplicates)}")
+    if versions != sorted(versions):
+        out_of_order = [
+            (previous, current)
+            for previous, current in itertools.pairwise(versions)
+            if previous > current
+        ]
+        raise RuntimeError(f"Migration versions are out of order: {out_of_order}")
+
+
+_assert_migration_versions_are_ordered()
 
 
 def _ensure_schema_migrations_table(cursor: Any) -> None:
