@@ -4,8 +4,8 @@ import inspect
 import json
 import re
 import secrets
-from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.storage.db import (
@@ -16,7 +16,6 @@ from app.storage.db import (
     get_database_backend,
     is_unique_violation,
 )
-
 
 PLACEHOLDER_COMPANY_SLUGS = {
     "string",
@@ -39,6 +38,13 @@ PLACEHOLDER_COMPANY_NAMES = {
 # Partial unique index guaranteeing one active company per WhatsApp number.
 WHATSAPP_ACTIVE_PHONE_INDEX = "idx_whatsapp_bindings_active_phone"
 WHATSAPP_ACTIVE_PHONE_COLUMN = "whatsapp_channel_bindings.phone_number_id"
+
+
+def _assert_sql_identifier(column: str) -> str:
+    """Reject anything that is not a bare column identifier before interpolation."""
+    if not _SQL_IDENTIFIER_PATTERN.fullmatch(column):
+        raise ValueError(f"Unsafe SQL identifier: {column!r}")
+    return column
 
 
 def _is_active_phone_number_conflict(error: BaseException) -> bool:
@@ -438,10 +444,7 @@ class RuntimeRepository:
             slug = str(company.get("slug") or "").strip().lower()
             name = str(company.get("name") or "").strip().lower()
             is_placeholder = (
-                slug in PLACEHOLDER_COMPANY_SLUGS
-                or name in PLACEHOLDER_COMPANY_NAMES
-                or slug.startswith("demo-")
-                or slug.startswith("test-")
+                slug in PLACEHOLDER_COMPANY_SLUGS or name in PLACEHOLDER_COMPANY_NAMES or slug.startswith(("demo-", "test-"))
             )
             if not is_placeholder or not company.get("active"):
                 continue
@@ -4722,7 +4725,7 @@ class RuntimeRepository:
         )
         by_outcome = {str(row["group_key"] or "pending"): int(row["count"]) for row in cursor.fetchall()}
 
-        cancel_conditions = list(conditions) + ["status = 'cancelled'", "cancellation_reason IS NOT NULL", "cancellation_reason != ''"]
+        cancel_conditions = [*list(conditions), "status = 'cancelled'", "cancellation_reason IS NOT NULL", "cancellation_reason != ''"]
         cursor.execute(
             f"""
             SELECT cancellation_reason AS group_key, COUNT(*) AS count
@@ -4898,10 +4901,7 @@ class RuntimeRepository:
         where_clause = f" AND {' AND '.join(conditions)}" if conditions else ""
 
         backend = get_database_backend()
-        if backend == "postgres":
-            month_extract = "TO_CHAR(starts_at, 'YYYY-MM')"
-        else:
-            month_extract = "strftime('%Y-%m', starts_at)"
+        month_extract = "TO_CHAR(starts_at, 'YYYY-MM')" if backend == "postgres" else "strftime('%Y-%m', starts_at)"
 
         cursor.execute(
             f"""
@@ -4918,7 +4918,7 @@ class RuntimeRepository:
             GROUP BY {month_extract}
             ORDER BY month ASC
             """,
-            tuple([f"-{months} months"] + params),
+            tuple([f"-{months} months", *params]),
         )
 
         trend = []
@@ -5252,9 +5252,13 @@ class RuntimeRepository:
             return
 
         # Column names come from the `allowed` whitelist above, never from callers.
-        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        # Keys come from the `allowed` whitelist above; validating them here
+        # makes the SET clause provably safe at the point of construction.
+        set_clause = ", ".join(
+            f"{_assert_sql_identifier(column)} = ?" for column in updates
+        )
         company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-        params = list(updates.values()) + [subscription_id, *company_id_params]
+        params = [*list(updates.values()), subscription_id, *company_id_params]
 
         connection = get_connection()
         cursor = connection.cursor()

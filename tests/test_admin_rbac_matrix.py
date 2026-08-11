@@ -103,8 +103,10 @@ def _admin_mutating_routes() -> list[tuple[str, str]]:
     for route in _iter_api_routes(app.routes):
         if not route.path.startswith("/admin"):
             continue
-        for method in sorted(set(route.methods or set()) & MUTATING_HTTP_METHODS):
-            entries.append((method, route.path))
+        entries.extend(
+            (method, route.path)
+            for method in sorted(set(route.methods or set()) & MUTATING_HTTP_METHODS)
+        )
     return sorted(entries)
 
 

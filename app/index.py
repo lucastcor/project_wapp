@@ -7,5 +7,4 @@ Migrations are intentionally not run by serverless cold starts. Configure
 
 from app.main import app
 
-
 __all__ = ["app"]

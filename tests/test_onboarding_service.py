@@ -1,12 +1,12 @@
 from app.services import onboarding_service
 from app.services.onboarding_service import (
+    BUSINESS_TYPE_PRESETS,
     OnboardingError,
-    get_onboarding_presets,
-    setup_company,
-    get_setup_status,
     _build_company_context,
     _slugify,
-    BUSINESS_TYPE_PRESETS,
+    get_onboarding_presets,
+    get_setup_status,
+    setup_company,
 )
 
 
@@ -79,7 +79,7 @@ def test_get_onboarding_presets():
     assert "business_types" in presets
     assert "timezones" in presets
     assert len(presets["business_types"]) == len(BUSINESS_TYPE_PRESETS)
-    for key, info in presets["business_types"].items():
+    for info in presets["business_types"].values():
         assert "label" in info
         assert "key" in info
 
@@ -184,7 +184,7 @@ def test_setup_company_rejects_empty_name(monkeypatch):
 
     try:
         setup_company(company_name="", business_type_key="clinica")
-        assert False, "Should have raised OnboardingError"
+        raise AssertionError("Should have raised OnboardingError")
     except OnboardingError as exc:
         assert "company_name" in str(exc)
 
@@ -194,7 +194,7 @@ def test_setup_company_rejects_invalid_business_type(monkeypatch):
 
     try:
         setup_company(company_name="Teste", business_type_key="invalid_type")
-        assert False, "Should have raised OnboardingError"
+        raise AssertionError("Should have raised OnboardingError")
     except OnboardingError as exc:
         assert "Invalid business_type_key" in str(exc)
 
@@ -207,7 +207,7 @@ def test_setup_company_rejects_duplicate_slug(monkeypatch):
 
     try:
         setup_company(company_name="Clinica Unica", business_type_key="clinica")
-        assert False, "Should have raised OnboardingError"
+        raise AssertionError("Should have raised OnboardingError")
     except OnboardingError as exc:
         assert "already exists" in str(exc)
 
@@ -247,7 +247,7 @@ def test_get_setup_status_not_found(monkeypatch):
 
     try:
         get_setup_status(999)
-        assert False, "Should have raised OnboardingError"
+        raise AssertionError("Should have raised OnboardingError")
     except OnboardingError as exc:
         assert "not found" in str(exc)
 

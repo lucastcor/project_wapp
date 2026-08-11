@@ -1,6 +1,6 @@
 import json
-from collections import Counter
 import random
+from collections import Counter
 from typing import Any
 
 from app.core.training_config import (
@@ -12,9 +12,7 @@ from app.core.training_config import (
     SENSITIVE_MARKERS,
     VALIDATION_RATIO,
 )
-
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 
@@ -112,18 +110,14 @@ def is_example_eligible_for_training(example: dict[str, Any]) -> bool:
     if not customer_message or not approved_reply:
         return False
 
-    if _looks_sensitive(customer_message) or _looks_sensitive(approved_reply):
-        return False
-
-    return True
+    return not (_looks_sensitive(customer_message) or _looks_sensitive(approved_reply))
 
 
 def get_curated_training_examples(company_id: int | None = None) -> list[dict[str, Any]]:
     examples = repository.get_exportable_message_examples(company_id=company_id)
     eligible_examples = [example for example in examples if is_example_eligible_for_training(example)]
     deduplicated_examples = deduplicate_examples(eligible_examples)
-    curated_examples = limit_examples_per_scenario(deduplicated_examples)
-    return curated_examples
+    return limit_examples_per_scenario(deduplicated_examples)
 
 
 
@@ -213,7 +207,9 @@ def split_examples(
         return {"train": [], "validation": []}
 
     shuffled = examples[:]
-    random.Random(seed).shuffle(shuffled)
+
+    # not used for tokens, secrets or any security decision.
+    random.Random(seed).shuffle(shuffled)  # noqa: S311
 
     validation_size = max(1, int(len(shuffled) * validation_ratio)) if len(shuffled) > 1 else 0
     validation_examples = shuffled[:validation_size]
@@ -292,7 +288,9 @@ def split_training_records(
         return {"train": [], "validation": []}
 
     shuffled = records[:]
-    random.Random(seed).shuffle(shuffled)
+
+    # not used for tokens, secrets or any security decision.
+    random.Random(seed).shuffle(shuffled)  # noqa: S311
 
     validation_size = max(1, int(len(shuffled) * validation_ratio)) if len(shuffled) > 1 else 0
     validation_records = shuffled[:validation_size]

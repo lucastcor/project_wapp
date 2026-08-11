@@ -2,17 +2,17 @@ import logging
 import time
 from typing import Any
 
+from app.core.company_context import get_company_context
 from app.core.logging import get_logger, log_event, mask_identifier
+from app.services.billing_service import consume_usage
 from app.services.classification_service import classify_message
+from app.services.conversation_workflow_service import handle_conversation_workflow
 from app.services.decision_service import MessageDecision, decide_message_action
-from app.storage.repository import RuntimeRepository
-from app.services.reply_services import generate_business_reply
+from app.services.handoff_service import HandoffDecision, should_create_pending_question
 from app.services.memory_service import update_conversation_summary
 from app.services.pipeline_service import infer_pipeline_state
-from app.services.handoff_service import HandoffDecision, should_create_pending_question
-from app.core.company_context import get_company_context
-from app.services.conversation_workflow_service import handle_conversation_workflow
-from app.services.billing_service import consume_usage
+from app.services.reply_services import generate_business_reply
+from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)

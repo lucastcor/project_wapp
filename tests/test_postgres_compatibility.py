@@ -20,7 +20,6 @@ from app.storage.db import (
 )
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 
@@ -37,20 +36,20 @@ def tenant() -> dict:
 
 # Each entry: (label, callable taking the filter kwargs).
 OPTIONAL_FILTER_LISTINGS = [
-    ("appointment_bookings", lambda **kw: repository.get_appointment_bookings(**kw)),
-    ("knowledge_entries", lambda **kw: repository.get_knowledge_entries(**kw)),
-    ("customer_reminders", lambda **kw: repository.get_customer_reminders(**kw)),
-    ("pending_questions", lambda **kw: repository.get_pending_questions(**kw)),
-    ("audit_events", lambda **kw: repository.get_audit_events(**kw)),
-    ("messages", lambda **kw: repository.get_messages(**kw)),
-    ("contacts", lambda **kw: repository.get_contacts(**kw)),
-    ("outbound_messages", lambda **kw: repository.get_outbound_messages(**kw)),
-    ("finetuning_jobs", lambda **kw: repository.get_finetuning_job_records(**kw)),
-    ("message_examples", lambda **kw: repository.get_message_examples(**kw)),
-    ("queue_entries", lambda **kw: repository.get_appointment_queue_entries(**kw)),
-    ("queue_offers", lambda **kw: repository.get_appointment_queue_offers(**kw)),
-    ("calendar_integrations", lambda **kw: repository.get_calendar_integrations(**kw)),
-    ("active_knowledge_entries", lambda **kw: repository.get_active_knowledge_entries(**kw)),
+    ("appointment_bookings", repository.get_appointment_bookings),
+    ("knowledge_entries", repository.get_knowledge_entries),
+    ("customer_reminders", repository.get_customer_reminders),
+    ("pending_questions", repository.get_pending_questions),
+    ("audit_events", repository.get_audit_events),
+    ("messages", repository.get_messages),
+    ("contacts", repository.get_contacts),
+    ("outbound_messages", repository.get_outbound_messages),
+    ("finetuning_jobs", repository.get_finetuning_job_records),
+    ("message_examples", repository.get_message_examples),
+    ("queue_entries", repository.get_appointment_queue_entries),
+    ("queue_offers", repository.get_appointment_queue_offers),
+    ("calendar_integrations", repository.get_calendar_integrations),
+    ("active_knowledge_entries", repository.get_active_knowledge_entries),
 ]
 
 
@@ -286,7 +285,7 @@ def test_repeated_repository_failures_do_not_exhaust_the_pool(monkeypatch) -> No
         real_cursor = connection.cursor
 
         def broken_cursor():
-            cursor = real_cursor()
+            real_cursor()
             raise RuntimeError("injected cursor failure")
 
         connection.cursor = broken_cursor  # type: ignore[method-assign]
@@ -435,7 +434,7 @@ def test_putconn_failure_after_successful_rollback_discards_the_connection() -> 
 
 
 def test_putconn_failure_after_rollback_failure_still_discards() -> None:
-    wrapper, raw, pool = _wrapper(fail_rollback=True, fail_putconn=True)
+    wrapper, raw, _pool = _wrapper(fail_rollback=True, fail_putconn=True)
 
     wrapper.close()
 
@@ -446,7 +445,7 @@ def test_putconn_failure_after_rollback_failure_still_discards() -> None:
 
 def test_close_never_raises_even_when_every_cleanup_step_fails() -> None:
     """Cleanup failures must not mask the application exception in flight."""
-    wrapper, raw, _pool = _wrapper(fail_rollback=True, fail_putconn=True, fail_close=True)
+    wrapper, _raw, _pool = _wrapper(fail_rollback=True, fail_putconn=True, fail_close=True)
 
     wrapper.close()  # must not raise
 
@@ -479,7 +478,7 @@ def test_repository_failure_then_successful_reuse_with_a_tiny_pool(monkeypatch) 
         real_cursor = connection.cursor
 
         def broken_cursor():
-            cursor = real_cursor()
+            real_cursor()
             raise RuntimeError("injected cursor failure")
 
         connection.cursor = broken_cursor  # type: ignore[method-assign]

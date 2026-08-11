@@ -5,7 +5,6 @@ from app.core.config import settings
 from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
 
-
 VALID_PIPELINE_STAGES = {
     "novo_lead",
     "qualificando",

@@ -1,5 +1,5 @@
-import logging
 import hmac
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -143,12 +143,7 @@ def build_require_admin_access(
                 if not company:
                     raise HTTPException(status_code=404, detail="Company not found.")
                 target_company_id = int(company["id"])
-            elif request.url.path.startswith("/admin/companies/"):
-                try:
-                    target_company_id = int(request.url.path.rsplit("/", 1)[-1])
-                except ValueError:
-                    target_company_id = None
-            elif request.url.path.startswith("/admin/onboarding/setup-status/"):
+            elif request.url.path.startswith("/admin/companies/") or request.url.path.startswith("/admin/onboarding/setup-status/"):
                 try:
                     target_company_id = int(request.url.path.rsplit("/", 1)[-1])
                 except ValueError:

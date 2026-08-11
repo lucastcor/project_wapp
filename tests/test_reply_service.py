@@ -1,6 +1,6 @@
 from app.core.config import settings
-from app.services.reply_services import generate_business_reply
 from app.services import reply_services
+from app.services.reply_services import generate_business_reply
 
 
 def test_reply_service_fallback_for_lead(monkeypatch) -> None:

@@ -60,7 +60,6 @@ class FakeRepository:
             "contact_id": contact_id,
             "company_id": company_id,
         }
-        return None
 
     def save_message(self, **kwargs) -> None:
         self.saved_messages.append(kwargs)

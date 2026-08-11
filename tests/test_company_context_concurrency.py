@@ -20,7 +20,6 @@ from app.core.company_context import (
 )
 from app.storage.repository import RuntimeRepository
 
-
 BARRIER_TIMEOUT_SECONDS = 10.0
 JOIN_TIMEOUT_SECONDS = 30.0
 
@@ -50,7 +49,7 @@ def _run_concurrently(worker, count: int) -> list:
             results[index] = ("ok", worker(index))
         except CompanyContextConflictError as exc:
             results[index] = ("conflict", exc)
-        except Exception as exc:  # noqa: BLE001 - the failure mode is the assertion
+        except Exception as exc:
             results[index] = ("error", exc)
 
     for index in range(count):

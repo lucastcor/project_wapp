@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any, Mapping
+from typing import Any
 
 from app.core.config import is_missing_or_placeholder, settings
 from app.services.billing_service import seed_plans
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 SUPPORTED_WEBHOOK_EVENTS = {

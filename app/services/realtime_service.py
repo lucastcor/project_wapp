@@ -16,9 +16,7 @@ import time
 from typing import Any
 
 from app.core.config import settings
-from app.core.logging import get_logger, log_event
-from app.core.logging import mask_identifier
-
+from app.core.logging import get_logger, log_event, mask_identifier
 
 logger = get_logger(__name__)
 

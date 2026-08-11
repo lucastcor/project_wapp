@@ -322,10 +322,7 @@ def activate_subscription(
     sub = repository.get_billing_subscription(company_id)
     now = datetime.now(UTC)
 
-    if billing_cycle == "annual":
-        period_end = now + timedelta(days=365)
-    else:
-        period_end = now + timedelta(days=30)
+    period_end = now + timedelta(days=365) if billing_cycle == "annual" else now + timedelta(days=30)
 
     if sub:
         repository.update_billing_subscription(
@@ -402,10 +399,7 @@ def reactivate_subscription(
         raise BillingError("billing_cycle must be 'monthly' or 'annual'.")
 
     now = datetime.now(UTC)
-    if billing_cycle == "annual":
-        period_end = now + timedelta(days=365)
-    else:
-        period_end = now + timedelta(days=30)
+    period_end = now + timedelta(days=365) if billing_cycle == "annual" else now + timedelta(days=30)
 
     repository.update_billing_subscription(
         sub["id"],

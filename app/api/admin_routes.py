@@ -3,18 +3,23 @@ import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
+
+from app.api.admin_security import (
+    build_require_admin_access,
+    build_require_admin_role,
+)
+from app.api.admin_support import build_prometheus_metrics, record_audit_event
 from app.api.schemas import (
-    AppointmentBookingPayload,
     AppointmentBookingCancellationPayload,
+    AppointmentBookingPayload,
     AppointmentBookingReschedulePayload,
     AppointmentQueueEntryPayload,
     AppointmentQueueOfferResponsePayload,
     BookingOutcomePayload,
     CalendarAvailabilityQueryPayload,
     CalendarIntegrationPayload,
-    CancelSubscriptionPayload,
     CancellationReasonPayload,
-    OnboardingSetupPayload,
+    CancelSubscriptionPayload,
     CompanyContextPayload,
     CompanyContextRecordResponse,
     CompanyCreatePayload,
@@ -24,26 +29,18 @@ from app.api.schemas import (
     IncomingMessageResponse,
     InternalReminderPayload,
     MessageExampleCreatePayload,
+    OnboardingSetupPayload,
     PendingQuestionAnswerPayload,
     PlanChangePayload,
     ReactivateSubscriptionPayload,
-    SubscriptionActivatePayload,
     StripeCheckoutPayload,
+    SubscriptionActivatePayload,
     TrainingImportPayload,
     UsageRecordPayload,
     WhatsAppBindingPayload,
     WhatsAppBindingResponse,
     WhatsAppBindingStatePayload,
 )
-from app.api.admin_security import (
-    build_require_admin_access,
-    build_require_admin_role,
-)
-from app.api.admin_support import build_prometheus_metrics, record_audit_event
-
-from app.core.orchestrator import process_incoming_message
-from app.storage.repository import RuntimeRepository
-
 from app.core.company_context import (
     CompanyContextConflictError,
     CompanyContextError,
@@ -51,32 +48,16 @@ from app.core.company_context import (
     get_company_context_record,
     save_company_context_record,
 )
-from app.services.handoff_service import normalize_owner_resolution
-from app.services.knowledge_service import (
-    build_knowledge_entry_from_resolution,
-    should_store_resolution_as_knowledge,
-)
-
-from app.services.training_export_service import (
-    export_finetuning_bundle_as_json,
-    export_finetuning_train_jsonl,
-    export_finetuning_validation_jsonl,
-    export_training_records_as_json,
-    export_training_records_as_jsonl,
-    export_training_review_report_as_json,
-    export_training_split_as_json,
-)
-from app.services.training_import_service import TrainingImportError, import_training_records
-
-from app.services.outbound_dispatch_service import (
-    OutboundDispatchError,
-    dispatch_outbound_message,
-    dispatch_pending_outbound_messages,
-)
-from app.services.system_readiness_service import (
-    get_onboarding_status,
-    get_system_profile,
-    get_system_readiness,
+from app.core.config import settings
+from app.core.logging import get_logger, log_event, mask_identifier
+from app.core.orchestrator import process_incoming_message
+from app.services.appointment_queue_service import (
+    AppointmentQueueError,
+    create_queue_entry,
+    list_queue_entries,
+    list_queue_offers,
+    release_booking_slot,
+    respond_to_queue_offer,
 )
 from app.services.calendar_service import (
     CalendarProviderError,
@@ -91,25 +72,46 @@ from app.services.calendar_service import (
     query_calendar_availability,
     reschedule_calendar_booking,
 )
+from app.services.finetuning_service import FineTuningError, FineTuningService
+from app.services.handoff_service import normalize_owner_resolution
+from app.services.knowledge_service import (
+    build_knowledge_entry_from_resolution,
+    should_store_resolution_as_knowledge,
+)
+from app.services.outbound_dispatch_service import (
+    OutboundDispatchError,
+    dispatch_outbound_message,
+    dispatch_pending_outbound_messages,
+)
+from app.services.realtime_service import (
+    broadcast_event,
+    publish_incoming_message_event,
+)
 from app.services.reminder_service import (
     ReminderServiceError,
     create_internal_reminder,
     dispatch_due_reminders,
     list_reminders,
 )
-from app.services.appointment_queue_service import (
-    AppointmentQueueError,
-    create_queue_entry,
-    list_queue_entries,
-    list_queue_offers,
-    release_booking_slot,
-    respond_to_queue_offer,
+from app.services.system_readiness_service import (
+    get_onboarding_status,
+    get_system_profile,
+    get_system_readiness,
 )
-
-from app.core.config import settings
-from app.services.realtime_service import broadcast_event, publish_incoming_message_event
-from app.services.finetuning_service import FineTuningError, FineTuningService
-from app.core.logging import get_logger, log_event, mask_identifier
+from app.services.training_export_service import (
+    export_finetuning_bundle_as_json,
+    export_finetuning_train_jsonl,
+    export_finetuning_validation_jsonl,
+    export_training_records_as_json,
+    export_training_records_as_jsonl,
+    export_training_review_report_as_json,
+    export_training_split_as_json,
+)
+from app.services.training_import_service import (
+    TrainingImportError,
+    import_training_records,
+)
+from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
@@ -1709,7 +1711,10 @@ def record_cancellation_reason_endpoint(
     request: Request,
     company_id: int | None = Query(default=None),
 ) -> dict:
-    from app.services.analytics_service import AnalyticsError, record_cancellation_reason
+    from app.services.analytics_service import (
+        AnalyticsError,
+        record_cancellation_reason,
+    )
 
     try:
         result = (

@@ -263,7 +263,7 @@ def test_unmapped_source_column_fails_before_connecting_to_postgres(
     with sqlite3.connect(source) as connection:
         connection.execute("ALTER TABLE appointment_bookings ADD COLUMN future_value TEXT")
 
-    with pytest.raises(RuntimeError, match="unmapped column: appointment_bookings.future_value"):
+    with pytest.raises(RuntimeError, match=r"unmapped column: appointment_bookings\.future_value"):
         migrate(
             sqlite_path=str(source),
             postgres_url="postgresql://unused/unused",
@@ -509,8 +509,9 @@ def test_migration_failure_rolls_back_target_data(
     postgres_target,
     monkeypatch,
 ) -> None:
-    import app.tools.migrate_sqlite_to_postgres as migration_module
     import psycopg
+
+    import app.tools.migrate_sqlite_to_postgres as migration_module
 
     original_url = settings.database_url
     original_pg_url = settings.postgres_database_url
@@ -591,7 +592,7 @@ def test_legacy_source_missing_required_column_fails(
         )
         connection.execute("INSERT INTO companies (id, name) VALUES (1, 'Missing slug')")
 
-    with pytest.raises(RuntimeError, match="lacks required columns.*slug"):
+    with pytest.raises(RuntimeError, match=r"lacks required columns.*slug"):
         migrate(sqlite_path=str(source), postgres_url=postgres_target)
 
 

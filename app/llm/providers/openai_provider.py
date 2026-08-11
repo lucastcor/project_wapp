@@ -3,9 +3,8 @@ from typing import Any
 
 from openai import OpenAI
 
-
-from app.core.config import settings
 from app.core.company_context import get_company_context
+from app.core.config import settings
 
 
 class OpenAIProvider:
@@ -135,7 +134,7 @@ class OpenAIProvider:
         )
 
         return response.output_text.strip()
-    
+
     def generate_conversation_summary(
         self,
         previous_summary: str | None,
@@ -163,7 +162,7 @@ class OpenAIProvider:
         )
 
         return response.output_text.strip()
-    
+
     def infer_pipeline_state(
         self,
         conversation_summary: str | None,
@@ -227,7 +226,7 @@ class OpenAIProvider:
 
         content = response.output_text
         return json.loads(content)
-    
+
     def classify_message(self, message: str) -> dict[str, Any]:
         response = self.client.responses.create(
             model=self.model,

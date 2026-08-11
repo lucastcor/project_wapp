@@ -2,7 +2,6 @@ from typing import Any
 
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 
@@ -71,16 +70,13 @@ def format_style_examples_for_prompt(examples: list[dict[str, Any]]) -> str:
     if not examples:
         return "- Nenhum exemplo de estilo aprovado cadastrado"
 
-    formatted_examples: list[str] = []
-    for example in examples:
-        formatted_examples.append(
-            (
-                f"- Perfil: {example.get('profile_name', DEFAULT_PROFILE_NAME)} "
-                f"| Cenário: {example.get('scenario_type', DEFAULT_SCENARIO_TYPE)}\n"
-                f"  Cliente: {example.get('customer_message', '')}\n"
-                f"  Resposta aprovada: {example.get('approved_reply', '')}\n"
-                f"  Notas de estilo: {example.get('style_notes', '')}"
-            )
-        )
+    formatted_examples: list[str] = [
+        f"- Perfil: {example.get('profile_name', DEFAULT_PROFILE_NAME)} "
+        f"| Cenário: {example.get('scenario_type', DEFAULT_SCENARIO_TYPE)}\n"
+        f"  Cliente: {example.get('customer_message', '')}\n"
+        f"  Resposta aprovada: {example.get('approved_reply', '')}\n"
+        f"  Notas de estilo: {example.get('style_notes', '')}"
+        for example in examples
+    ]
 
     return "\n".join(formatted_examples)

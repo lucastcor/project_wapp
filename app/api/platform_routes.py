@@ -1,8 +1,9 @@
 import asyncio
 import hmac
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import FileResponse, RedirectResponse
@@ -43,14 +44,13 @@ from app.services.platform_session_service import (
     clear_platform_session_cookie,
     read_platform_session,
 )
-from app.services.realtime_service import hub
 from app.services.rate_limit_service import get_request_client_ip
+from app.services.realtime_service import hub
 from app.services.transactional_email_service import (
     TransactionalEmailError,
     send_invitation_email,
     send_password_reset_email,
 )
-
 
 PLATFORM_DIR = Path(__file__).resolve().parent.parent / "platform"
 PLATFORM_ASSETS_DIR = PLATFORM_DIR / "assets"
@@ -409,7 +409,7 @@ async def sse_stream(request: Request) -> StreamingResponse:
                 try:
                     payload = await asyncio.wait_for(subscription.queue.get(), timeout=25.0)
                     yield f"data: {payload}\n\n"
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     # Keep-alive ping every 25s to prevent proxy timeouts
                     yield ": heartbeat\n\n"
         finally:

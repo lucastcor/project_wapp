@@ -1,8 +1,11 @@
+import importlib.util
+import re
 import sqlite3
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, Sequence
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from app.core.config import settings
@@ -370,9 +373,10 @@ def get_connection() -> Any:
         # SQLite does not enforce declared foreign keys unless every connection
         # enables them. Tenant isolation must not depend on the caller.
         raw_sqlite.execute("PRAGMA foreign_keys = ON")
-        raw_sqlite.execute(
-            f"PRAGMA busy_timeout = {max(5000, settings.database_statement_timeout_ms)}"
-        )
+        # PRAGMA takes no bind parameters, so the value is interpolated; int()
+        # makes it structurally impossible for the setting to carry SQL.
+        busy_timeout_ms = int(max(5000, settings.database_statement_timeout_ms))
+        raw_sqlite.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
         return _register_connection(SqliteConnectionWrapper(raw_sqlite))
 
     pool = _get_postgres_pool()
@@ -570,14 +574,12 @@ def get_postgres_target_summary() -> dict[str, str | bool | int | None]:
     parsed = urlparse(configured_url)
     query_params = parse_qs(parsed.query or "")
 
-    driver_available = False
-    try:
-        import psycopg  # type: ignore # noqa: F401
-        import psycopg_pool  # type: ignore # noqa: F401
-    except ImportError:
-        driver_available = False
-    else:
-        driver_available = True
+    # Availability probe only: find_spec avoids importing the drivers (and their
+    # C extensions) just to report whether the Postgres backend is installable.
+    driver_available = all(
+        importlib.util.find_spec(module) is not None
+        for module in ("psycopg", "psycopg_pool")
+    )
 
     support_level = "active" if configured_url == settings.database_url and get_database_backend() == "postgres" else "target_only"
     return {
@@ -678,15 +680,50 @@ def check_postgres_target_connection() -> dict[str, str | bool]:
     }
 
 
+_SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# DDL column definitions are migration-authored fragments; keep them to the
+# small vocabulary the migrations actually use so nothing else can slip in.
+# Covers the vocabulary the migrations use: types, NOT NULL, DEFAULT literals
+# (including JSON defaults such as '{}'), precision and enum-ish check values.
+# Notably excludes ';' so a definition cannot append a second statement.
+_SQL_COLUMN_DEFINITION_PATTERN = re.compile(r"""^[A-Za-z0-9_ ()'{}:.,\-]+$""")
+
+
+def _assert_sql_identifier(value: str, *, kind: str) -> str:
+    """Reject anything that is not a bare SQL identifier.
+
+    These helpers receive their arguments from migration code only, but the
+    check makes that guarantee local and enforceable instead of relying on
+    every present and future call site.
+    """
+    if not _SQL_IDENTIFIER_PATTERN.fullmatch(value):
+        raise ValueError(f"Unsafe {kind} identifier in migration: {value!r}")
+    return value
+
+
+def _assert_sql_column_definition(definition: str) -> str:
+    if not _SQL_COLUMN_DEFINITION_PATTERN.fullmatch(definition):
+        raise ValueError(f"Unsafe column definition in migration: {definition!r}")
+    return definition
+
+
 def _ensure_sqlite_column(cursor: Any, table: str, column: str, definition: str) -> None:
-    cursor.execute(f"PRAGMA table_info({table})")
+    safe_table = _assert_sql_identifier(table, kind="table")
+    safe_column = _assert_sql_identifier(column, kind="column")
+    safe_definition = _assert_sql_column_definition(definition)
+    cursor.execute(f"PRAGMA table_info({safe_table})")
     existing_columns = {row["name"] for row in cursor.fetchall()}
     if column not in existing_columns:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        cursor.execute(f"ALTER TABLE {safe_table} ADD COLUMN {safe_column} {safe_definition}")
 
 
 def _ensure_postgres_column(cursor: Any, table: str, column: str, definition: str) -> None:
-    cursor.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+    safe_table = _assert_sql_identifier(table, kind="table")
+    safe_column = _assert_sql_identifier(column, kind="column")
+    safe_definition = _assert_sql_column_definition(definition)
+    cursor.execute(
+        f"ALTER TABLE {safe_table} ADD COLUMN IF NOT EXISTS {safe_column} {safe_definition}"
+    )
 
 
 def _create_runtime_tables_sqlite(cursor: Any) -> None:
@@ -1656,10 +1693,7 @@ def _create_queue_tables(cursor: Any) -> None:
 
 
 def _add_booking_outcome_columns(cursor: Any) -> None:
-    if get_database_backend() == "postgres":
-        ensure_column = _ensure_postgres_column
-    else:
-        ensure_column = _ensure_sqlite_column
+    ensure_column = _ensure_postgres_column if get_database_backend() == "postgres" else _ensure_sqlite_column
 
     ensure_column(cursor, "appointment_bookings", "booking_outcome", "TEXT")
     ensure_column(cursor, "appointment_bookings", "booking_outcome_at", "TIMESTAMP")
@@ -2640,10 +2674,7 @@ SQLITE_ID_TABLES_BILLING = {"billing_plans", "billing_subscriptions", "billing_u
 
 def _repair_queue_columns(cursor: Any) -> None:
     """Ensure all queue columns exist for databases created before migration 011."""
-    if get_database_backend() == "postgres":
-        ensure_column = _ensure_postgres_column
-    else:
-        ensure_column = _ensure_sqlite_column
+    ensure_column = _ensure_postgres_column if get_database_backend() == "postgres" else _ensure_sqlite_column
 
     ensure_column(cursor, "appointment_queue_entries", "scheduling_profile_key", "TEXT")
     ensure_column(cursor, "appointment_queue_entries", "customer_profile", "TEXT")

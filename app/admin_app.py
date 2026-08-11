@@ -1,8 +1,7 @@
-# ruff: noqa: E402
 
-from pathlib import Path
 import os
 import sys
+from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -21,8 +20,6 @@ from app.ui.pages.message_examples_page import render_message_examples_page
 from app.ui.pages.outbound_page import render_outbound_page
 from app.ui.pages.pending_questions_page import render_pending_questions_page
 from app.ui.pages.system_page import render_system_page
-
-
 
 st.set_page_config(
     page_title="Project WAPP Admin",

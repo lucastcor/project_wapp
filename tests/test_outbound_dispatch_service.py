@@ -200,7 +200,7 @@ def test_dispatch_outbound_message_raises_for_unsupported_channel(monkeypatch) -
 
     try:
         dispatch_outbound_message(outbound_message_id=1, channel="email")
-        assert False, "Expected OutboundDispatchError to be raised"
+        raise AssertionError("Expected OutboundDispatchError to be raised")
     except OutboundDispatchError as exc:
         assert "unsupported outbound channel" in str(exc).lower()
 
@@ -215,7 +215,7 @@ def test_dispatch_outbound_message_raises_when_whatsapp_provider_fails(monkeypat
 
     try:
         dispatch_outbound_message(outbound_message_id=1, channel="whatsapp")
-        assert False, "Expected OutboundDispatchError to be raised"
+        raise AssertionError("Expected OutboundDispatchError to be raised")
     except OutboundDispatchError as exc:
         assert "falha no provider whatsapp" in str(exc).lower()
         assert fake_repository.marked_as_sent == []

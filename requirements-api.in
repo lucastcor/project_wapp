@@ -1,5 +1,8 @@
 # Direct dependencies for the API, worker and Vercel runtime.
 caldav
+# Security floor, not a direct import: pulled transitively (google-auth, caldav,
+# stripe). 49.0.0 carries PYSEC-2026-3552; 50.0.0 is the fixed release.
+cryptography>=50.0.0
 fastapi
 google-api-python-client
 google-auth

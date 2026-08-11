@@ -1,3 +1,6 @@
 # Installed on top of the API runtime by the dedicated admin image.
 requests
 streamlit
+# Security floor, not a direct import: pulled transitively by streamlit.
+# 3.1.57 carries GHSA-jm78-9fvv-mhgr; 3.1.58 is the fixed release.
+gitpython>=3.1.58

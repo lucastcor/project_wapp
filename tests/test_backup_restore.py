@@ -25,7 +25,6 @@ from app.tools.export_runtime_backup import (
     write_backup_file,
 )
 
-
 repository = RuntimeRepository()
 
 
@@ -38,7 +37,7 @@ def seeded_installation():
     company_a = repository.create_company(slug=f"br-a-{suffix}", name="Backup Tenant A")
     company_b = repository.create_company(slug=f"br-b-{suffix}", name="Backup Tenant B")
 
-    for company_id, slug, label in [
+    for _company_id, slug, label in [
         (company_a, f"br-a-{suffix}", "Tenant A Context"),
         (company_b, f"br-b-{suffix}", "Tenant B Context"),
     ]:
@@ -213,9 +212,9 @@ def test_backup_sanitizes_persisted_nested_calendar_credentials(seeded_installat
 
     assert "PERSISTED_CLIENT_SECRET_SENTINEL" not in serialized
     assert "PERSISTED_REFRESH_TOKEN_SENTINEL" not in serialized
-    exported = [
+    exported = next(
         row for row in payload["tables"]["calendar_integrations"] if row["id"] == integration_id
-    ][0]
+    )
     config = json.loads(exported["config_json"])
     assert config["calendar_id"] == "primary"
     assert config["client_id"] == "public-client-id"
@@ -304,7 +303,7 @@ def test_restore_preserves_active_binding_uniqueness(seeded_installation, tmp_pa
     assert all(count == 1 for count in active_per_phone.values())
 
     # The restored constraint is still enforced afterwards.
-    company_b = [c for c in repository.get_companies() if c["slug"] == seeded_installation["slug_b"]][0]["id"]
+    company_b = next(c for c in repository.get_companies() if c["slug"] == seeded_installation["slug_b"])["id"]
     assert repository.upsert_whatsapp_binding(
         company_id=company_b,
         phone_number_id=seeded_installation["active_phone"],
@@ -572,11 +571,11 @@ def test_restore_rejects_plaintext_credentials_even_with_valid_checksum(
         active=False,
     )
     payload = build_backup_payload()
-    row = [
+    row = next(
         item
         for item in payload["tables"]["calendar_integrations"]
         if item["id"] == integration_id
-    ][0]
+    )
     row["config_json"] = json.dumps(
         {
             "calendar_id": "primary",

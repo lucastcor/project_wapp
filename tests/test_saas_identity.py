@@ -9,7 +9,6 @@ from app.main import app
 from app.storage.db import db_transaction
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 

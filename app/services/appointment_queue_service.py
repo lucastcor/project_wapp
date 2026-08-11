@@ -12,7 +12,6 @@ from app.services.outbound_dispatch_service import (
 )
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 VALID_PRIORITY_TIERS = {"vip", "high", "normal", "low"}
 VALID_QUEUE_ENTRY_STATUSES = {
@@ -227,10 +226,7 @@ def _matches_queue_entry(
         return False
 
     hours_until_slot = (slot_start.astimezone(UTC) - datetime.now(UTC)).total_seconds() / 3600
-    if hours_until_slot < SHORT_NOTICE_THRESHOLD_HOURS and not bool(entry.get("accepts_short_notice")):
-        return False
-
-    return True
+    return not (hours_until_slot < SHORT_NOTICE_THRESHOLD_HOURS and not bool(entry.get("accepts_short_notice")))
 
 
 def _is_queue_waiting_message(message: str) -> bool:
@@ -672,7 +668,10 @@ def release_booking_slot(
     booking_id: int,
     company_id: int | None = None,
 ) -> dict[str, Any]:
-    from app.services.calendar_service import CalendarProviderError, cancel_calendar_booking
+    from app.services.calendar_service import (
+        CalendarProviderError,
+        cancel_calendar_booking,
+    )
 
     try:
         cancellation_result = cancel_calendar_booking(booking_id=booking_id, company_id=company_id)
@@ -802,7 +801,10 @@ def respond_to_queue_offer(
             "dispatch_result": continuation_dispatch_result,
         }
 
-    from app.services.calendar_service import create_calendar_booking, reschedule_calendar_booking
+    from app.services.calendar_service import (
+        create_calendar_booking,
+        reschedule_calendar_booking,
+    )
 
     request_summary = (entry.get("request_summary") or "").strip() or None
     original_booking_id = entry.get("original_booking_id")

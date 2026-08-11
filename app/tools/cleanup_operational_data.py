@@ -6,7 +6,6 @@ from app.storage.db import init_db
 from app.storage.repository import RuntimeRepository
 from app.tools.export_runtime_backup import write_backup_file
 
-
 repository = RuntimeRepository()
 
 

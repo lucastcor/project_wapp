@@ -1,22 +1,24 @@
 import contextvars
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import settings
 
-
-_request_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+# The default is None rather than {}: a mutable ContextVar default is shared by
+# every context that never sets it, so an accidental in-place mutation would
+# leak request data across requests.
+_request_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "request_context",
-    default={},
+    default=None,
 )
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -89,11 +91,11 @@ def set_request_context(**kwargs: Any) -> None:
 
 
 def get_request_context() -> dict[str, Any]:
-    return dict(_request_context.get())
+    return dict(_request_context.get() or {})
 
 
 def clear_request_context() -> None:
-    _request_context.set({})
+    _request_context.set(None)
 
 
 def log_event(

@@ -21,9 +21,16 @@ from app.core.logging import (
     log_event,
     set_request_context,
 )
-from app.services.rate_limit_service import build_rate_limit_headers, evaluate_rate_limit, get_request_client_ip
+from app.services.rate_limit_service import (
+    build_rate_limit_headers,
+    evaluate_rate_limit,
+    get_request_client_ip,
+)
 from app.services.realtime_service import close_realtime_broker, start_realtime_broker
-from app.services.runtime_guard_service import get_runtime_blockers, validate_runtime_environment
+from app.services.runtime_guard_service import (
+    get_runtime_blockers,
+    validate_runtime_environment,
+)
 from app.services.system_readiness_service import get_system_readiness
 from app.storage.db import (
     check_database_schema_current,

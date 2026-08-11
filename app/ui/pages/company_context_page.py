@@ -1,10 +1,9 @@
+import json
 from typing import Any
 
-import json
 import streamlit as st
 
 from app.ui.admin_api_client import AdminApiClientError
-
 
 DAY_KEYS = [
     ("monday", "Segunda"),
@@ -54,7 +53,7 @@ def _render_profiles_tab(client: Any, company_slug: str | None, context_data: di
         st.subheader("Editar perfil")
         selected_profile_key = st.selectbox(
             "Perfil",
-            options=["__novo__"] + existing_profile_keys,
+            options=["__novo__", *existing_profile_keys],
             format_func=lambda item: "Novo perfil" if item == "__novo__" else item,
         )
         selected_profile: dict[str, Any] = next(
@@ -159,8 +158,9 @@ def _render_profiles_tab(client: Any, company_slug: str | None, context_data: di
                     except Exception as exc:
                         st.error(f"Erro inesperado ao salvar perfil: {exc}")
 
-        if selected_profile_key != "__novo__":
-            if st.button("Remover perfil selecionado", use_container_width=True):
+        if selected_profile_key != "__novo__" and st.button(
+            "Remover perfil selecionado", use_container_width=True
+        ):
                 scheduling_policy["profiles"] = [
                     profile for profile in profiles if str(profile.get("key") or "") != selected_profile_key
                 ]

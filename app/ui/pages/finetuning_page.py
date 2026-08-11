@@ -5,7 +5,6 @@ import streamlit as st
 from app.ui.admin_api_client import AdminApiClientError
 
 
-
 def render_finetuning_page(page_context: dict[str, Any]) -> None:
     client = page_context["client"]
     selected_company_id = page_context.get("company_id")

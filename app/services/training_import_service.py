@@ -6,7 +6,6 @@ from typing import Any
 from app.services.training_export_service import is_example_eligible_for_training
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 FIELD_ALIASES = {

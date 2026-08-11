@@ -64,7 +64,9 @@ def _send_email(
     )
     try:
         # URL comes from the fixed request constructed above.
-        with urlopen(  # nosec B310
+        # The Request above is built from a module-level constant HTTPS
+        # endpoint; no caller-supplied URL or scheme reaches urlopen.
+        with urlopen(  # nosec B310  # noqa: S310
             request,
             timeout=max(1, settings.transactional_email_timeout_seconds),
         ) as response:

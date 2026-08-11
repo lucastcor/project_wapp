@@ -182,7 +182,7 @@ class FakeConversationEngine:
                 "pipeline_stage": "encerrado",
                 "next_action": "Encaminhar para atendimento humano adequado.",
                 "lead_temperature": "cold",
-            } 
+            }
 
         if any(
             term in combined

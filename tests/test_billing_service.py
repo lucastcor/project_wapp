@@ -182,7 +182,7 @@ def test_start_trial_rejects_duplicate(monkeypatch):
     start_trial(company_id=1)
     try:
         start_trial(company_id=1)
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "already has" in str(exc)
 
@@ -215,7 +215,7 @@ def test_activate_invalid_plan(monkeypatch):
     _patch(monkeypatch)
     try:
         activate_subscription(company_id=1, plan_key="nonexistent")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "Invalid plan" in str(exc)
 
@@ -224,7 +224,7 @@ def test_activate_invalid_cycle(monkeypatch):
     _patch(monkeypatch)
     try:
         activate_subscription(company_id=1, plan_key="essencial", billing_cycle="weekly")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "billing_cycle" in str(exc)
 
@@ -245,7 +245,7 @@ def test_cancel_no_subscription(monkeypatch):
     _patch(monkeypatch)
     try:
         cancel_subscription(company_id=1)
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "No subscription" in str(exc)
 
@@ -256,7 +256,7 @@ def test_cancel_already_cancelled(monkeypatch):
     cancel_subscription(company_id=1)
     try:
         cancel_subscription(company_id=1)
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "already cancelled" in str(exc)
 
@@ -278,7 +278,7 @@ def test_change_plan_invalid(monkeypatch):
     activate_subscription(company_id=1, plan_key="essencial")
     try:
         change_plan(company_id=1, new_plan_key="nonexistent")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "Invalid plan" in str(exc)
 
@@ -287,7 +287,7 @@ def test_change_plan_no_subscription(monkeypatch):
     _patch(monkeypatch)
     try:
         change_plan(company_id=1, new_plan_key="premium")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "No subscription" in str(exc)
 
@@ -298,7 +298,7 @@ def test_change_plan_cancelled_subscription(monkeypatch):
     cancel_subscription(company_id=1)
     try:
         change_plan(company_id=1, new_plan_key="premium")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "active or trial" in str(exc)
 
@@ -319,7 +319,7 @@ def test_record_usage_invalid_metric(monkeypatch):
     _patch(monkeypatch)
     try:
         record_usage(company_id=1, metric="invalid_metric")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "Invalid metric" in str(exc)
 
@@ -459,7 +459,7 @@ def test_check_limit_cancelled_still_in_period(monkeypatch):
 
 
 def test_all_plans_have_required_fields():
-    for key, plan in PLANS.items():
+    for plan in PLANS.values():
         assert "name" in plan
         assert "price_monthly_cents" in plan
         assert "price_annual_monthly_cents" in plan
@@ -517,7 +517,7 @@ def test_reactivate_active_subscription_fails(monkeypatch):
     activate_subscription(company_id=1, plan_key="essencial")
     try:
         reactivate_subscription(company_id=1)
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "cancelled" in str(exc).lower()
 
@@ -526,7 +526,7 @@ def test_reactivate_no_subscription_fails(monkeypatch):
     _patch(monkeypatch)
     try:
         reactivate_subscription(company_id=1)
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "No subscription" in str(exc)
 
@@ -537,7 +537,7 @@ def test_reactivate_invalid_plan_fails(monkeypatch):
     cancel_subscription(company_id=1)
     try:
         reactivate_subscription(company_id=1, plan_key="nonexistent")
-        assert False, "Should have raised BillingError"
+        raise AssertionError("Should have raised BillingError")
     except BillingError as exc:
         assert "Invalid plan" in str(exc)
 
@@ -626,7 +626,7 @@ def test_full_billing_lifecycle(monkeypatch):
     # Change plan should fail while cancelled
     try:
         change_plan(company_id=1, new_plan_key="premium")
-        assert False
+        raise AssertionError()
     except BillingError:
         pass
 

@@ -27,8 +27,7 @@ class SanitizationResult:
 
 
 def _normalize_sensitive_key(key: object) -> str:
-    normalized = _JSON_IDENTIFIER_PATTERN.sub("_", str(key).strip().lower()).strip("_")
-    return normalized
+    return _JSON_IDENTIFIER_PATTERN.sub("_", str(key).strip().lower()).strip("_")
 
 
 def is_sensitive_key(key: object) -> bool:

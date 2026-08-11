@@ -26,10 +26,10 @@ class FakeRepository:
             "ends_at": kwargs.get("ends_at", "2026-04-10T11:00:00+00:00"),
             "timezone": "America/Sao_Paulo",
             "status": kwargs.get("status", "confirmed"),
-            "booking_outcome": kwargs.get("booking_outcome", None),
+            "booking_outcome": kwargs.get("booking_outcome"),
             "booking_outcome_at": None,
             "booking_outcome_notes": None,
-            "cancellation_reason": kwargs.get("cancellation_reason", None),
+            "cancellation_reason": kwargs.get("cancellation_reason"),
             "created_at": "2026-04-09T08:00:00+00:00",
             "updated_at": "2026-04-09T08:00:00+00:00",
         }
@@ -181,7 +181,7 @@ def test_record_booking_outcome_invalid_raises(monkeypatch):
     bid = repo._add_booking()
     try:
         record_booking_outcome(bid, "invalid_outcome")
-        assert False, "Should have raised AnalyticsError"
+        raise AssertionError("Should have raised AnalyticsError")
     except AnalyticsError as exc:
         assert "Invalid outcome" in str(exc)
 
@@ -190,7 +190,7 @@ def test_record_booking_outcome_not_found_raises(monkeypatch):
     _patch_repo(monkeypatch)
     try:
         record_booking_outcome(999, "attended")
-        assert False, "Should have raised AnalyticsError"
+        raise AssertionError("Should have raised AnalyticsError")
     except AnalyticsError as exc:
         assert "not found" in str(exc)
 
@@ -206,7 +206,7 @@ def test_record_cancellation_reason_not_found(monkeypatch):
     _patch_repo(monkeypatch)
     try:
         record_cancellation_reason(999, "motivo")
-        assert False, "Should have raised AnalyticsError"
+        raise AssertionError("Should have raised AnalyticsError")
     except AnalyticsError as exc:
         assert "not found" in str(exc)
 

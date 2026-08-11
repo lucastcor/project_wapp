@@ -5,10 +5,9 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.logging import get_logger, log_event, mask_identifier
-from app.services.whatsapp_provider import WhatsAppProvider, WhatsAppProviderError
 from app.services.billing_service import BillingLimitError, require_usage_capacity
+from app.services.whatsapp_provider import WhatsAppProvider, WhatsAppProviderError
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
@@ -261,8 +260,10 @@ def dispatch_pending_outbound_messages(
             raise OutboundDispatchError(str(exc)) from exc
 
     results: list[dict[str, Any]] = []
+    # Explicit loop, not a comprehension: each iteration performs an external
+    # send. Keeping it statement-shaped makes the side effect obvious.
     for pending_message in pending_messages:
-        results.append(
+        results.append(  # noqa: PERF401
             dispatch_outbound_message(
                 outbound_message_id=int(pending_message["id"]),
                 channel=normalized_channel,

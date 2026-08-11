@@ -2,7 +2,10 @@ import argparse
 import json
 import sys
 
-from app.services.system_readiness_service import get_system_profile, get_system_readiness
+from app.services.system_readiness_service import (
+    get_system_profile,
+    get_system_readiness,
+)
 from app.storage.db import close_postgres_pool, init_db
 
 

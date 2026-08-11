@@ -13,7 +13,7 @@ def test_pipeline_service_invalid_openai_output_falls_back(monkeypatch) -> None:
                 "lead_temperature": "muito_quente",
             }
 
-    monkeypatch.setattr(pipeline_service, "OpenAIProvider", lambda: FakeProvider())
+    monkeypatch.setattr(pipeline_service, "OpenAIProvider", FakeProvider)
 
     result = pipeline_service.infer_pipeline_state(
         conversation_summary="Contato demonstrou interesse.",

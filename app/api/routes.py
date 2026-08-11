@@ -1,6 +1,6 @@
-import logging
 import hashlib
 import hmac
+import logging
 from typing import Any, TypedDict
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -19,13 +19,16 @@ from app.api.schemas import (
     NormalizedWhatsAppPayload,
 )
 from app.core.config import settings
+from app.core.logging import get_logger, log_event
 from app.core.orchestrator import (
     process_incoming_message,
     process_whatsapp_webhook,
 )
-from app.core.logging import get_logger, log_event
 from app.services.admin_auth_service import secrets_match
-from app.services.outbound_dispatch_service import OutboundDispatchError, dispatch_outbound_message
+from app.services.outbound_dispatch_service import (
+    OutboundDispatchError,
+    dispatch_outbound_message,
+)
 from app.services.realtime_service import publish_incoming_message_event
 from app.storage.repository import RuntimeRepository
 
@@ -155,7 +158,7 @@ def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | 
 
 
 def _is_normalized_whatsapp_payload(payload: dict[str, Any]) -> bool:
-    return all(key in payload for key in {"event", "from_number", "text"})
+    return all(key in payload for key in ("event", "from_number", "text"))
 
 
 def _parse_normalized_whatsapp_payload(payload: dict[str, Any]) -> dict[str, Any]:

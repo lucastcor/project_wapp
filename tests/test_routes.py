@@ -4,9 +4,9 @@ import hmac
 from fastapi.testclient import TestClient
 
 from app import main as main_module
-from app.main import app
 from app.api import routes
 from app.core.config import settings
+from app.main import app
 from app.services.rate_limit_service import reset_rate_limit_state
 
 client = TestClient(app)
@@ -368,8 +368,8 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     })
 
     raw_payload = (
-        '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"metadata":{"display_phone_number":"5511888887777","phone_number_id":"111222333444555"},"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
-    ).encode("utf-8")
+        b'{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"metadata":{"display_phone_number":"5511888887777","phone_number_id":"111222333444555"},"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
+    )
     signature = hmac.new(
         b"meta-app-secret",
         msg=raw_payload,
@@ -454,9 +454,9 @@ def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> 
 def test_whatsapp_webhook_ignores_non_message_meta_events(monkeypatch) -> None:
     monkeypatch.setattr(settings, "whatsapp_app_secret", "meta-app-secret")
     raw_payload = (
-        '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"statuses":'
-        '[{"id":"wamid.status.1","status":"delivered"}]}}]}]}'
-    ).encode("utf-8")
+        b'{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"statuses":'
+        b'[{"id":"wamid.status.1","status":"delivered"}]}}]}]}'
+    )
     signature = hmac.new(b"meta-app-secret", msg=raw_payload, digestmod=hashlib.sha256).hexdigest()
 
     response = client.post(

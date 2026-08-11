@@ -22,7 +22,6 @@ from app.storage.db import (
 )
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 

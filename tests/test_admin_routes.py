@@ -1,9 +1,8 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.api import admin_routes
 from app.core.config import settings
-
+from app.main import app
 
 client = TestClient(app)
 
@@ -231,7 +230,7 @@ def test_create_finetuning_job_passes_resolved_company_scope(monkeypatch) -> Non
             }
 
     monkeypatch.setattr(admin_routes, "repository", FakeRepository())
-    monkeypatch.setattr(admin_routes, "_get_finetuning_service", lambda: FakeFineTuningService())
+    monkeypatch.setattr(admin_routes, "_get_finetuning_service", FakeFineTuningService)
 
     response = client.post("/admin/finetuning/jobs", params={"company_slug": "empresa-a"})
 
@@ -266,7 +265,7 @@ def test_list_finetuning_jobs_uses_company_scope(monkeypatch) -> None:
             ]
 
     monkeypatch.setattr(admin_routes, "repository", FakeRepository())
-    monkeypatch.setattr(admin_routes, "_get_finetuning_service", lambda: FakeFineTuningService())
+    monkeypatch.setattr(admin_routes, "_get_finetuning_service", FakeFineTuningService)
 
     response = client.get("/admin/finetuning/jobs", params={"company_id": 8, "limit": 20})
 

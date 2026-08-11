@@ -1,0 +1,137 @@
+[tool.ruff]
+# Pinning the rule set makes the lint gate deterministic. Without this file the
+# result depends on whichever defaults the installed Ruff version ships, so a
+# routine tool upgrade could silently change what CI enforces.
+target-version = "py313"
+line-length = 120
+extend-exclude = [".venv", "frontend"]
+
+[tool.ruff.lint]
+select = [
+    "F",     # pyflakes: real defects (undefined names, unused imports/vars)
+    "E4",    # import formatting
+    "E7",    # statement-level correctness
+    "E9",    # syntax/runtime errors
+    "W",     # whitespace
+    "I",     # import sorting
+    "UP",    # pyupgrade: keep syntax current with the pinned Python
+    "B",     # bugbear: likely bugs
+    "S",     # bandit-equivalent security rules
+    "DTZ",   # timezone-naive datetime construction
+    "SIM",   # simplifications
+    "RET",   # return-path clarity
+    "PERF",  # obvious performance traps
+    "PIE",   # misc lints
+    "PLC",   # pylint conventions
+    "PLE",   # pylint errors
+    "PLR",   # pylint refactors
+    "PLW",   # pylint warnings
+    "RUF",   # Ruff-specific
+    "BLE",   # blind except
+    "TRY",   # exception-handling antipatterns
+]
+
+ignore = [
+    # ── Deliberate codebase idioms, each verified against the actual sites ──
+
+    # BLE001 / S110: `except Exception` at cleanup and adapter boundaries. These
+    # are load-bearing, not laziness. Connection release
+    # (PostgresConnectionWrapper.close, connection_scope) must never raise, or a
+    # cleanup failure would mask the application exception already propagating
+    # and strand a pooled connection. Readiness probes must report "not ready"
+    # instead of crashing the health endpoint. Streamlit admin pages must render
+    # an error rather than blank the page. Narrowing these to specific driver
+    # exception types would let an unanticipated type escape the boundary, which
+    # is the failure mode we hardened against in Release 1A.1.
+    "BLE001",
+    "S110",
+
+    # TRY003: this codebase raises domain errors with descriptive one-line
+    # messages (CompanyContextError, IdentityError, WhatsAppProviderError). The
+    # message is the contract surfaced to operators; extracting it into an
+    # exception subclass per message would add indirection without value.
+    "TRY003",
+
+    # TRY300/TRY301: the `return` inside `try` pattern is used where the return
+    # value is what the try guards; hoisting it to `else` obscures the intent.
+    "TRY300",
+    "TRY301",
+
+    # TRY004: type validation raises the domain error (ValueError/HTTPException)
+    # that the caller and API layer already handle, not TypeError.
+    "TRY004",
+
+    # SIM117: nested `with` blocks are kept where the outer context is a
+    # connection/transaction scope and the inner is a cursor or patch — merging
+    # them hides which scope owns the failure path.
+    "SIM117",
+
+    # PLR0911/0912/0913/0915: the orchestrator, readiness service and webhook
+    # handlers are intentionally branch-heavy dispatchers. Splitting them for a
+    # metric would scatter one decision across several files.
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+
+    # PLR2004: numeric literals in HTTP status comparisons and test assertions
+    # read better inline than behind constants.
+    "PLR2004",
+
+    # S101: `assert` is the test idiom; production code is covered by the
+    # per-file rules below.
+    "S101",
+
+    # S608: SQL built from f-strings. Every site is a column identifier or
+    # structural fragment from a module-level constant, never caller input, and
+    # `_optional_equals()` validates identifiers against a strict pattern before
+    # interpolation. `tests/test_dynamic_sql_guard.py` proves this
+    # structurally; see also the Bandit note in the CI workflow.
+    "S608",
+
+    # PLC0415: function-level imports are load-bearing here for two reasons.
+    # (1) Cycle avoidance: app.core.company_context <-> app.storage.repository,
+    #     and app.storage.db -> app.core.logging only at failure time.
+    # (2) Cold start: the Vercel function imports FastAPI routes eagerly but
+    #     defers optional providers (psycopg, stripe, redis, google-api-client),
+    #     so an unused integration never costs import time or memory.
+    # Hoisting these would either break imports or slow every cold start.
+    "PLC0415",
+
+    # PLR0917: repository and service signatures take many *keyword* arguments
+    # mirroring table columns. They are called with keywords everywhere; the
+    # positional count is an artifact of the signature, not the call sites.
+    "PLR0917",
+
+    # PLW0603: module-level singletons with an explicit documented lifecycle —
+    # the Postgres pool (`_POSTGRES_POOL`, retired by `close_postgres_pool()`)
+    # and the Redis realtime client. Both are process-wide by design.
+    "PLW0603",
+
+    # SIM105: `contextlib.suppress` is avoided in cleanup paths where the
+    # except body also records the failure on `release_error`; suppress() would
+    # discard the diagnostic we deliberately keep.
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests build small fakes and stubs where these rules add ceremony without
+# catching defects.
+"tests/**" = [
+    "S105",    # test-only fake secrets, clearly named as such
+    "S106",    # same, passed as keyword arguments
+    "S311",    # non-cryptographic randomness in fixtures
+    "RUF012",  # mutable class attributes on test doubles
+    "PLW0603", # module-level state used by recording doubles
+]
+# The Streamlit admin panel is a contingency operator UI: it renders local dates
+# for a human sitting in the company's own timezone and has no request context
+# to derive one from. Timezone correctness is enforced in the calendar service,
+# not here.
+"app/ui/**" = ["DTZ005", "DTZ011"]
+# Streamlit resolves page configuration at import time, so `st.set_page_config`
+# must run before the page modules are imported.
+"app/admin_app.py" = ["E402"]
+# conftest pins environment variables before any `app.*` import so the suite
+# never inherits a developer's .env; that ordering is the whole point.
+"tests/conftest.py" = ["E402"]

@@ -8,7 +8,6 @@ from app.services.reminder_service import dispatch_due_reminders
 from app.storage.db import db_transaction
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 

@@ -13,7 +13,6 @@ from app.services.realtime_service import (
     close_realtime_broker,
 )
 
-
 TEST_REDIS_URL = os.getenv("TEST_REDIS_URL", "").strip()
 pytestmark = pytest.mark.skipif(
     not TEST_REDIS_URL,

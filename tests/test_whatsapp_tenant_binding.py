@@ -17,7 +17,6 @@ from app.services import outbound_dispatch_service
 from app.services.whatsapp_provider import WhatsAppProvider, WhatsAppProviderError
 from app.storage.repository import RuntimeRepository
 
-
 client = TestClient(app)
 repository = RuntimeRepository()
 
@@ -549,13 +548,13 @@ def test_unrelated_integrity_errors_are_not_translated(tenants) -> None:
     class _OtherUniqueViolation(Exception):
         sqlstate = "23505"
 
-        class diag:  # noqa: N801 - mimics psycopg's diagnostics object
+        class diag:
             constraint_name = "idx_company_contexts_slug"
 
     class _ForeignKeyViolation(Exception):
         sqlstate = "23503"
 
-        class diag:  # noqa: N801
+        class diag:
             constraint_name = "idx_whatsapp_bindings_active_phone"
 
     assert _is_active_phone_number_conflict(_OtherUniqueViolation()) is False
@@ -657,7 +656,7 @@ def test_concurrent_upserts_produce_exactly_one_active_owner(tenants) -> None:
                 phone_number_id=phone,
                 updated_by=f"racer-{index}",
             )
-        except Exception as exc:  # noqa: BLE001 - an escaping exception is the failure
+        except Exception as exc:
             results[index] = exc
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(len(companies))]
@@ -698,7 +697,7 @@ def test_concurrent_activation_of_historical_bindings_has_one_winner(tenants) ->
         try:
             barrier.wait()
             outcomes[index] = repository.set_whatsapp_binding_active(binding_ids[index], active=True)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             outcomes[index] = exc
 
     threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(len(binding_ids))]

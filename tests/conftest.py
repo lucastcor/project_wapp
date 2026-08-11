@@ -69,14 +69,14 @@ else:
     os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
 os.environ.pop("POSTGRES_DATABASE_URL", None)
 
-import pytest  # noqa: E402
+import pytest
 
-from app.services.rate_limit_service import reset_rate_limit_state  # noqa: E402
-from app.storage.db import init_db  # noqa: E402
+from app.services.rate_limit_service import reset_rate_limit_state
+from app.storage.db import init_db
 
 
 @pytest.fixture(autouse=True, scope="session")
-def _bootstrap_test_database() -> "pytest.FixtureRequest":
+def _bootstrap_test_database() -> pytest.FixtureRequest:
     init_db()
     yield
     if _TEST_DB_PATH is not None and _TEST_DB_PATH.exists():

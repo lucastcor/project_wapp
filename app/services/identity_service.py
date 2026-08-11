@@ -12,7 +12,6 @@ from typing import Any
 from app.core.config import settings
 from app.storage.db import db_session, db_transaction
 
-
 IDENTITY_ROLES = ("viewer", "operator", "admin", "owner")
 ROLE_WEIGHT = {"viewer": 1, "operator": 2, "admin": 3, "owner": 4}
 ADMIN_ROLE_MAP = {
@@ -23,7 +22,7 @@ ADMIN_ROLE_MAP = {
 }
 _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _SLUG_PATTERN = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$")
-_PASSWORD_SCHEME = "scrypt"
+_PASSWORD_SCHEME = "scrypt"  # noqa: S105 - algorithm name, not a credential
 _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
@@ -129,10 +128,7 @@ def _timestamp(value: datetime) -> str:
 
 
 def _parse_timestamp(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)

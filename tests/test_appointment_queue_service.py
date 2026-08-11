@@ -1,6 +1,6 @@
+from app.core.config import settings
 from app.services import appointment_queue_service as queue_service
 from app.services import calendar_service
-from app.core.config import settings
 
 
 class FakeQueueRepository:

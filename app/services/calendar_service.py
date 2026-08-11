@@ -1,7 +1,7 @@
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -14,7 +14,6 @@ from app.services.billing_service import (
 )
 from app.services.reminder_service import schedule_booking_customer_reminders
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
@@ -118,8 +117,7 @@ def _normalize_lookup_key(value: Any) -> str:
         "ç": "c",
     })
     normalized = normalized.translate(replacements)
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized
+    return re.sub(r"\s+", " ", normalized)
 
 
 def _normalize_weekday_key(value: Any) -> str | None:
@@ -338,10 +336,11 @@ def _resolve_profile_daily_windows(
 
     day_windows = scheduling_profile.get("day_windows")
     if isinstance(day_windows, dict):
-        configured_values: list[Any] = []
-        for key in DAY_SCHEDULE_KEYS.get(weekday, ()):
-            if key in day_windows:
-                configured_values.append(day_windows.get(key))
+        configured_values: list[Any] = [
+            day_windows.get(key)
+            for key in DAY_SCHEDULE_KEYS.get(weekday, ())
+            if key in day_windows
+        ]
         if weekday < 5:
             configured_values.extend(
                 day_windows.get(key)
@@ -631,7 +630,8 @@ class GoogleCalendarProvider(BaseCalendarProvider):
         credentials = Credentials(
             token=None,
             refresh_token=refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
+
+            token_uri="https://oauth2.googleapis.com/token",  # noqa: S106
             client_id=client_id,
             client_secret=client_secret,
             scopes=[CALENDAR_SCOPE],
@@ -676,14 +676,13 @@ class GoogleCalendarProvider(BaseCalendarProvider):
             .execute()
         )
 
-        intervals: list[BusyInterval] = []
-        for item in response.get("calendars", {}).get(calendar_id, {}).get("busy", []):
-            intervals.append(
-                BusyInterval(
-                    starts_at=_parse_iso_datetime(item["start"]),
-                    ends_at=_parse_iso_datetime(item["end"]),
-                )
+        intervals: list[BusyInterval] = [
+            BusyInterval(
+                starts_at=_parse_iso_datetime(item["start"]),
+                ends_at=_parse_iso_datetime(item["end"]),
             )
+            for item in response.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+        ]
         return intervals
 
     def create_external_event(

@@ -15,7 +15,6 @@ from app.services.outbound_dispatch_service import (
 from app.storage.db import db_transaction
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 

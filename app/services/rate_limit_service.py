@@ -1,5 +1,5 @@
-import time
 import hashlib
+import time
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
@@ -7,7 +7,6 @@ from typing import Any
 from fastapi import Request
 
 from app.core.config import settings
-
 
 LOCAL_CLIENT_IDENTIFIERS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
@@ -43,7 +42,7 @@ def _get_redis_client() -> Any | None:
     redis_url = str(settings.redis_url or "").strip()
     if not redis_url:
         return None
-    if _REDIS_CLIENT is not None and _REDIS_CLIENT_URL == redis_url:
+    if _REDIS_CLIENT is not None and redis_url == _REDIS_CLIENT_URL:
         return _REDIS_CLIENT
     try:
         import redis

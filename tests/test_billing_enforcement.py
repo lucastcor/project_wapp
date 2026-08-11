@@ -12,7 +12,6 @@ from app.services.billing_service import (
 )
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 

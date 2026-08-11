@@ -6,7 +6,6 @@ import streamlit as st
 
 from app.ui.admin_api_client import AdminApiClientError
 
-
 RESOLUTION_OPTIONS = {
     "Responder ao cliente": "final_answer",
     "Pedir clarificação ao cliente": "needs_customer_clarification",

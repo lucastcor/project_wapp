@@ -1,16 +1,16 @@
 import logging
 from typing import Any
 
-from app.core.config import settings
 from app.core.company_context import get_company_context
+from app.core.config import settings
 from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
-from app.storage.repository import RuntimeRepository
 from app.services.style_service import (
     format_style_examples_for_prompt,
     get_relevant_style_examples,
     infer_style_scenario_type,
 )
+from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)

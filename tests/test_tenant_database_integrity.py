@@ -8,7 +8,6 @@ import pytest
 from app.storage.db import db_session, get_database_backend
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 
 
