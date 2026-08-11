@@ -57,7 +57,7 @@ def _render_profiles_tab(client: Any, company_slug: str | None, context_data: di
             options=["__novo__"] + existing_profile_keys,
             format_func=lambda item: "Novo perfil" if item == "__novo__" else item,
         )
-        selected_profile = next(
+        selected_profile: dict[str, Any] = next(
             (profile for profile in profiles if str(profile.get("key") or "") == selected_profile_key),
             {},
         ) if selected_profile_key != "__novo__" else {}

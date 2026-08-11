@@ -1,0 +1,12 @@
+# Direct dependencies for the API, worker and Vercel runtime.
+caldav
+fastapi
+google-api-python-client
+google-auth
+openai
+psycopg[binary,pool]
+pydantic
+python-dotenv
+redis
+stripe
+uvicorn

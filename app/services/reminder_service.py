@@ -1,11 +1,15 @@
 import re
+import secrets
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.company_context import get_company_context
 from app.core.config import settings
-from app.services.outbound_dispatch_service import dispatch_outbound_message
+from app.services.outbound_dispatch_service import (
+    OutboundDispatchError,
+    dispatch_outbound_message,
+)
 from app.storage.repository import RuntimeRepository
 
 
@@ -99,7 +103,7 @@ def _build_outbound_message(reminder: dict[str, Any]) -> str:
 def _resolve_reminder_channel(
     reminder: dict[str, Any],
     explicit_channel: str | None = None,
-) -> str | None:
+) -> str:
     if explicit_channel:
         return explicit_channel
 
@@ -232,9 +236,92 @@ def dispatch_due_reminders(
     dispatch_immediately: bool = False,
     channel: str | None = None,
     audience: str | None = None,
+    company_id: int | None = None,
 ) -> list[dict[str, Any]]:
-    due_reminders = repository.get_due_customer_reminders(datetime.now(UTC).isoformat())
-    results: list[dict[str, Any]] = []
+    reference_time = datetime.now(UTC).isoformat()
+    if hasattr(repository, "claim_due_customer_reminder"):
+        results: list[dict[str, Any]] = []
+        for _ in range(max(1, settings.reminder_worker_batch_size)):
+            claim_token = secrets.token_urlsafe(24)
+            reminder = repository.claim_due_customer_reminder(
+                reference_time,
+                claim_token=claim_token,
+                audience=audience,
+                company_id=company_id,
+                claim_ttl_seconds=settings.worker_lease_ttl_seconds,
+            )
+            if reminder is None:
+                break
+            resolved_channel = _resolve_reminder_channel(
+                reminder,
+                explicit_channel=channel,
+            )
+            try:
+                outbound_message_id = repository.enqueue_claimed_reminder_outbound(
+                    int(reminder["id"]),
+                    claim_token=claim_token,
+                    channel=resolved_channel,
+                    message=_build_outbound_message(reminder),
+                    source=f"reminder_{reminder.get('audience') or 'generic'}",
+                )
+            except Exception as exc:
+                attempt_count = int(reminder.get("attempt_count") or 1)
+                retry_seconds = min(
+                    max(1, settings.outbound_retry_max_seconds),
+                    max(1, settings.outbound_retry_base_seconds)
+                    * (2 ** max(0, attempt_count - 1)),
+                )
+                retry_at = (
+                    datetime.now(UTC) + timedelta(seconds=retry_seconds)
+                ).isoformat()
+                final_status = repository.mark_customer_reminder_failed(
+                    int(reminder["id"]),
+                    claim_token=claim_token,
+                    error=str(exc),
+                    retry_at=retry_at,
+                )
+                results.append(
+                    {
+                        "reminder_id": reminder["id"],
+                        "company_id": reminder.get("company_id"),
+                        "audience": reminder.get("audience"),
+                        "channel": resolved_channel,
+                        "status": final_status,
+                    }
+                )
+                continue
+
+            result: dict[str, Any] = {
+                "reminder_id": reminder["id"],
+                "outbound_message_id": outbound_message_id,
+                "contact_id": reminder["contact_id"],
+                "company_id": reminder.get("company_id"),
+                "audience": reminder.get("audience"),
+                "channel": resolved_channel,
+                "status": "queued",
+            }
+            if dispatch_immediately:
+                try:
+                    dispatch_result = dispatch_outbound_message(
+                        outbound_message_id=outbound_message_id,
+                        channel=resolved_channel,
+                        company_id=reminder.get("company_id"),
+                    )
+                    result["status"] = "sent"
+                    result["dispatch_result"] = dispatch_result
+                except OutboundDispatchError:
+                    # The outbound dispatcher owns its retry/dead-letter state.
+                    # The reminder is already atomically linked to that message.
+                    result["status"] = "retry"
+            results.append(result)
+        return results
+
+    due_reminders = (
+        repository.get_due_customer_reminders(reference_time)
+        if company_id is None
+        else repository.get_due_customer_reminders(reference_time, company_id=company_id)
+    )
+    fallback_results: list[dict[str, Any]] = []
 
     for reminder in due_reminders:
         if audience and reminder.get("audience") != audience:
@@ -252,10 +339,11 @@ def dispatch_due_reminders(
             outbound_message_id=outbound_message_id,
         )
 
-        result: dict[str, Any] = {
+        fallback_result: dict[str, Any] = {
             "reminder_id": reminder["id"],
             "outbound_message_id": outbound_message_id,
             "contact_id": reminder["contact_id"],
+            "company_id": reminder.get("company_id"),
             "audience": reminder.get("audience"),
             "channel": _resolve_reminder_channel(reminder, explicit_channel=channel),
             "status": "queued",
@@ -263,11 +351,11 @@ def dispatch_due_reminders(
         if dispatch_immediately:
             dispatch_result = dispatch_outbound_message(
                 outbound_message_id=outbound_message_id,
-                channel=result["channel"],
+                channel=fallback_result["channel"],
                 company_id=reminder.get("company_id"),
             )
-            result["status"] = "sent"
-            result["dispatch_result"] = dispatch_result
-        results.append(result)
+            fallback_result["status"] = "sent"
+            fallback_result["dispatch_result"] = dispatch_result
+        fallback_results.append(fallback_result)
 
-    return results
+    return fallback_results

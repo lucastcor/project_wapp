@@ -2,7 +2,7 @@
 title: Glossário
 type: reference
 tags: [glossário, vocabulário]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Glossário
@@ -13,10 +13,10 @@ Vocabulário recorrente do projeto. Ordenado alfabeticamente.
 |-------|-------------|
 | **Auto-reply** | Decisão de responder automaticamente sem handoff humano. Definida em `app/services/decision_service.py`. |
 | **Booking** | Reserva persistida em `appointment_bookings`. Pode ter `external_event_id` quando sincronizada com calendário externo. |
-| **Bot Studio** | Tela da plataforma web `/platform` que simula cliente/operador batendo em `/messages/incoming`. |
+| **Bot Studio** | Tela da plataforma web `/platform` que simula cliente/operador batendo na rota autenticada `/admin/simulator/messages`. |
 | **Canvas (Flow Studio)** | Desenho visual de pipeline conversacional persistido em `company_context.conversation_pipelines`. |
 | **Classification** | Saída de `classify_message()` — `lead_novo`, `cliente_existente`, `suporte`, `indefinido`. |
-| **Company Context** | Contrato de negócio JSON por empresa em `app/data/company_context.json` ou `app/data/company_contexts/<slug>.json`. Ver [[40-Data/05-Company Context]]. |
+| **Company Context** | Contrato de negócio por empresa, persistido na tabela `company_contexts`. Os JSON em `app/data/` são apenas seed. Ver [[40-Data/05-Company Context]]. |
 | **Company scope** | Resolução do tenant ativo via `company_id` (int), `company_slug` (string normalizada) ou empresa default. |
 | **Customer profile** | Tag livre por contato (ex.: `new_customer`, `returning_customer`) usada por `scheduling_policy.profiles` e curadoria. |
 | **Dispatch** | Ato de enviar `outbound_message` por provider. Implementado em `app/services/outbound_dispatch_service.py`. |

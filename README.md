@@ -32,8 +32,13 @@ A arquitetura foi organizada para manter separação clara entre:
 - Cancelamento e reagendamento conversacional natural pelo proprio cliente
 - Operacao interna por conversa natural para agendar cliente por nome ou telefone, com confirmacao e desambiguacao
 - Importador inicial de base historica/CRM para atualizar `customer_profile` e promover exemplos para curadoria de treino
-- Frontend dedicado em `/platform` com simulador, flow studio, agenda console e training ops
+- Frontend dedicado em `/platform` com analytics, simulador, flow studio,
+  agenda, contatos, training, equipe, billing e onboarding
 - Autenticacao propria de sessao para a plataforma dedicada com cookie HTTP-only
+- Identidade SaaS com usuários, memberships por empresa, convite, recuperação,
+  sessão revogável e proteção CSRF
+- Stripe Checkout, Customer Portal, webhook reconciliado e enforcement de uso
+- Redis para rate limiting e eventos realtime compartilhados entre réplicas
 - Canvas visual persistido de pipelines conversacionais no `company_context`
 - Timeline/calendario visual de agenda com layout semanal baseado em endpoint proprio do backend
 - Testes automatizados para fluxos críticos
@@ -44,6 +49,8 @@ A arquitetura foi organizada para manter separação clara entre:
 - Pydantic
 - Uvicorn
 - Postgres com psycopg
+- Redis
+- Stripe
 - SQLite como fallback local/testes
 - Pytest
 - OpenAI Python SDK
@@ -158,6 +165,16 @@ O runtime agora suporta SQLite e Postgres, com foco operacional em Postgres. As 
 - `appointment_queue_offers`
 - `conversation_flows`
 - `customer_reminders`
+- `saas_users`
+- `company_memberships`
+- `identity_invitations`
+- `user_sessions`
+- `password_reset_tokens`
+- `worker_leases`
+- `billing_plans`
+- `billing_subscriptions`
+- `billing_usage_records`
+- `billing_webhook_events`
 
 O projeto também já possui:
 - configuração explícita via `DATABASE_URL`;
@@ -282,6 +299,10 @@ COMPOSE_DATABASE_URL=postgresql://project_wapp:project_wapp@postgres:5432/projec
 COMPOSE_POSTGRES_DATABASE_URL=postgresql://project_wapp:project_wapp@postgres:5432/project_wapp
 DATABASE_POOL_SIZE=10
 DATABASE_STATEMENT_TIMEOUT_MS=5000
+RUN_MIGRATIONS_ON_STARTUP=false
+REDIS_URL=redis://127.0.0.1:6379/0
+COMPOSE_REDIS_URL=redis://redis:6379/0
+REQUIRE_SHARED_STATE=true
 ENABLE_ADMIN_AUTH=true
 ADMIN_API_TOKEN=change-me-superadmin-token
 ADMIN_VIEWER_TOKEN=change-me-viewer-token
@@ -290,6 +311,16 @@ ADMIN_SUPERADMIN_TOKEN=change-me-superadmin-token
 ADMIN_ACTOR=streamlit-admin
 ADMIN_APP_API_BASE_URL=http://127.0.0.1:8000
 AUDIT_RETENTION_DAYS=90
+ENABLE_SELF_SERVICE_SIGNUP=false
+IDENTITY_EXPOSE_ACTION_TOKENS=false
+PLATFORM_PUBLIC_URL=https://app.seu-dominio.com
+TRANSACTIONAL_EMAIL_PROVIDER=resend
+TRANSACTIONAL_EMAIL_FROM=
+RESEND_API_KEY=
+ENABLE_BILLING_ENFORCEMENT=false
+STRIPE_SECRET_KEY=
+STRIPE_WEBHOOK_SECRET=
+STRIPE_PUBLISHABLE_KEY=
 REMINDER_WORKER_ENABLED=true
 REMINDER_WORKER_POLL_SECONDS=60
 REMINDER_WORKER_DISPATCH_IMMEDIATELY=true
@@ -357,6 +388,9 @@ As variaveis externas, que precisam vir do provedor real, sao:
 - `WHATSAPP_PHONE_NUMBER_ID`
 - `WHATSAPP_WEBHOOK_VERIFY_TOKEN`
 - `WHATSAPP_APP_SECRET`
+- `STRIPE_SECRET_KEY`
+- `STRIPE_WEBHOOK_SECRET`
+- `RESEND_API_KEY`
 
 ## Como rodar localmente
 ### 1. Criar e ativar ambiente virtual
@@ -368,7 +402,12 @@ source .venv/bin/activate
 ### 2. Instalar dependências
 ```bash
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 ```
+
+`requirements.txt` contém somente o runtime da API/worker;
+`requirements-admin.txt` adiciona Streamlit; `requirements-dev.txt` contém os
+gates de desenvolvimento. Todos são fixados com hashes.
 
 ### 3. Escolher o modo de execucao
 Voce tem dois caminhos:
@@ -421,6 +460,8 @@ docker compose --env-file .env.production up --build -d
 
 Para um runtime operacional de verdade, o `compose.yaml` sobe:
 - `postgres`
+- `redis`
+- `migrate` (one-shot)
 - `api`
 - `worker`
 - `admin`
@@ -674,7 +715,7 @@ pytest tests/test_outbound_dispatch_service.py
 ```
 
 ## Estado atual do produto
-O backend já está em um estágio avançado de base de produto. Os pontos mais importantes já implementados são:
+As fundações dos Releases 1B/1C estão implementadas e validadas localmente:
 - fluxo de atendimento orientado a negócio
 - separação entre automação e decisão humana
 - outbound multicanal com provider mock e provider real de WhatsApp preparado
@@ -682,14 +723,21 @@ O backend já está em um estágio avançado de base de produto. Os pontos mais 
 - observabilidade, auditoria e readiness para operação e evolução
 - onboarding/admin UX mínimo porém funcional para multiempresa
 - agenda operacional com conversa natural para cliente e operacao interna, com lembretes consistentes para a equipe
+- identidade e ownership por tenant
+- gestão de equipe, convites e papéis por tenant na própria plataforma
+- jobs idempotentes com claim/retry/dead-letter
+- Stripe e quotas reconciliados por webhook
+- build reproduzível, PostgreSQL/Redis reais e imagens separadas
 
 ## Próximos passos naturais
+- criar staging com Vercel + PostgreSQL/Redis gerenciados e worker durável
+- executar o sandbox Stripe real e registrar os seis Price IDs
+- validar domínio/remetente no Resend
 - integrar envio real em produção com provider de WhatsApp
 - adicionar provider futuro para Instagram
 - concluir um job de fine-tuning com sucesso e plugar o modelo no runtime
 - conectar credenciais reais de Google Calendar ou CalDAV/iCloud
-- automatizar o disparo recorrente de lembretes vencidos
-- endurecer identidade centralizada e RBAC com usuário real
+- ensaiar backup/restore, rollback, alertas e E2E antes do piloto
 
 ## Boas práticas
 - nunca versionar `.env` com segredos reais

@@ -254,9 +254,13 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 ## Resumo operacional
 
 - A plataforma dedicada é um frontend SPA simples, sem framework, servido pelo próprio FastAPI.
-- A autenticação é por sessão web assinada, não por token persistido no JavaScript.
-- Quase toda a operação visual conversa com `app/api/admin_routes.py`.
+- A autenticação principal usa sessão opaca e revogável de identidade, sem token
+  persistido no JavaScript; o cookie assinado permanece como break-glass legado.
+- A operação visual conversa com rotas administrativas e com as rotas próprias
+  de identidade, equipe, sessão e eventos em `platform_routes.py`.
 - O `Bot Studio` conversa com o mesmo runtime do bot real.
 - O `Flow Studio` grava no `company_context`.
 - O `Agenda Console` conversa com `calendar_service.py` e `appointment_queue_service.py`.
 - O `Training Ops` conversa com importação, curadoria e fine-tuning.
+- A tela `Equipe` gerencia memberships, convites e papéis por tenant.
+- `Billing` usa Stripe Checkout/Portal e exibe consumo/limites reconciliados.

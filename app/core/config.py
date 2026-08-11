@@ -2,7 +2,10 @@ import os
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Automated tests set DISABLE_DOTENV=true so configuration never depends on a
+# developer's local .env file.
+if os.getenv("DISABLE_DOTENV", "false").strip().lower() != "true":
+    load_dotenv()
 
 
 _PLACEHOLDER_PREFIXES = ("change-me", "changeme", "example-", "example_", "example")
@@ -35,21 +38,88 @@ class Settings:
     rate_limit_incoming_requests: int = int(os.getenv("RATE_LIMIT_INCOMING_REQUESTS", "120"))
     rate_limit_webhook_requests: int = int(os.getenv("RATE_LIMIT_WEBHOOK_REQUESTS", "300"))
     rate_limit_exempt_localhost: bool = os.getenv("RATE_LIMIT_EXEMPT_LOCALHOST", "false").lower() == "true"
+    trust_proxy_headers: bool = os.getenv(
+        "TRUST_PROXY_HEADERS",
+        "true" if os.getenv("VERCEL") else "false",
+    ).lower() == "true"
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///project_wapp.db")
     postgres_database_url: str | None = os.getenv("POSTGRES_DATABASE_URL")
     database_pool_size: int = int(os.getenv("DATABASE_POOL_SIZE", "10"))
     database_statement_timeout_ms: int = int(os.getenv("DATABASE_STATEMENT_TIMEOUT_MS", "5000"))
+    run_migrations_on_startup: bool = os.getenv(
+        "RUN_MIGRATIONS_ON_STARTUP",
+        "false" if os.getenv("VERCEL") else "true",
+    ).lower() == "true"
+    redis_url: str | None = os.getenv("REDIS_URL")
+    require_shared_state: bool = os.getenv("REQUIRE_SHARED_STATE", "false").lower() == "true"
+    realtime_redis_channel: str = os.getenv(
+        "REALTIME_REDIS_CHANNEL",
+        "project_wapp:realtime:v1",
+    )
     operations_backup_dir: str = os.getenv("OPERATIONS_BACKUP_DIR", "backups")
     enable_admin_auth: bool = os.getenv("ENABLE_ADMIN_AUTH", "false").lower() == "true"
     admin_api_token: str | None = os.getenv("ADMIN_API_TOKEN")
     admin_viewer_token: str | None = os.getenv("ADMIN_VIEWER_TOKEN")
     admin_operator_token: str | None = os.getenv("ADMIN_OPERATOR_TOKEN")
     admin_superadmin_token: str | None = os.getenv("ADMIN_SUPERADMIN_TOKEN")
+    # Optional per-role tenant binding for platform sessions. Empty means "all companies".
+    admin_viewer_company_ids: str | None = os.getenv("ADMIN_VIEWER_COMPANY_IDS")
+    admin_operator_company_ids: str | None = os.getenv("ADMIN_OPERATOR_COMPANY_IDS")
+    admin_superadmin_company_ids: str | None = os.getenv("ADMIN_SUPERADMIN_COMPANY_IDS")
+    enable_normalized_whatsapp_ingress: bool = os.getenv(
+        "ENABLE_NORMALIZED_WHATSAPP_INGRESS",
+        "false",
+    ).lower() == "true"
+    internal_ingress_secret: str | None = os.getenv("INTERNAL_INGRESS_SECRET")
     platform_session_secret: str | None = os.getenv("PLATFORM_SESSION_SECRET")
     platform_session_ttl_seconds: int = int(os.getenv("PLATFORM_SESSION_TTL_SECONDS", "28800"))
+    identity_session_ttl_seconds: int = int(os.getenv("IDENTITY_SESSION_TTL_SECONDS", "43200"))
+    identity_invitation_ttl_hours: int = int(os.getenv("IDENTITY_INVITATION_TTL_HOURS", "72"))
+    identity_password_reset_ttl_minutes: int = int(
+        os.getenv("IDENTITY_PASSWORD_RESET_TTL_MINUTES", "30")
+    )
+    enable_self_service_signup: bool = os.getenv(
+        "ENABLE_SELF_SERVICE_SIGNUP",
+        "false",
+    ).lower() == "true"
+    identity_expose_action_tokens: bool = os.getenv(
+        "IDENTITY_EXPOSE_ACTION_TOKENS",
+        "false",
+    ).lower() == "true"
+    platform_public_url: str | None = os.getenv("PLATFORM_PUBLIC_URL")
+    transactional_email_provider: str = os.getenv(
+        "TRANSACTIONAL_EMAIL_PROVIDER",
+        "disabled",
+    ).strip().lower()
+    transactional_email_from: str | None = os.getenv("TRANSACTIONAL_EMAIL_FROM")
+    resend_api_key: str | None = os.getenv("RESEND_API_KEY")
+    transactional_email_timeout_seconds: int = int(
+        os.getenv("TRANSACTIONAL_EMAIL_TIMEOUT_SECONDS", "10")
+    )
+    stripe_secret_key: str | None = os.getenv("STRIPE_SECRET_KEY")
+    stripe_webhook_secret: str | None = os.getenv("STRIPE_WEBHOOK_SECRET")
+    stripe_publishable_key: str | None = os.getenv("STRIPE_PUBLISHABLE_KEY")
+    stripe_success_url: str | None = os.getenv("STRIPE_SUCCESS_URL")
+    stripe_cancel_url: str | None = os.getenv("STRIPE_CANCEL_URL")
+    stripe_portal_return_url: str | None = os.getenv("STRIPE_PORTAL_RETURN_URL")
+    stripe_price_essencial_monthly: str | None = os.getenv("STRIPE_PRICE_ESSENCIAL_MONTHLY")
+    stripe_price_essencial_annual: str | None = os.getenv("STRIPE_PRICE_ESSENCIAL_ANNUAL")
+    stripe_price_avancado_monthly: str | None = os.getenv("STRIPE_PRICE_AVANCADO_MONTHLY")
+    stripe_price_avancado_annual: str | None = os.getenv("STRIPE_PRICE_AVANCADO_ANNUAL")
+    stripe_price_premium_monthly: str | None = os.getenv("STRIPE_PRICE_PREMIUM_MONTHLY")
+    stripe_price_premium_annual: str | None = os.getenv("STRIPE_PRICE_PREMIUM_ANNUAL")
+    billing_grace_period_days: int = int(os.getenv("BILLING_GRACE_PERIOD_DAYS", "3"))
+    stripe_webhook_claim_ttl_seconds: int = int(
+        os.getenv("STRIPE_WEBHOOK_CLAIM_TTL_SECONDS", "300")
+    )
+    enable_billing_enforcement: bool = os.getenv(
+        "ENABLE_BILLING_ENFORCEMENT",
+        "false",
+    ).lower() == "true"
     audit_retention_days: int = int(os.getenv("AUDIT_RETENTION_DAYS", "90"))
     reminder_worker_enabled: bool = os.getenv("REMINDER_WORKER_ENABLED", "false").lower() == "true"
     reminder_worker_poll_seconds: int = int(os.getenv("REMINDER_WORKER_POLL_SECONDS", "60"))
+    reminder_worker_batch_size: int = int(os.getenv("REMINDER_WORKER_BATCH_SIZE", "100"))
     reminder_worker_dispatch_immediately: bool = os.getenv(
         "REMINDER_WORKER_DISPATCH_IMMEDIATELY",
         "true",
@@ -71,6 +141,11 @@ class Settings:
     classification_provider: str = os.getenv("CLASSIFICATION_PROVIDER", "mock")
     outbound_provider: str = os.getenv("OUTBOUND_PROVIDER", "mock")
     outbound_default_channel: str = os.getenv("OUTBOUND_DEFAULT_CHANNEL", "whatsapp")
+    outbound_max_attempts: int = int(os.getenv("OUTBOUND_MAX_ATTEMPTS", "5"))
+    outbound_retry_base_seconds: int = int(os.getenv("OUTBOUND_RETRY_BASE_SECONDS", "30"))
+    outbound_retry_max_seconds: int = int(os.getenv("OUTBOUND_RETRY_MAX_SECONDS", "3600"))
+    outbound_claim_ttl_seconds: int = int(os.getenv("OUTBOUND_CLAIM_TTL_SECONDS", "300"))
+    worker_lease_ttl_seconds: int = int(os.getenv("WORKER_LEASE_TTL_SECONDS", "300"))
     calendar_provider: str = os.getenv("CALENDAR_PROVIDER", "mock")
     calendar_timezone: str = os.getenv("CALENDAR_TIMEZONE", "America/Sao_Paulo")
     calendar_default_workday_start: str = os.getenv("CALENDAR_DEFAULT_WORKDAY_START", "09:00")

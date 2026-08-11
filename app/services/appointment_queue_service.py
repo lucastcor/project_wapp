@@ -145,7 +145,7 @@ def _slot_period(slot_start: datetime) -> str:
     return "evening"
 
 
-def _priority_weight(entry: dict[str, Any]) -> tuple[int, int, int, str, int]:
+def _priority_weight(entry: dict[str, Any]) -> tuple[int, int, int]:
     tier_weight = {
         "vip": 4,
         "high": 3,

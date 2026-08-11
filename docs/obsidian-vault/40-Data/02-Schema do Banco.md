@@ -2,7 +2,7 @@
 title: Schema do Banco
 type: data
 tags: [dados, schema, ddl]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Schema do Banco
@@ -334,6 +334,41 @@ Perfil tenant-scoped do contato.
 | `period` | TEXT |
 | `recorded_at` | TIMESTAMPTZ |
 
+### `company_contexts`
+
+Store de runtime do company context (migração `024`). Ver [[40-Data/05-Company Context]].
+
+| Coluna | Tipo | Observação |
+|--------|------|-----------|
+| `id` | BIGSERIAL PK (SQLite: INTEGER AUTOINCREMENT) | |
+| `company_id` | INT | Id interno resolvido do slug; `NULL` no contexto global |
+| `company_slug` | TEXT NOT NULL UNIQUE | Chave de storage; `__global__` para o contexto compartilhado |
+| `context_json` | TEXT NOT NULL | Payload validado |
+| `schema_version` | INT NOT NULL DEFAULT 1 | |
+| `revision` | INT NOT NULL DEFAULT 1 | Concorrência otimista |
+| `created_at` | TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP | |
+| `updated_at` | TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP | |
+| `updated_by` | TEXT | Ator admin, ou `seed:<arquivo>` na importação |
+
+### `whatsapp_channel_bindings`
+
+Vínculo durável entre um número de negócio do Meta e uma empresa (migração `027`).
+É a **única** fonte de identidade de tenant para um webhook Meta assinado.
+Ver [[30-API/03-Webhook WhatsApp]].
+
+| Coluna | Tipo | Observação |
+|--------|------|-----------|
+| `id` | BIGSERIAL PK (SQLite: INTEGER AUTOINCREMENT) | |
+| `company_id` | INTEGER NOT NULL → `companies(id)` | Empresa dona do número |
+| `phone_number_id` | TEXT NOT NULL | Identificador do provedor. Único entre vínculos **ativos** |
+| `display_phone_number` | TEXT | Apenas apresentação — **não** é usado como identidade |
+| `active` | INTEGER NOT NULL DEFAULT 1 | Desativar preserva o histórico |
+| `created_at` / `updated_at` | TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP | |
+| `updated_by` | TEXT | Ator admin |
+
+Nenhum token de acesso ou app secret é armazenado nesta tabela: as credenciais
+continuam em variáveis de ambiente.
+
 ## Índices importantes
 
 `db.py` cria índices operacionais e analíticos. Categorias:
@@ -350,8 +385,11 @@ Perfil tenant-scoped do contato.
 - `idx_conversation_flows_contact_status`
 - `idx_customer_reminders_status_remind_at`, `idx_customer_reminders_company_status`
 - `idx_contact_company_profiles_company_contact`, `idx_contact_company_profiles_company_updated_at`
+- `idx_company_contexts_slug` (único), `idx_company_contexts_company`
+- `idx_whatsapp_bindings_active_phone` (único parcial, `WHERE active = 1`), `idx_whatsapp_bindings_company`
 
 ## Próximas leituras
 
 - [[40-Data/03-Migrações]]
 - [[40-Data/04-Multi-tenant]]
+- [[40-Data/05-Company Context]]

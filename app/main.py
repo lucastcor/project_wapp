@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.admin_routes import admin_router
+from app.api.billing_routes import billing_router
 from app.api.platform_routes import PLATFORM_ASSETS_DIR, platform_router
 from app.api.routes import router
 from app.core.config import is_missing_or_placeholder, settings
@@ -21,9 +22,15 @@ from app.core.logging import (
     set_request_context,
 )
 from app.services.rate_limit_service import build_rate_limit_headers, evaluate_rate_limit, get_request_client_ip
+from app.services.realtime_service import close_realtime_broker, start_realtime_broker
 from app.services.runtime_guard_service import get_runtime_blockers, validate_runtime_environment
 from app.services.system_readiness_service import get_system_readiness
-from app.storage.db import check_runtime_database_connection, close_postgres_pool, init_db
+from app.storage.db import (
+    check_database_schema_current,
+    check_runtime_database_connection,
+    close_postgres_pool,
+    init_db,
+)
 
 configure_logging()
 logger = get_logger(__name__)
@@ -45,6 +52,12 @@ def _validate_production_config() -> None:
                     break
         if is_missing_or_placeholder(settings.openai_api_key) and settings.classification_provider == "openai":
             warnings.append("CLASSIFICATION_PROVIDER=openai but OPENAI_API_KEY is not set")
+        if is_missing_or_placeholder(settings.internal_ingress_secret):
+            warnings.append("INTERNAL_INGRESS_SECRET is not set — internal ingress is closed")
+    if settings.enable_normalized_whatsapp_ingress and is_missing_or_placeholder(settings.internal_ingress_secret):
+        warnings.append(
+            "ENABLE_NORMALIZED_WHATSAPP_INGRESS=true without a valid INTERNAL_INGRESS_SECRET"
+        )
     if settings.outbound_provider == "mock":
         warnings.append("OUTBOUND_PROVIDER=mock — WhatsApp messages will not be delivered")
     if settings.calendar_provider == "mock":
@@ -56,11 +69,22 @@ def _validate_production_config() -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _validate_production_config()
-    init_db()
+    if settings.run_migrations_on_startup:
+        init_db()
+    elif (
+        not check_runtime_database_connection()["ok"]
+        or not check_database_schema_current()["ok"]
+    ):
+        raise RuntimeError(
+            "Database is unavailable or not migrated. Run `python -m app.tools.run_migrations` "
+            "as a release step before starting the API."
+        )
     validate_runtime_environment("api")
+    start_realtime_broker()
     try:
         yield
     finally:
+        close_realtime_broker()
         close_postgres_pool()
 
 
@@ -136,6 +160,22 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
 
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
         response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'; "
+            "form-action 'self'; "
+            "img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "script-src 'self'; "
+            "connect-src 'self'"
+        )
+        if settings.environment.strip().lower() == "production":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         if rate_limit_decision:
             for header_name, header_value in build_rate_limit_headers(rate_limit_decision).items():
                 response.headers[header_name] = header_value
@@ -153,6 +193,7 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestObservabilityMiddleware)
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(billing_router)
 app.include_router(platform_router)
 app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")
 

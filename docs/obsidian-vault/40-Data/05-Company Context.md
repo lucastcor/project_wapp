@@ -1,18 +1,40 @@
 ---
-title: Company Context (JSON)
+title: Company Context
 type: data
-tags: [dados, contexto, json]
-updated: 2026-04-28
+tags: [dados, contexto, persistência]
+updated: 2026-07-25
 ---
 
-# Company Context (contrato JSON)
+# Company Context
 
-Cada empresa tem um JSON com **identidade, regras, agenda e playbooks**. Validação obrigatória em `app/core/company_context.py`.
+Cada empresa tem um documento com **identidade, regras, agenda e playbooks**.
+Validação obrigatória em `app/core/company_context.py`.
 
-## Localização
+## Onde o contexto mora
 
-- Global / fallback: `app/data/company_context.json`.
-- Por empresa: `app/data/company_contexts/{slug}.json` — onde `{slug}` é o slug normalizado (lowercase, hifens, sem acento).
+O **store de runtime é o banco compartilhado** (tabela `company_contexts`). API e
+worker leem a mesma linha, cada escrita é transacional e versionada, e o backup
+lógico do banco inclui a configuração ativa.
+
+Os arquivos JSON sob `app/data` são **material de seed**, não store de runtime:
+
+| Caminho | Papel |
+|---------|-------|
+| `app/data/company_context.json` | Seed do contexto global (chave de storage `__global__`) |
+| `app/data/company_contexts/{slug}.json` | Seed por empresa (`{slug}` normalizado: lowercase, hifens) |
+
+### Ordem de resolução
+
+`get_company_context(company_slug=...)` avalia, nesta ordem, `slug` e depois o global:
+
+1. Linha do banco para a chave.
+2. Arquivo de seed da chave — **apenas se seeds estiverem habilitados**.
+
+Seeds são desabilitados quando `ENVIRONMENT=production` **ou**
+`STRICT_RUNTIME_VALIDATION=true` (`seed_contexts_enabled()`). Ou seja: o runtime
+de produção nunca cai silenciosamente em arquivo local mutável. Sem linha no
+banco e sem fallback permitido, a leitura levanta `CompanyContextError` e a
+readiness reporta blocker.
 
 ## Chaves obrigatórias
 
@@ -102,30 +124,95 @@ Quando um desses contatos manda mensagem, o sistema entende como **comando inter
 
 Validações: `key` único, `next_keys` precisa apontar para keys existentes, `canvas_position.x|y` numéricos.
 
+## Persistência
+
+Tabela `company_contexts` (migrações `024`–`026`):
+
+| Coluna | Observação |
+|--------|-----------|
+| `company_id` | Id interno resolvido a partir do slug; `NULL` no contexto global |
+| `company_slug` | Chave de storage única (`__global__` para o contexto compartilhado) |
+| `context_json` | Payload validado |
+| `schema_version` | `COMPANY_CONTEXT_SCHEMA_VERSION` (hoje `1`) |
+| `revision` | Contador incremental para concorrência otimista |
+| `created_at` / `updated_at` | Timestamps |
+| `updated_by` | Ator admin quando disponível; `seed:<arquivo>` na importação |
+
+### Garantias de escrita
+
+- **Validação antes de persistir** — payload inválido é rejeitado antes de qualquer
+  escrita, então a última versão válida nunca é substituída por uma quebrada.
+- **Transação** — leitura da revisão, insert/update e commit acontecem na mesma
+  conexão; falha implica rollback.
+- **Sem lost update** — o `UPDATE` carrega o predicado `WHERE company_slug = ? AND
+  revision = ?` com a revisão lida. Um escritor concorrente que já avançou a
+  revisão faz o `UPDATE` afetar 0 linhas → conflito.
+- **Concorrência otimista opcional** — `expected_revision` no payload da API;
+  divergência retorna `409`.
+- **Sem cache** — nenhuma camada de cache foi introduzida, então API e worker não
+  podem divergir.
+
 ## Como editar
 
-1. **Pela plataforma** (Flow Studio para pipelines, formulários para resto): `PUT /admin/company-context` (superadmin).
+1. **Pela plataforma** (Flow Studio para pipelines, formulários para o resto):
+   `PUT /admin/company-context` (superadmin). Aceita `expected_revision` opcional.
 2. **Pelo Streamlit**: `app/ui/pages/company_context_page.py`.
-3. **Manual**: editar JSON e validar com `get_company_context_status(company_slug=...)` antes de subir.
+3. **Leitura com metadados**: `GET /admin/company-context/record` devolve
+   `revision`, `schema_version`, `source`, `updated_at`, `updated_by` e `data` —
+   use para obter a `revision` antes de um update concorrente.
+
+Respostas de `PUT /admin/company-context`:
+
+| Situação | Código |
+|----------|--------|
+| Sucesso | `200` com o contexto salvo |
+| Payload inválido | `400` (nada é gravado) |
+| `expected_revision` desatualizada | `409` (nada é gravado) |
+| Papel abaixo de superadmin | `403` |
+
+## Bootstrap / importação dos seeds
+
+A migração `026_company_context_seed_import` importa os arquivos de seed dentro da
+própria transação de migração. Ela é **idempotente**: uma chave que já tem linha é
+pulada, então um contexto mais novo no banco nunca é sobrescrito por um seed
+antigo. Seeds inválidos são ignorados sem quebrar a migração.
+
+Para rodar a importação fora da migração:
+
+```bash
+python -m app.tools.bootstrap_company_contexts --dry-run   # mostra o plano
+python -m app.tools.bootstrap_company_contexts             # importa
+```
+
+Saída: `imported`, `skipped_existing`, `skipped_invalid`.
 
 ## Como o backend lê
 
-`get_company_context(company_slug=...)`:
-1. Resolve path com `_normalize_company_slug`.
-2. Se não existe, fallback para o global.
-3. Lê JSON, valida, retorna dict.
-
-`get_company_context_status(...)` retorna o estado de validação para readiness.
+`get_company_context(company_slug=...)` devolve o payload validado.
+`get_company_context_record(...)` devolve payload + `revision`, `schema_version`,
+`source` (`database` ou `seed_file`), `company_id`, `updated_at`, `updated_by`.
+`get_company_context_status(...)` devolve o mesmo estado sem levantar exceção,
+para readiness e onboarding.
 
 ## Onde o contexto é usado
 
 - **Reply prompt**: `openai_provider.generate_business_reply` carrega catálogo, regras, identidade, guidelines.
 - **Workflow conversacional**: `enabled_modules.scheduling`, `business_hours.timezone`, `internal_operation.operator_contact_ids`.
 - **Calendar service**: `scheduling_policy.profiles` segmenta janelas.
-- **Readiness**: `get_company_context_status` aparece em `/admin/system/readiness` e `/admin/system/onboarding`.
+- **Readiness**: `get_company_context_status` aparece em `/admin/system/readiness`
+  e `/admin/system/onboarding`. O check `company_context_persistence` é blocker em
+  produção quando o contexto global ainda vem de arquivo de seed.
+- **Backup**: `company_contexts` está em `BACKUP_TABLES`
+  (`app/tools/export_runtime_backup.py`), então o export lógico carrega a
+  configuração ativa.
+- **Auditoria**: cada update grava `audit_events` com `revision` e `schema_version`
+  nos metadados (sem o payload).
 
 ## Próximas leituras
 
 - [[20-Modules/01-Core]] (linha company_context)
 - [[10-Architecture/06-Fluxo Agenda]]
 - [[20-Modules/04-Plataforma Frontend]] (Flow Studio)
+- [[40-Data/02-Schema do Banco]] (tabela `company_contexts`)
+- [[40-Data/03-Migrações]]
+- [[40-Data/06-Backup e Limpeza]]

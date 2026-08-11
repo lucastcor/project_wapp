@@ -2,7 +2,7 @@
 title: Project WAPP — Vault de Conhecimento
 type: moc
 tags: [moc, home, project-wapp]
-updated: 2026-04-28
+updated: 2026-07-25
 owner: equipe-produto
 ---
 
@@ -118,11 +118,15 @@ flowchart TB
 | Dimensão | Estado | Nota |
 |----------|--------|------|
 | Backend conversacional | ✅ Maduro | Orquestrador, classificação, reply, memória, pipeline. |
-| Multi-tenant | ✅ Implementado | `company_id`/`company_slug` em todas tabelas operacionais. |
+| Multi-tenant | ✅ Implementado | Webhook Meta resolve tenant por `phone_number_id` vinculado; saída usa o número do próprio tenant. |
+| PostgreSQL | ✅ Suíte completa verde | I-016 e I-017 resolvidos; CI roda SQLite e PostgreSQL. |
+| Company context | ✅ No banco | Tabela `company_contexts`, transacional e versionada; JSON vira seed. |
+| Ingress público | ✅ Autenticado | Meta exige HMAC; modo normalizado off por padrão; `/messages/incoming` exige segredo em produção. |
+| Realtime (SSE) | ✅ Autenticado e isolado | Sessão obrigatória; eventos entregues por escopo de empresa. |
 | Agenda + lembretes | ✅ Operacional | Provider mock + preparação Google/CalDAV. |
 | Fine-tuning | 🟡 Pipeline pronto | Falta job concluído com sucesso em produção. |
 | WhatsApp real | 🟡 Preparado | HMAC validado, falta hardening produtivo. |
-| RBAC | ✅ Por token | Evolução para identidade centralizada pendente. |
+| RBAC | ✅ Matriz explícita | Toda rota mutante declarada e testada; escopo por tenant ainda pendente. |
 | Tracing distribuído | 🔴 Ausente | Apenas logs JSON + `X-Request-ID`. |
 | Identidade humana | 🔴 Ausente | Tokens estáticos por papel. |
 

@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from app.core.config import settings
 from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
@@ -81,6 +82,7 @@ USAGE_METRICS = {
 }
 
 DEGRADED_METRICS = {"outbound_campaigns", "handoffs", "finetuning_jobs"}
+HARD_LIMIT_METRICS = {"bookings", "outbound_campaigns", "finetuning_jobs"}
 ALERT_THRESHOLD = 0.80
 
 
@@ -88,9 +90,154 @@ class BillingError(Exception):
     pass
 
 
+class BillingLimitError(BillingError):
+    pass
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _subscription_access(sub: dict[str, Any]) -> tuple[bool, str]:
+    now = datetime.now(UTC)
+    status = str(sub.get("status") or "")
+    if status == "active":
+        return True, "active"
+    if status == "trial":
+        trial_end = _parse_datetime(sub.get("trial_ends_at"))
+        return (
+            (True, "trial")
+            if trial_end is None or now <= trial_end
+            else (False, "trial_expired")
+        )
+    if status == "past_due":
+        grace_end = _parse_datetime(sub.get("grace_period_ends_at"))
+        return (
+            (True, "payment_grace_period")
+            if grace_end is not None and now <= grace_end
+            else (False, "payment_failed")
+        )
+    if status == "cancelled":
+        period_end = _parse_datetime(sub.get("current_period_end"))
+        return (
+            (True, "cancelled_access_until_period_end")
+            if period_end is not None and now <= period_end
+            else (False, "subscription_expired")
+        )
+    return False, f"subscription_{status or 'unknown'}"
+
+
+def consume_usage(
+    *,
+    company_id: int,
+    metric: str,
+    quantity: int = 1,
+) -> dict[str, Any]:
+    """Atomically enforce hard limits and record real product usage."""
+    if metric not in USAGE_METRICS:
+        raise BillingError(f"Invalid metric: {metric}")
+    if quantity <= 0:
+        raise BillingError("quantity must be greater than zero.")
+    subscription = repository.get_billing_subscription(company_id)
+    if not subscription:
+        if settings.enable_billing_enforcement:
+            return {"allowed": False, "recorded": False, "reason": "no_subscription"}
+        return {
+            "allowed": True,
+            "recorded": False,
+            "reason": "billing_enforcement_disabled",
+        }
+
+    has_access, access_reason = _subscription_access(subscription)
+    if not has_access and settings.enable_billing_enforcement:
+        return {"allowed": False, "recorded": False, "reason": access_reason}
+
+    plan = PLANS.get(str(subscription.get("plan_key")), PLANS["essencial"])
+    limit = int(plan["limits"].get(metric, 0) or 0)
+    hard_limit = metric in HARD_LIMIT_METRICS and settings.enable_billing_enforcement
+    if hard_limit and limit <= 0:
+        return {
+            "allowed": False,
+            "recorded": False,
+            "reason": "feature_not_in_plan",
+            "limit": limit,
+        }
+
+    result = repository.consume_billing_usage(
+        company_id=company_id,
+        subscription_id=int(subscription["id"]),
+        metric=metric,
+        period_start=str(subscription.get("current_period_start") or ""),
+        period_end=str(subscription.get("current_period_end") or ""),
+        quantity=quantity,
+        limit=limit if hard_limit else None,
+    )
+    return {
+        "allowed": bool(result["consumed"]) or not hard_limit,
+        "recorded": bool(result["consumed"]),
+        "reason": result["reason"] if result["consumed"] else (
+            result["reason"] if hard_limit else access_reason
+        ),
+        "used": result.get("used"),
+        "limit": limit,
+        "hard_limit": hard_limit,
+        "usage_record_id": result.get("usage_record_id"),
+    }
+
+
+def require_usage_capacity(
+    *,
+    company_id: int,
+    metric: str,
+    quantity: int = 1,
+) -> dict[str, Any]:
+    decision = consume_usage(
+        company_id=company_id,
+        metric=metric,
+        quantity=quantity,
+    )
+    if not decision["allowed"]:
+        raise BillingLimitError(
+            f"Billing policy blocked {metric}: {decision['reason']}."
+        )
+    return decision
+
+
+def refund_usage_reservation(*, company_id: int, decision: dict[str, Any]) -> None:
+    usage_record_id = decision.get("usage_record_id")
+    if usage_record_id is not None:
+        repository.refund_billing_usage(
+            usage_record_id=int(usage_record_id),
+            company_id=company_id,
+        )
+
+
 def seed_plans() -> list[dict[str, Any]]:
     results = []
+    stripe_prices = {
+        "essencial": (
+            settings.stripe_price_essencial_monthly,
+            settings.stripe_price_essencial_annual,
+        ),
+        "avancado": (
+            settings.stripe_price_avancado_monthly,
+            settings.stripe_price_avancado_annual,
+        ),
+        "premium": (
+            settings.stripe_price_premium_monthly,
+            settings.stripe_price_premium_annual,
+        ),
+    }
     for plan_key, plan in PLANS.items():
+        monthly_price_id, annual_price_id = stripe_prices[plan_key]
         plan_id = repository.upsert_billing_plan(
             plan_key=plan_key,
             name=plan["name"],
@@ -100,16 +247,21 @@ def seed_plans() -> list[dict[str, Any]]:
             features_json=json.dumps(plan["features"]),
             display_order=plan["display_order"],
         )
+        if hasattr(repository, "update_billing_plan_gateway_mapping"):
+            repository.update_billing_plan_gateway_mapping(
+                plan_id,
+                currency="brl",
+                stripe_monthly_price_id=monthly_price_id,
+                stripe_annual_price_id=annual_price_id,
+            )
         results.append({"plan_key": plan_key, "id": plan_id})
     return results
 
 
 def get_plans() -> list[dict[str, Any]]:
+    # Also refresh immutable Stripe price mappings from deployment config.
+    seed_plans()
     db_plans = repository.get_billing_plans(active_only=True)
-
-    if not db_plans:
-        seed_plans()
-        db_plans = repository.get_billing_plans(active_only=True)
 
     plans = []
     for row in db_plans:
@@ -123,6 +275,8 @@ def get_plans() -> list[dict[str, Any]]:
             "limits": limits,
             "features": features,
             "display_order": row.get("display_order", 0),
+            "currency": row.get("currency") or "brl",
+            "stripe_checkout_ready": bool(row.get("stripe_monthly_price_id")),
         })
     return plans
 
@@ -381,8 +535,8 @@ def get_usage_dashboard(company_id: int) -> dict[str, Any]:
         period_end=period_end,
     )
 
-    usage_details = {}
-    alerts = []
+    usage_details: dict[str, dict[str, Any]] = {}
+    alerts: list[dict[str, Any]] = []
 
     for metric in USAGE_METRICS:
         used = usage_totals.get(metric, 0)
@@ -434,6 +588,10 @@ def get_usage_dashboard(company_id: int) -> dict[str, Any]:
         "subscription": {
             "id": int(sub["id"]),
             "status": sub["status"],
+            "gateway": sub.get("gateway"),
+            "payment_status": sub.get("payment_status"),
+            "cancel_at_period_end": bool(sub.get("cancel_at_period_end")),
+            "grace_period_ends_at": sub.get("grace_period_ends_at"),
             "plan_key": plan_key,
             "plan_name": plan_def["name"],
             "billing_cycle": cycle,
@@ -453,20 +611,18 @@ def get_usage_dashboard(company_id: int) -> dict[str, Any]:
 
 
 def check_limit(company_id: int, metric: str) -> dict[str, Any]:
+    if metric not in USAGE_METRICS:
+        raise BillingError(f"Invalid metric: {metric}")
     sub = repository.get_billing_subscription(company_id)
     if not sub:
-        return {"allowed": True, "reason": "no_subscription"}
+        return {
+            "allowed": True,
+            "reason": "no_subscription",
+        }
 
-    if sub["status"] == "cancelled":
-        now = datetime.now(UTC)
-        period_end = sub.get("current_period_end")
-        if period_end:
-            try:
-                end_dt = datetime.fromisoformat(str(period_end))
-                if now > end_dt:
-                    return {"allowed": False, "reason": "subscription_expired"}
-            except (ValueError, TypeError):
-                pass
+    has_access, access_reason = _subscription_access(sub)
+    if not has_access:
+        return {"allowed": False, "reason": access_reason}
 
     plan_key = sub["plan_key"]
     plan_def = PLANS.get(plan_key, PLANS["essencial"])
@@ -474,7 +630,11 @@ def check_limit(company_id: int, metric: str) -> dict[str, Any]:
     limit = limits.get(metric, 0)
 
     if limit <= 0:
-        return {"allowed": True, "reason": "no_limit_for_metric"}
+        return {
+            "allowed": False,
+            "reason": "feature_not_in_plan",
+            "limit": limit,
+        }
 
     period_start = sub.get("current_period_start") or ""
     period_end = sub.get("current_period_end") or ""
@@ -487,10 +647,12 @@ def check_limit(company_id: int, metric: str) -> dict[str, Any]:
     used = usage_totals.get(metric, 0)
 
     if used >= limit:
+        hard_limit = metric in HARD_LIMIT_METRICS
         degraded = metric in DEGRADED_METRICS
         return {
-            "allowed": not degraded,
+            "allowed": not hard_limit and not degraded,
             "degraded": degraded,
+            "hard_limit": hard_limit,
             "reason": "limit_exceeded",
             "used": used,
             "limit": limit,

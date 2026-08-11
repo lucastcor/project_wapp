@@ -1,16 +1,18 @@
 import logging
 import time
+from typing import Any
 
 from app.core.logging import get_logger, log_event, mask_identifier
 from app.services.classification_service import classify_message
-from app.services.decision_service import decide_message_action
+from app.services.decision_service import MessageDecision, decide_message_action
 from app.storage.repository import RuntimeRepository
 from app.services.reply_services import generate_business_reply
 from app.services.memory_service import update_conversation_summary
 from app.services.pipeline_service import infer_pipeline_state
-from app.services.handoff_service import should_create_pending_question
+from app.services.handoff_service import HandoffDecision, should_create_pending_question
 from app.core.company_context import get_company_context
 from app.services.conversation_workflow_service import handle_conversation_workflow
+from app.services.billing_service import consume_usage
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
@@ -22,7 +24,7 @@ def _process_contact_message(
     message: str,
     company_id: int | None = None,
     company_slug: str | None = None,
-) -> dict[str, str | float | bool | int | None]:
+) -> dict[str, Any]:
     start_time = time.perf_counter()
     masked_contact_id = mask_identifier(contact_id)
 
@@ -67,23 +69,26 @@ def _process_contact_message(
         company_context=company_context,
     )
 
+    pending_question_id: int | None = None
+    decision: MessageDecision
+    handoff_decision: HandoffDecision
+
     if workflow_result.handled:
         classification = str(workflow_result.classification or "workflow")
         confidence = 0.98
         reason = f"Fluxo conversacional tratado internamente: {workflow_result.workflow_type or 'workflow'}."
         decision = {
-            "auto_reply": workflow_result.auto_reply,
-            "action": workflow_result.action,
-            "priority": workflow_result.priority,
+            "auto_reply": bool(workflow_result.auto_reply),
+            "action": str(workflow_result.action or "workflow"),
+            "priority": str(workflow_result.priority or "medium"),
         }
         reply = workflow_result.reply
         reply_source = workflow_result.source
         handoff_decision = {
             "should_handoff": False,
             "question_type": None,
+            "question_for_owner": None,
         }
-        pending_question_id = None
-
         log_event(
             logger,
             logging.INFO,
@@ -171,14 +176,17 @@ def _process_contact_message(
                 reply_length=len(reply),
             )
 
-        pending_question_id: int | None = None
         if handoff_decision["should_handoff"] and not latest_customer_clarification:
+            question_type = handoff_decision["question_type"]
+            question_for_owner = handoff_decision["question_for_owner"]
+            if question_type is None or question_for_owner is None:
+                raise RuntimeError("Handoff decision is missing its required question metadata.")
             pending_question_id = repository.create_pending_question(
                 contact_id=contact_id,
                 company_id=resolved_company_id,
                 customer_message=message,
-                question_type=handoff_decision["question_type"],
-                question_for_owner=handoff_decision["question_for_owner"],
+                question_type=question_type,
+                question_for_owner=question_for_owner,
             )
             log_event(
                 logger,
@@ -203,6 +211,26 @@ def _process_contact_message(
         action=decision["action"],
         priority=decision["priority"],
     )
+    try:
+        consume_usage(
+            company_id=resolved_company_id,
+            metric="messages",
+        )
+        if handoff_decision["should_handoff"] and not latest_customer_clarification:
+            consume_usage(
+                company_id=resolved_company_id,
+                metric="handoffs",
+            )
+    except Exception as exc:  # Billing telemetry is non-blocking for inbound safety.
+        # Inbound conversations and safety handoffs are deliberately fail-open;
+        # billing telemetry must never make the customer channel unavailable.
+        log_event(
+            logger,
+            logging.WARNING,
+            "billing.usage.soft_meter_failed",
+            company_id=resolved_company_id,
+            error_type=type(exc).__name__,
+        )
 
     new_summary = update_conversation_summary(
         previous_summary=previous_summary,
@@ -272,7 +300,7 @@ def process_incoming_message(
     message: str,
     company_id: int | None = None,
     company_slug: str | None = None,
-) -> dict[str, str | float | bool | int | None]:
+) -> dict[str, Any]:
     return _process_contact_message(
         contact_id=contact_id,
         contact_name=contact_name,
@@ -288,7 +316,7 @@ def process_whatsapp_webhook(
     text: str,
     company_id: int | None = None,
     company_slug: str | None = None,
-) -> dict[str, str | float | bool | int | None]:
+) -> dict[str, Any]:
     return _process_contact_message(
         contact_id=from_number,
         contact_name=from_name,

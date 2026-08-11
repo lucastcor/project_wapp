@@ -2,7 +2,7 @@
 title: Webhook HMAC
 type: security
 tags: [segurança, webhook, hmac, whatsapp]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Validação HMAC do Webhook WhatsApp
@@ -33,12 +33,40 @@ Pontos importantes:
 - `hmac.compare_digest` para evitar timing attack.
 - 503 quando `WHATSAPP_APP_SECRET` ausente.
 - 403 quando header ausente ou inválido.
+- A autenticação roda **antes** de qualquer parsing pesado, persistência ou
+  orquestração: o handler classifica o formato do payload, autentica o modo
+  correspondente e só então normaliza e processa.
+- Vale para **todo** payload com `object=whatsapp_business_account`, inclusive
+  eventos de status que serão ignorados. Um POST Meta sem assinatura válida
+  recebe 403 mesmo que a mensagem não fosse processada.
 
-## Quando NÃO valida
+## Modo normalizado interno
 
-Quando o payload chega no formato **normalizado interno** (com `event`, `from_number`, `text` no top-level), a validação não é exigida. Esse modo serve para integrações internas (dev, testes, gateways privados).
+Quando o payload chega no formato **normalizado interno** (com `event`,
+`from_number`, `text` no top-level), não há assinatura Meta para validar. Por isso
+esse modo tem autenticação própria:
 
-> Implicação operacional: em produção, **sempre** o tráfego do Meta cai no modo `meta` e exige assinatura. O modo normalizado só funciona para fontes confiáveis dentro da rede.
+1. **Desabilitado por padrão** (`ENABLE_NORMALIZED_WHATSAPP_INGRESS=false`) →
+   `403 Normalized webhook ingress is disabled.`
+2. Quando habilitado, exige `INTERNAL_INGRESS_SECRET` em
+   `X-Internal-Ingress-Secret` ou `Authorization: Bearer`, comparado em tempo
+   constante.
+3. Habilitado **sem** segredo real (ausente ou `change-me*`) → `503`. Falha
+   fechado em qualquer ambiente, e o readiness marca `normalized_ingress_security`
+   como blocker.
+
+Implementação em `app/services/ingress_auth_service.py` (política) e
+`app/api/ingress_security.py` (mapeamento HTTP).
+
+> Implicação operacional: o tráfego do Meta sempre cai no modo `meta` e exige
+> assinatura. O modo normalizado é opt-in explícito para fontes confiáveis dentro
+> da rede, e portador do segredo interno.
+
+## O que nunca vai para o log
+
+O evento `api.ingress.auth.denied` registra apenas `ingress_surface`,
+`denial_reason` e `status_code`. Segredo apresentado, segredo configurado e
+header `Authorization` **nunca** são logados.
 
 ## Idempotência
 

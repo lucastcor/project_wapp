@@ -2,7 +2,7 @@
 title: Mapa de Arquivos
 type: reference
 tags: [referência, mapa, arquivos]
-updated: 2026-04-28
+updated: 2026-07-26
 ---
 
 # Mapa de Arquivos
@@ -55,7 +55,7 @@ Inventário completo do que existe em `app/`, `tests/`, `docs/` e raiz. Verifica
 
 ### `app/data/`
 
-- `company_context.json` — fallback global.
+- `company_context.json` — **seed** do contexto global (runtime lê de `company_contexts` no banco).
 - `company_contexts/empresa-teste.json` — exemplo.
 - `company_contexts/string.json` — placeholder/lixo (ver I-010).
 
@@ -117,8 +117,12 @@ Inventário completo do que existe em `app/`, `tests/`, `docs/` e raiz. Verifica
 - `__init__.py`
 - `calendar_mock.py` — disponibilidade mock MVP.
 - `cleanup_operational_data.py` — CLI de limpeza.
-- `export_runtime_backup.py` — CLI de snapshot JSON.
-- `migrate_sqlite_to_postgres.py` — CLI migração.
+- `export_runtime_backup.py` — backup/restore v2 com snapshot consistente,
+  checksum, validação fail-closed e escrita privada atômica.
+- `migrate_sqlite_to_postgres.py` — migração com cobertura real de tabelas e
+  colunas, rollback e ressincronização de sequences.
+- `portability_security.py` — sanitização recursiva compartilhada por backup e
+  migração para impedir transporte de credenciais persistidas.
 - `preflight_check.py` — CLI pre-flight.
 - `registry.py` — vazio (placeholder).
 - `reminder_worker.py` — worker daemon.

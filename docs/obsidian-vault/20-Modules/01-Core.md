@@ -2,7 +2,7 @@
 title: Core (orchestrator, config, company_context)
 type: module
 tags: [módulo, core]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Módulo: Core
@@ -48,11 +48,16 @@ Chaves opcionais validadas:
 - `internal_operation.operator_contact_ids[]` — contatos autorizados a operar agenda.
 - `conversation_pipelines[]` — playbooks visuais com `key`, `label`, `next_keys`, `canvas_position` (chaves únicas; `next_keys` deve referenciar keys existentes).
 
-Persistência:
-- Global: `app/data/company_context.json` (fallback).
-- Por empresa: `app/data/company_contexts/{slug}.json`.
+Persistência (store de runtime = banco):
+- Tabela `company_contexts`, com `revision`, `schema_version` e `updated_by`.
+- Chave de storage: slug normalizado, ou `__global__` para o contexto compartilhado.
+- `app/data/company_context.json` e `app/data/company_contexts/{slug}.json` são
+  **seed**: importados idempotentemente pela migração `026` e lidos como fallback
+  apenas fora de produção/strict.
 
-`save_company_context()` valida antes de gravar; se inválido, levanta `CompanyContextError`.
+`save_company_context()` valida antes de gravar; se inválido, levanta
+`CompanyContextError` e nada é escrito. Escrita concorrente com revisão
+desatualizada levanta `CompanyContextConflictError`.
 
 Detalhe em [[40-Data/05-Company Context]].
 

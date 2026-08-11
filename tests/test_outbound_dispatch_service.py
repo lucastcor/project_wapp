@@ -89,6 +89,9 @@ class FakeRepository:
 
 
 class FakeWhatsAppProvider:
+    def __init__(self, *, company_id: int | None = None) -> None:
+        self.company_id = company_id
+
     def send_message(self, contact_id: str, message: str) -> dict:
         return {
             "channel": "whatsapp",
@@ -102,6 +105,9 @@ class FakeWhatsAppProvider:
 
 
 class BrokenWhatsAppProvider:
+    def __init__(self, *, company_id: int | None = None) -> None:
+        self.company_id = company_id
+
     def send_message(self, contact_id: str, message: str) -> dict:
         raise outbound_dispatch_service.WhatsAppProviderError("Falha no provider WhatsApp")
 

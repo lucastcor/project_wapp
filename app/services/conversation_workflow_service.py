@@ -596,6 +596,11 @@ def _booking_change_result_metadata(booking: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _flow_state(flow: dict[str, Any] | None) -> dict[str, Any]:
+    raw_state = flow.get("state") if flow else None
+    return dict(raw_state) if isinstance(raw_state, dict) else {}
+
+
 def _continue_scheduling_flow(
     *,
     flow: dict[str, Any] | None,
@@ -606,7 +611,7 @@ def _continue_scheduling_flow(
     company_context: dict[str, Any],
 ) -> WorkflowResult:
     timezone_obj = _get_timezone(company_context)
-    state = dict(flow.get("state") if flow else {})
+    state = _flow_state(flow)
     service_name = state.get("service_name") or _extract_service_name(company_context, message)
     request_summary = state.get("request_summary") or _extract_request_summary(message)
     requested_date = state.get("requested_date")
@@ -871,7 +876,7 @@ def _continue_booking_change_flow(
     company_context: dict[str, Any],
 ) -> WorkflowResult:
     timezone_obj = _get_timezone(company_context)
-    state = dict(flow.get("state") if flow else {})
+    state = _flow_state(flow)
     upcoming_bookings = _get_upcoming_bookings(
         contact_id=contact_id,
         company_id=company_id,
@@ -1116,7 +1121,7 @@ def _continue_operator_booking_flow(
     company_context: dict[str, Any],
 ) -> WorkflowResult:
     timezone_obj = _get_timezone(company_context)
-    state = dict(flow.get("state") if flow else {})
+    state = _flow_state(flow)
 
     if not flow:
         command = _extract_operator_booking_command(message)

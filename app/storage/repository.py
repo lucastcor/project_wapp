@@ -1,7 +1,21 @@
+import functools
+import hmac
+import inspect
 import json
+import re
+import secrets
+from datetime import UTC, datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 
-from app.storage.db import get_connection, get_database_backend
+from app.storage.db import (
+    connection_scope,
+    db_session,
+    db_transaction,
+    get_connection,
+    get_database_backend,
+    is_unique_violation,
+)
 
 
 PLACEHOLDER_COMPANY_SLUGS = {
@@ -19,16 +33,57 @@ PLACEHOLDER_COMPANY_NAMES = {
     "test company",
 }
 
+# Neutral condition used when an optional filter is not applied. PostgreSQL
+# cannot infer the type of a bare placeholder in `? IS NULL OR col = ?` and
+# raises IndeterminateDatatype, so the condition is built instead of bound.
+# Partial unique index guaranteeing one active company per WhatsApp number.
+WHATSAPP_ACTIVE_PHONE_INDEX = "idx_whatsapp_bindings_active_phone"
+WHATSAPP_ACTIVE_PHONE_COLUMN = "whatsapp_channel_bindings.phone_number_id"
+
+
+def _is_active_phone_number_conflict(error: BaseException) -> bool:
+    """Whether the error is the active-phone-number uniqueness violation."""
+    return is_unique_violation(
+        error,
+        postgres_constraint=WHATSAPP_ACTIVE_PHONE_INDEX,
+        sqlite_qualified_column=WHATSAPP_ACTIVE_PHONE_COLUMN,
+    )
+
+
+ALWAYS_TRUE_CONDITION = "1 = 1"
+# Bare column, or `alias.column`. Anything else is rejected outright.
+_SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def _optional_equals(column: str, value: Any) -> tuple[str, tuple[Any, ...]]:
+    """Build a parameterized equality condition for an optional filter.
+
+    ``value is None`` means "do not filter" and yields the neutral condition
+    with no bound parameters. Values are *always* bound as parameters; only the
+    column identifier is interpolated, and it is validated against a strict
+    identifier pattern so a future caller cannot turn this into an injection
+    point even by mistake.
+    """
+    if not _SQL_IDENTIFIER_PATTERN.match(column):
+        raise ValueError(f"Unsafe SQL identifier for optional filter: {column!r}")
+    if value is None:
+        return ALWAYS_TRUE_CONDITION, ()
+    return f"{column} = ?", (value,)
+
 
 class RuntimeRepository:
-    def get_state(self) -> dict[str, Any]:
+    def get_state(self, company_id: int | None = None) -> dict[str, Any]:
         connection = get_connection()
         cursor = connection.cursor()
+        condition, params = _optional_equals("company_id", company_id)
 
-        cursor.execute("SELECT COUNT(*) AS count FROM messages")
+        cursor.execute(f"SELECT COUNT(*) AS count FROM messages WHERE {condition}", params)
         messages_count = cursor.fetchone()["count"]
 
-        cursor.execute("SELECT COUNT(*) AS count FROM contact_company_profiles")
+        cursor.execute(
+            f"SELECT COUNT(*) AS count FROM contact_company_profiles WHERE {condition}",
+            params,
+        )
         contacts_count = cursor.fetchone()["count"]
 
         connection.close()
@@ -38,17 +93,21 @@ class RuntimeRepository:
             "contacts_count": contacts_count,
         }
 
-    def get_observability_summary(self) -> dict[str, Any]:
+    def get_observability_summary(self, company_id: int | None = None) -> dict[str, Any]:
         connection = get_connection()
         cursor = connection.cursor()
+        condition, company_params = _optional_equals("company_id", company_id)
 
-        def fetch_count(query: str) -> int:
-            cursor.execute(query)
+        def fetch_count(query: str, params: tuple[Any, ...] = ()) -> int:
+            cursor.execute(query, params)
             row = cursor.fetchone()
             return int(row["count"]) if row else 0
 
-        def fetch_grouped_counts(query: str) -> dict[str, int]:
-            cursor.execute(query)
+        def fetch_grouped_counts(
+            query: str,
+            params: tuple[Any, ...] = (),
+        ) -> dict[str, int]:
+            cursor.execute(query, params)
             rows = cursor.fetchall()
             result: dict[str, int] = {}
             for row in rows:
@@ -58,68 +117,95 @@ class RuntimeRepository:
 
         summary = {
             "totals": {
-                "messages": fetch_count("SELECT COUNT(*) AS count FROM messages"),
-                "contacts": fetch_count("SELECT COUNT(*) AS count FROM contact_company_profiles"),
-                "pending_questions": fetch_count("SELECT COUNT(*) AS count FROM pending_questions"),
-                "knowledge_entries": fetch_count("SELECT COUNT(*) AS count FROM knowledge_entries"),
-                "message_examples": fetch_count("SELECT COUNT(*) AS count FROM message_examples"),
-                "outbound_messages": fetch_count("SELECT COUNT(*) AS count FROM outbound_messages"),
-                "finetuning_jobs": fetch_count("SELECT COUNT(*) AS count FROM finetuning_jobs"),
-                "companies": fetch_count("SELECT COUNT(*) AS count FROM companies"),
-                "audit_events": fetch_count("SELECT COUNT(*) AS count FROM audit_events"),
+                "messages": fetch_count(f"SELECT COUNT(*) AS count FROM messages WHERE {condition}", company_params),
+                "contacts": fetch_count(f"SELECT COUNT(*) AS count FROM contact_company_profiles WHERE {condition}", company_params),
+                "pending_questions": fetch_count(f"SELECT COUNT(*) AS count FROM pending_questions WHERE {condition}", company_params),
+                "knowledge_entries": fetch_count(f"SELECT COUNT(*) AS count FROM knowledge_entries WHERE {condition}", company_params),
+                "message_examples": fetch_count(f"SELECT COUNT(*) AS count FROM message_examples WHERE {condition}", company_params),
+                "outbound_messages": fetch_count(f"SELECT COUNT(*) AS count FROM outbound_messages WHERE {condition}", company_params),
+                "finetuning_jobs": fetch_count(f"SELECT COUNT(*) AS count FROM finetuning_jobs WHERE {condition}", company_params),
+                "companies": fetch_count(
+                    "SELECT COUNT(*) AS count FROM companies"
+                    if company_id is None
+                    else "SELECT COUNT(*) AS count FROM companies WHERE id = ?",
+                    () if company_id is None else (company_id,),
+                ),
+                "audit_events": fetch_count(f"SELECT COUNT(*) AS count FROM audit_events WHERE {condition}", company_params),
             },
             "pending_questions_by_status": fetch_grouped_counts(
-                """
+                f"""
                 SELECT status AS group_key, COUNT(*) AS count
                 FROM pending_questions
+                WHERE {condition}
                 GROUP BY status
-                """
+                """,
+                company_params,
             ),
             "outbound_by_status": fetch_grouped_counts(
-                """
+                f"""
                 SELECT status AS group_key, COUNT(*) AS count
                 FROM outbound_messages
+                WHERE {condition}
                 GROUP BY status
-                """
+                """,
+                company_params,
             ),
             "knowledge_by_status": fetch_grouped_counts(
-                """
+                f"""
                 SELECT status AS group_key, COUNT(*) AS count
                 FROM knowledge_entries
+                WHERE {condition}
                 GROUP BY status
-                """
+                """,
+                company_params,
             ),
             "messages_by_classification": fetch_grouped_counts(
-                """
+                f"""
                 SELECT classification AS group_key, COUNT(*) AS count
                 FROM messages
+                WHERE {condition}
                 GROUP BY classification
-                """
+                """,
+                company_params,
             ),
             "messages_by_action": fetch_grouped_counts(
-                """
+                f"""
                 SELECT action AS group_key, COUNT(*) AS count
                 FROM messages
+                WHERE {condition}
                 GROUP BY action
-                """
+                """,
+                company_params,
             ),
             "messages_by_reply_source": fetch_grouped_counts(
-                """
+                f"""
                 SELECT reply_source AS group_key, COUNT(*) AS count
                 FROM messages
+                WHERE {condition}
                 GROUP BY reply_source
-                """
+                """,
+                company_params,
             ),
             "companies_by_status": {
-                "active": fetch_count("SELECT COUNT(*) AS count FROM companies WHERE active = 1"),
-                "inactive": fetch_count("SELECT COUNT(*) AS count FROM companies WHERE active = 0"),
+                "active": fetch_count(
+                    "SELECT COUNT(*) AS count FROM companies WHERE active = 1"
+                    + (" AND id = ?" if company_id is not None else ""),
+                    () if company_id is None else (company_id,),
+                ),
+                "inactive": fetch_count(
+                    "SELECT COUNT(*) AS count FROM companies WHERE active = 0"
+                    + (" AND id = ?" if company_id is not None else ""),
+                    () if company_id is None else (company_id,),
+                ),
             },
             "audit_events_by_status": fetch_grouped_counts(
-                """
+                f"""
                 SELECT status AS group_key, COUNT(*) AS count
                 FROM audit_events
+                WHERE {condition}
                 GROUP BY status
-                """
+                """,
+                company_params,
             ),
         }
 
@@ -283,7 +369,10 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
-        query = """
+        action_condition, action_params = _optional_equals("action", action)
+        resource_type_condition, resource_type_params = _optional_equals("resource_type", resource_type)
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        query = f"""
             SELECT
                 id,
                 actor_id,
@@ -302,15 +391,15 @@ class RuntimeRepository:
                 metadata_json,
                 created_at
             FROM audit_events
-            WHERE (? IS NULL OR action = ?)
-              AND (? IS NULL OR resource_type = ?)
-              AND (? IS NULL OR company_id = ?)
+            WHERE {action_condition}
+              AND {resource_type_condition}
+              AND {company_id_condition}
             ORDER BY id DESC
             LIMIT ?
         """
         cursor.execute(
             query,
-            (action, action, resource_type, resource_type, company_id, company_id, limit),
+            (*action_params, *resource_type_params, *company_id_params, limit),
         )
 
         rows = cursor.fetchall()
@@ -457,8 +546,9 @@ class RuntimeRepository:
         cursor = connection.cursor()
         updated_count = 0
         for question_id in normalized_ids:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE pending_questions
                 SET
                     status = 'expired',
@@ -467,9 +557,9 @@ class RuntimeRepository:
                     resolved_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                   AND status = 'pending'
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (owner_answer, resolution_type, question_id, company_id, company_id),
+                (owner_answer, resolution_type, question_id, *company_id_params),
             )
             updated_count += max(0, int(cursor.rowcount))
 
@@ -492,15 +582,16 @@ class RuntimeRepository:
         cursor = connection.cursor()
         updated_count = 0
         for outbound_message_id in normalized_ids:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE outbound_messages
                 SET status = ?
                 WHERE id = ?
                   AND status = 'pending'
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (cancelled_status, outbound_message_id, company_id, company_id),
+                (cancelled_status, outbound_message_id, *company_id_params),
             )
             updated_count += max(0, int(cursor.rowcount))
 
@@ -523,15 +614,16 @@ class RuntimeRepository:
         cursor = connection.cursor()
         updated_count = 0
         for finetuning_job_id in normalized_ids:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE finetuning_jobs
                 SET status = ?
                 WHERE id = ?
                   AND status = 'failed'
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (archived_status, finetuning_job_id, company_id, company_id),
+                (archived_status, finetuning_job_id, *company_id_params),
             )
             updated_count += max(0, int(cursor.rowcount))
 
@@ -706,8 +798,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 contact_id,
@@ -723,10 +816,10 @@ class RuntimeRepository:
                 action,
                 priority
             FROM messages
-            WHERE (? IS NULL OR company_id = ?)
+            WHERE {company_id_condition}
             ORDER BY id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -1164,8 +1257,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 contact_id,
@@ -1183,10 +1277,10 @@ class RuntimeRepository:
                 created_at,
                 resolved_at
             FROM pending_questions
-            WHERE (? IS NULL OR company_id = ?)
+            WHERE {company_id_condition}
             ORDER BY id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -1203,8 +1297,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 contact_id,
@@ -1223,9 +1318,9 @@ class RuntimeRepository:
                 resolved_at
             FROM pending_questions
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (question_id, company_id, company_id),
+            (question_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -1247,8 +1342,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE pending_questions
             SET
                 owner_answer = ?,
@@ -1259,18 +1355,9 @@ class RuntimeRepository:
                 status = 'resolved',
                 resolved_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (
-                owner_answer,
-                resolution_type,
-                customer_followup_question,
-                int(applies_globally),
-                knowledge_action,
-                question_id,
-                company_id,
-                company_id,
-            ),
+            (owner_answer, resolution_type, customer_followup_question, int(applies_globally), knowledge_action, question_id, *company_id_params),
         )
 
         connection.commit()
@@ -1330,8 +1417,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 source_question_id,
@@ -1344,10 +1432,10 @@ class RuntimeRepository:
                 status,
                 created_at
             FROM knowledge_entries
-            WHERE (? IS NULL OR company_id = ?)
+            WHERE {company_id_condition}
             ORDER BY id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -1364,8 +1452,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 source_question_id,
@@ -1379,9 +1468,9 @@ class RuntimeRepository:
                 created_at
             FROM knowledge_entries
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (knowledge_entry_id, company_id, company_id),
+            (knowledge_entry_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -1397,8 +1486,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 source_question_id,
@@ -1412,10 +1502,10 @@ class RuntimeRepository:
                 created_at
             FROM knowledge_entries
             WHERE status = 'active'
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             ORDER BY applies_globally DESC, id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -1433,8 +1523,9 @@ class RuntimeRepository:
         cursor = connection.cursor()
 
         if contact_id:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     id,
                     source_question_id,
@@ -1449,17 +1540,18 @@ class RuntimeRepository:
                 FROM knowledge_entries
                 WHERE status = 'active'
                   AND (
-                        (applies_globally = 1 AND (? IS NULL OR company_id = ?))
+                        (applies_globally = 1 AND {company_id_condition})
                         OR contact_id = ?
                       )
                 ORDER BY applies_globally DESC, id DESC
                 LIMIT ?
                 """,
-                (company_id, company_id, contact_id, limit),
+                (*company_id_params, contact_id, limit),
             )
         else:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     id,
                     source_question_id,
@@ -1474,11 +1566,11 @@ class RuntimeRepository:
                 FROM knowledge_entries
                 WHERE status = 'active'
                   AND applies_globally = 1
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                (company_id, company_id, limit),
+                (*company_id_params, limit),
             )
 
         rows = cursor.fetchall()
@@ -1543,8 +1635,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -1558,10 +1651,10 @@ class RuntimeRepository:
                 active,
                 created_at
             FROM message_examples
-            WHERE (? IS NULL OR company_id = ?)
+            WHERE {company_id_condition}
             ORDER BY id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -1578,8 +1671,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -1594,9 +1688,9 @@ class RuntimeRepository:
                 created_at
             FROM message_examples
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (message_example_id, company_id, company_id),
+            (message_example_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -1615,8 +1709,9 @@ class RuntimeRepository:
         cursor = connection.cursor()
 
         if profile_name and scenario_type:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     id,
                     company_id,
@@ -1631,17 +1726,18 @@ class RuntimeRepository:
                     created_at
                 FROM message_examples
                 WHERE active = 1
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                   AND profile_name = ?
                   AND scenario_type = ?
                 ORDER BY quality_score DESC, id DESC
                 LIMIT ?
                 """,
-                (company_id, company_id, profile_name, scenario_type, limit),
+                (*company_id_params, profile_name, scenario_type, limit),
             )
         elif profile_name:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     id,
                     company_id,
@@ -1656,16 +1752,17 @@ class RuntimeRepository:
                     created_at
                 FROM message_examples
                 WHERE active = 1
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                   AND profile_name = ?
                 ORDER BY quality_score DESC, id DESC
                 LIMIT ?
                 """,
-                (company_id, company_id, profile_name, limit),
+                (*company_id_params, profile_name, limit),
             )
         elif scenario_type:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     id,
                     company_id,
@@ -1680,16 +1777,17 @@ class RuntimeRepository:
                     created_at
                 FROM message_examples
                 WHERE active = 1
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                   AND scenario_type = ?
                 ORDER BY quality_score DESC, id DESC
                 LIMIT ?
                 """,
-                (company_id, company_id, scenario_type, limit),
+                (*company_id_params, scenario_type, limit),
             )
         else:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     id,
                     company_id,
@@ -1704,11 +1802,11 @@ class RuntimeRepository:
                     created_at
                 FROM message_examples
                 WHERE active = 1
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 ORDER BY quality_score DESC, id DESC
                 LIMIT ?
                 """,
-                (company_id, company_id, limit),
+                (*company_id_params, limit),
             )
 
         rows = cursor.fetchall()
@@ -1723,8 +1821,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -1739,11 +1838,11 @@ class RuntimeRepository:
                 created_at
             FROM message_examples
             WHERE active = 1
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
               AND used_for_training = 1
             ORDER BY quality_score DESC, id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -1760,8 +1859,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 contact_id,
@@ -1780,7 +1880,7 @@ class RuntimeRepository:
                 resolved_at
             FROM pending_questions
             WHERE contact_id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
               AND status = 'resolved'
               AND resolution_type = 'needs_customer_clarification'
               AND customer_followup_question IS NOT NULL
@@ -1789,7 +1889,7 @@ class RuntimeRepository:
             ORDER BY resolved_at DESC, id DESC
             LIMIT 1
             """,
-            (contact_id, company_id, company_id),
+            (contact_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -1920,8 +2020,9 @@ class RuntimeRepository:
     ) -> None:
         connection = get_connection()
         cursor = connection.cursor()
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE inbound_message_receipts
             SET
                 status = 'completed',
@@ -1929,9 +2030,9 @@ class RuntimeRepository:
                 updated_at = CURRENT_TIMESTAMP
             WHERE provider = ?
               AND provider_message_id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (provider.strip().lower(), provider_message_id.strip(), company_id, company_id),
+            (provider.strip().lower(), provider_message_id.strip(), *company_id_params),
         )
         connection.commit()
         connection.close()
@@ -1946,8 +2047,9 @@ class RuntimeRepository:
     ) -> None:
         connection = get_connection()
         cursor = connection.cursor()
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE inbound_message_receipts
             SET
                 status = 'failed',
@@ -1955,9 +2057,9 @@ class RuntimeRepository:
                 updated_at = CURRENT_TIMESTAMP
             WHERE provider = ?
               AND provider_message_id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (error, provider.strip().lower(), provider_message_id.strip(), company_id, company_id),
+            (error, provider.strip().lower(), provider_message_id.strip(), *company_id_params),
         )
         connection.commit()
         connection.close()
@@ -1971,14 +2073,15 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE pending_questions
             SET clarification_consumed = 1
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (question_id, company_id, company_id),
+            (question_id, *company_id_params),
         )
 
         connection.commit()
@@ -2025,8 +2128,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 contact_id,
@@ -2035,13 +2139,23 @@ class RuntimeRepository:
                 message,
                 source,
                 status,
+                channel,
+                attempt_count,
+                max_attempts,
+                next_attempt_at,
+                claimed_at,
+                claim_token,
+                last_error,
+                provider_message_id,
+                provider_response_json,
+                failed_at,
                 created_at,
                 sent_at
             FROM outbound_messages
-            WHERE (? IS NULL OR company_id = ?)
+            WHERE {company_id_condition}
             ORDER BY id DESC
             """,
-            (company_id, company_id),
+            (*company_id_params,),
         )
 
         rows = cursor.fetchall()
@@ -2058,8 +2172,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 contact_id,
@@ -2068,13 +2183,23 @@ class RuntimeRepository:
                 message,
                 source,
                 status,
+                channel,
+                attempt_count,
+                max_attempts,
+                next_attempt_at,
+                claimed_at,
+                claim_token,
+                last_error,
+                provider_message_id,
+                provider_response_json,
+                failed_at,
                 created_at,
                 sent_at
             FROM outbound_messages
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (outbound_message_id, company_id, company_id),
+            (outbound_message_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -2087,24 +2212,192 @@ class RuntimeRepository:
         outbound_message_id: int,
         *,
         company_id: int | None = None,
+        claim_token: str | None = None,
+        channel: str | None = None,
+        provider_message_id: str | None = None,
+        provider_response: dict[str, Any] | None = None,
     ) -> None:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        claim_condition, claim_params = _optional_equals("claim_token", claim_token)
         cursor.execute(
-            """
+            f"""
             UPDATE outbound_messages
             SET
                 status = 'sent',
-                sent_at = CURRENT_TIMESTAMP
+                sent_at = CURRENT_TIMESTAMP,
+                channel = COALESCE(channel, ?),
+                provider_message_id = COALESCE(?, provider_message_id),
+                provider_response_json = COALESCE(?, provider_response_json),
+                last_error = NULL,
+                next_attempt_at = NULL,
+                claimed_at = NULL,
+                claim_token = NULL,
+                failed_at = NULL
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
+              AND {claim_condition}
             """,
-            (outbound_message_id, company_id, company_id),
+            (
+                channel,
+                provider_message_id,
+                (
+                    json.dumps(provider_response, ensure_ascii=False)
+                    if provider_response is not None
+                    else None
+                ),
+                outbound_message_id,
+                *company_id_params,
+                *claim_params,
+            ),
         )
 
         connection.commit()
         connection.close()
+
+    def claim_outbound_message(
+        self,
+        outbound_message_id: int,
+        *,
+        company_id: int | None = None,
+        channel: str | None = None,
+        claim_ttl_seconds: int = 300,
+        max_attempts: int = 5,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        stale_before = now - timedelta(seconds=max(30, claim_ttl_seconds))
+        claim_token = secrets.token_urlsafe(24)
+        company_condition, company_params = _optional_equals("company_id", company_id)
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""
+                UPDATE outbound_messages
+                SET status = 'processing',
+                    channel = COALESCE(?, channel),
+                    attempt_count = attempt_count + 1,
+                    max_attempts = CASE
+                        WHEN attempt_count = 0 OR max_attempts IS NULL OR max_attempts < 1 THEN ?
+                        ELSE max_attempts
+                    END,
+                    claimed_at = ?,
+                    claim_token = ?,
+                    last_error = NULL
+                WHERE id = ?
+                  AND {company_condition}
+                  AND status IN ('pending', 'retry')
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND (claimed_at IS NULL OR claimed_at <= ?)
+                """,
+                (
+                    channel,
+                    max(1, max_attempts),
+                    now.isoformat(),
+                    claim_token,
+                    outbound_message_id,
+                    *company_params,
+                    now.isoformat(),
+                    stale_before.isoformat(),
+                ),
+            )
+            if cursor.rowcount != 1:
+                return None
+            cursor.execute(
+                """
+                SELECT *
+                FROM outbound_messages
+                WHERE id = ?
+                  AND claim_token = ?
+                """,
+                (outbound_message_id, claim_token),
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def mark_outbound_message_failed(
+        self,
+        outbound_message_id: int,
+        *,
+        claim_token: str,
+        error: str,
+        retry_at: str | None,
+    ) -> str:
+        status = "retry" if retry_at else "dead_letter"
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE outbound_messages
+                SET status = ?,
+                    last_error = ?,
+                    next_attempt_at = ?,
+                    failed_at = CASE WHEN ? = 'dead_letter' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                    claimed_at = NULL,
+                    claim_token = NULL
+                WHERE id = ?
+                  AND claim_token = ?
+                  AND status = 'processing'
+                """,
+                (
+                    status,
+                    str(error)[:2000],
+                    retry_at,
+                    status,
+                    outbound_message_id,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Outbound claim was lost before failure could be recorded.")
+        return status
+
+    def acquire_worker_lease(
+        self,
+        lease_name: str,
+        owner_token: str,
+        *,
+        ttl_seconds: int = 300,
+    ) -> bool:
+        now = datetime.now(UTC)
+        expires_at = now + timedelta(seconds=max(30, ttl_seconds))
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO worker_leases (lease_name, owner_token, expires_at, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT (lease_name)
+                DO UPDATE SET
+                    owner_token = excluded.owner_token,
+                    expires_at = excluded.expires_at,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE worker_leases.expires_at <= ?
+                   OR worker_leases.owner_token = ?
+                """,
+                (
+                    lease_name,
+                    owner_token,
+                    expires_at.isoformat(),
+                    now.isoformat(),
+                    owner_token,
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def release_worker_lease(self, lease_name: str, owner_token: str) -> bool:
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                DELETE FROM worker_leases
+                WHERE lease_name = ?
+                  AND owner_token = ?
+                """,
+                (lease_name, owner_token),
+            )
+            return cursor.rowcount == 1
 
     def create_finetuning_job_record(
         self,
@@ -2173,8 +2466,9 @@ class RuntimeRepository:
         cursor = connection.cursor()
 
         if finished_at is None:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE finetuning_jobs
                 SET
                     status = ?,
@@ -2182,21 +2476,14 @@ class RuntimeRepository:
                     provider_error_code = ?,
                     provider_error_message = ?
                 WHERE job_id = ?
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (
-                    status,
-                    fine_tuned_model,
-                    provider_error_code,
-                    provider_error_message,
-                    job_id,
-                    company_id,
-                    company_id,
-                ),
+                (status, fine_tuned_model, provider_error_code, provider_error_message, job_id, *company_id_params),
             )
         else:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE finetuning_jobs
                 SET
                     status = ?,
@@ -2205,18 +2492,9 @@ class RuntimeRepository:
                     provider_error_message = ?,
                     finished_at = ?
                 WHERE job_id = ?
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (
-                    status,
-                    fine_tuned_model,
-                    provider_error_code,
-                    provider_error_message,
-                    finished_at,
-                    job_id,
-                    company_id,
-                    company_id,
-                ),
+                (status, fine_tuned_model, provider_error_code, provider_error_message, finished_at, job_id, *company_id_params),
             )
 
         connection.commit()
@@ -2494,6 +2772,398 @@ class RuntimeRepository:
             active=True,
         )
 
+    # ── WhatsApp channel bindings ─────────────────────────────────────
+
+    @staticmethod
+    def _normalize_binding_row(row: Any) -> dict[str, Any]:
+        """Give binding rows backend-independent types.
+
+        SQLite returns timestamps as strings while Postgres returns datetimes;
+        callers (and the API response model) must not depend on the backend.
+        """
+        binding = dict(row)
+        for timestamp_column in ("created_at", "updated_at"):
+            value = binding.get(timestamp_column)
+            binding[timestamp_column] = str(value) if value is not None else None
+        binding["active"] = int(binding.get("active") or 0)
+        if "company_active" in binding:
+            binding["company_active"] = int(binding.get("company_active") or 0)
+        return binding
+
+    def get_whatsapp_binding_by_phone_number_id(
+        self,
+        phone_number_id: str,
+        *,
+        active_only: bool = True,
+    ) -> dict[str, Any] | None:
+        """Resolve the company bound to a Meta phone_number_id.
+
+        This is the only trusted source of tenant identity for a signed Meta
+        webhook, so it joins `companies` and returns the slug the rest of the
+        pipeline needs without a second lookup.
+        """
+        active_condition = "AND b.active = 1" if active_only else ""
+        with db_session() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""
+                SELECT
+                    b.id,
+                    b.company_id,
+                    b.phone_number_id,
+                    b.display_phone_number,
+                    b.active,
+                    b.created_at,
+                    b.updated_at,
+                    b.updated_by,
+                    c.slug AS company_slug,
+                    c.name AS company_name,
+                    c.active AS company_active
+                FROM whatsapp_channel_bindings b
+                JOIN companies c ON c.id = b.company_id
+                WHERE b.phone_number_id = ?
+                  {active_condition}
+                ORDER BY b.id ASC
+                """,
+                (phone_number_id,),
+            )
+            rows = cursor.fetchall()
+
+        if len(rows) != 1:
+            # Zero means unknown; more than one means an ambiguous binding.
+            # Both fail closed at the call site.
+            return None
+        return self._normalize_binding_row(rows[0])
+
+    def get_whatsapp_bindings(
+        self,
+        *,
+        company_id: int | None = None,
+        active_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        company_id_condition, company_id_params = _optional_equals("b.company_id", company_id)
+        active_condition = "AND b.active = 1" if active_only else ""
+        with db_session() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""
+                SELECT
+                    b.id,
+                    b.company_id,
+                    b.phone_number_id,
+                    b.display_phone_number,
+                    b.active,
+                    b.created_at,
+                    b.updated_at,
+                    b.updated_by,
+                    c.slug AS company_slug
+                FROM whatsapp_channel_bindings b
+                JOIN companies c ON c.id = b.company_id
+                WHERE {company_id_condition}
+                  {active_condition}
+                ORDER BY b.id ASC
+                """,
+                (*company_id_params,),
+            )
+            rows = cursor.fetchall()
+        return [self._normalize_binding_row(row) for row in rows]
+
+    def get_active_whatsapp_binding_for_company(self, company_id: int) -> dict[str, Any] | None:
+        """Outbound counterpart: which number may this company send from."""
+        bindings = self.get_whatsapp_bindings(company_id=company_id, active_only=True)
+        if len(bindings) != 1:
+            return None
+        return bindings[0]
+
+    def upsert_whatsapp_binding(
+        self,
+        *,
+        company_id: int,
+        phone_number_id: str,
+        display_phone_number: str | None = None,
+        active: bool = True,
+        updated_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Create or update a binding, keeping phone_number_id unique when active.
+
+        Returns ``None`` when the phone number is already actively bound to a
+        different company, so the caller can reject instead of silently
+        re-pointing a tenant's traffic.
+
+        The preflight ``SELECT`` only produces a fast, friendly rejection; the
+        partial unique index is the actual authority. A concurrent writer that
+        wins the race between the SELECT and the write surfaces as the same
+        controlled conflict rather than an integrity exception.
+        """
+        try:
+            with db_transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    SELECT id, company_id, active
+                    FROM whatsapp_channel_bindings
+                    WHERE phone_number_id = ?
+                    ORDER BY id ASC
+                    """,
+                    (phone_number_id,),
+                )
+                existing = [dict(row) for row in cursor.fetchall()]
+
+                conflicting = [
+                    row
+                    for row in existing
+                    if int(row["company_id"]) != int(company_id) and int(row["active"] or 0) == 1
+                ]
+                if conflicting and active:
+                    return None
+
+                owned = [row for row in existing if int(row["company_id"]) == int(company_id)]
+                if owned:
+                    cursor.execute(
+                        """
+                        UPDATE whatsapp_channel_bindings
+                        SET display_phone_number = ?,
+                            active = ?,
+                            updated_at = CURRENT_TIMESTAMP,
+                            updated_by = ?
+                        WHERE id = ?
+                        """,
+                        (display_phone_number, int(active), updated_by, int(owned[0]["id"])),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        INSERT INTO whatsapp_channel_bindings (
+                            company_id,
+                            phone_number_id,
+                            display_phone_number,
+                            active,
+                            created_at,
+                            updated_at,
+                            updated_by
+                        )
+                        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                        """,
+                        (company_id, phone_number_id, display_phone_number, int(active), updated_by),
+                    )
+        except Exception as exc:
+            # Caught outside the transaction block so db_transaction has already
+            # rolled back: no partial state can survive a rejected write.
+            if _is_active_phone_number_conflict(exc):
+                return None
+            raise
+
+        # Return the row just written. A historical (deactivated) row for the same
+        # number may still exist for another company, so resolve by both keys.
+        written = [
+            binding
+            for binding in self.get_whatsapp_bindings(company_id=company_id)
+            if str(binding["phone_number_id"]) == phone_number_id
+        ]
+        return written[0] if written else None
+
+    def set_whatsapp_binding_active(
+        self,
+        binding_id: int,
+        *,
+        active: bool,
+        updated_by: str | None = None,
+    ) -> str:
+        """Activate or deactivate a binding.
+
+        Returns ``"updated"``, ``"not_found"``, or ``"conflict"`` when activating
+        a historical binding whose number is already active on another company.
+        Deactivation can never conflict.
+        """
+        try:
+            with db_transaction() as connection:
+                cursor = connection.cursor()
+                cursor.execute(
+                    """
+                    UPDATE whatsapp_channel_bindings
+                    SET active = ?,
+                        updated_at = CURRENT_TIMESTAMP,
+                        updated_by = ?
+                    WHERE id = ?
+                    """,
+                    (int(active), updated_by, binding_id),
+                )
+                changed = int(cursor.rowcount)
+        except Exception as exc:
+            if _is_active_phone_number_conflict(exc):
+                return "conflict"
+            raise
+
+        return "updated" if changed > 0 else "not_found"
+
+    def get_company_context_record(self, company_slug: str) -> dict[str, Any] | None:
+        # Context reads sit on the hot message path, so the pooled connection is
+        # released even when the query raises.
+        connection = get_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    company_id,
+                    company_slug,
+                    context_json,
+                    schema_version,
+                    revision,
+                    created_at,
+                    updated_at,
+                    updated_by
+                FROM company_contexts
+                WHERE company_slug = ?
+                """,
+                (company_slug,),
+            )
+            row = cursor.fetchone()
+        finally:
+            connection.close()
+
+        return dict(row) if row else None
+
+    def get_company_context_records(self) -> list[dict[str, Any]]:
+        connection = get_connection()
+        try:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    company_id,
+                    company_slug,
+                    schema_version,
+                    revision,
+                    created_at,
+                    updated_at,
+                    updated_by
+                FROM company_contexts
+                ORDER BY company_slug ASC
+                """
+            )
+            rows = cursor.fetchall()
+        finally:
+            connection.close()
+
+        return [dict(row) for row in rows]
+
+    def save_company_context_record(
+        self,
+        *,
+        company_slug: str,
+        company_id: int | None,
+        context_json: str,
+        schema_version: int,
+        expected_revision: int | None = None,
+        updated_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Insert or update a company context inside a single transaction.
+
+        Returns ``None`` when the write lost a concurrency check, i.e. another
+        writer created or changed the row first. Creation is decided by the
+        database, not by a read-then-write window: the INSERT is conditional, so
+        exactly one concurrent writer creates revision 1 and the loser gets the
+        same controlled conflict as a stale update instead of a unique-violation
+        exception. A caller without a revision token can simply retry, which
+        then takes the update path.
+        """
+        connection = get_connection()
+        cursor = connection.cursor()
+
+        try:
+            cursor.execute(
+                "SELECT id, revision FROM company_contexts WHERE company_slug = ?",
+                (company_slug,),
+            )
+            current_row = cursor.fetchone()
+
+            if current_row is None:
+                if expected_revision not in (None, 0):
+                    return None
+                # Conditional insert: the unique index on company_slug decides the
+                # winner, so a concurrent creator never raises here.
+                if get_database_backend() == "postgres":
+                    insert_sql = """
+                        INSERT INTO company_contexts (
+                            company_id,
+                            company_slug,
+                            context_json,
+                            schema_version,
+                            revision,
+                            created_at,
+                            updated_at,
+                            updated_by
+                        )
+                        VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                        ON CONFLICT (company_slug) DO NOTHING
+                    """
+                else:
+                    insert_sql = """
+                        INSERT OR IGNORE INTO company_contexts (
+                            company_id,
+                            company_slug,
+                            context_json,
+                            schema_version,
+                            revision,
+                            created_at,
+                            updated_at,
+                            updated_by
+                        )
+                        VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                    """
+                cursor.execute(
+                    insert_sql,
+                    (
+                        company_id,
+                        company_slug,
+                        context_json,
+                        schema_version,
+                        updated_by,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    # Another writer created revision 1 between our SELECT and
+                    # INSERT. Nothing was written; report the conflict.
+                    return None
+            else:
+                current_revision = int(current_row["revision"])
+                if expected_revision is not None and int(expected_revision) != current_revision:
+                    return None
+                # The revision predicate makes a concurrent update lose instead of
+                # silently overwriting the winner.
+                cursor.execute(
+                    """
+                    UPDATE company_contexts
+                    SET company_id = ?,
+                        context_json = ?,
+                        schema_version = ?,
+                        revision = revision + 1,
+                        updated_at = CURRENT_TIMESTAMP,
+                        updated_by = ?
+                    WHERE company_slug = ?
+                      AND revision = ?
+                    """,
+                    (
+                        company_id,
+                        context_json,
+                        schema_version,
+                        updated_by,
+                        company_slug,
+                        current_revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return None
+
+            connection.commit()
+        finally:
+            connection.close()
+
+        return self.get_company_context_record(company_slug)
+
     def create_calendar_integration(
         self,
         provider: str,
@@ -2597,8 +3267,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -2610,9 +3281,9 @@ class RuntimeRepository:
                 updated_at
             FROM calendar_integrations
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (integration_id, company_id, company_id),
+            (integration_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -2756,8 +3427,11 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        contact_id_condition, contact_id_params = _optional_equals("contact_id", contact_id)
+        status_condition, status_params = _optional_equals("status", status)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -2776,12 +3450,12 @@ class RuntimeRepository:
                 created_at,
                 updated_at
             FROM appointment_bookings
-            WHERE (? IS NULL OR company_id = ?)
-              AND (? IS NULL OR contact_id = ?)
-              AND (? IS NULL OR status = ?)
+            WHERE {company_id_condition}
+              AND {contact_id_condition}
+              AND {status_condition}
             ORDER BY starts_at ASC, id ASC
             """,
-            (company_id, company_id, contact_id, contact_id, status, status),
+            (*company_id_params, *contact_id_params, *status_params),
         )
 
         rows = cursor.fetchall()
@@ -2797,8 +3471,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -2818,9 +3493,9 @@ class RuntimeRepository:
                 updated_at
             FROM appointment_bookings
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (booking_id, company_id, company_id),
+            (booking_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -2836,8 +3511,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -2856,13 +3532,13 @@ class RuntimeRepository:
                 created_at,
                 updated_at
             FROM appointment_bookings
-            WHERE (? IS NULL OR company_id = ?)
+            WHERE {company_id_condition}
               AND status IN ('confirmed', 'pending')
               AND starts_at < ?
               AND ends_at > ?
             ORDER BY starts_at ASC, id ASC
             """,
-            (company_id, company_id, ends_at, starts_at),
+            (*company_id_params, ends_at, starts_at),
         )
 
         rows = cursor.fetchall()
@@ -2879,16 +3555,17 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE appointment_bookings
             SET
                 status = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (status, booking_id, company_id, company_id),
+            (status, booking_id, *company_id_params),
         )
 
         connection.commit()
@@ -2911,8 +3588,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE appointment_bookings
             SET
                 starts_at = ?,
@@ -2925,21 +3603,9 @@ class RuntimeRepository:
                 description = COALESCE(?, description),
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (
-                starts_at,
-                ends_at,
-                timezone,
-                external_event_id,
-                scheduling_profile_key,
-                customer_profile,
-                title,
-                description,
-                booking_id,
-                company_id,
-                company_id,
-            ),
+            (starts_at, ends_at, timezone, external_event_id, scheduling_profile_key, customer_profile, title, description, booking_id, *company_id_params),
         )
 
         connection.commit()
@@ -2953,8 +3619,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -2966,12 +3633,12 @@ class RuntimeRepository:
                 updated_at
             FROM conversation_flows
             WHERE contact_id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
               AND status = 'active'
             ORDER BY updated_at DESC, id DESC
             LIMIT 1
             """,
-            (contact_id, company_id, company_id),
+            (contact_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -3059,35 +3726,31 @@ class RuntimeRepository:
         cursor = connection.cursor()
 
         if state is None:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE conversation_flows
                 SET
                     status = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (status, flow_id, company_id, company_id),
+                (status, flow_id, *company_id_params),
             )
         else:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE conversation_flows
                 SET
                     status = ?,
                     state_json = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (
-                    status,
-                    json.dumps(state, ensure_ascii=False),
-                    flow_id,
-                    company_id,
-                    company_id,
-                ),
+                (status, json.dumps(state, ensure_ascii=False), flow_id, *company_id_params),
             )
 
         connection.commit()
@@ -3158,8 +3821,11 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        status_condition, status_params = _optional_equals("status", status)
+        audience_condition, audience_params = _optional_equals("audience", audience)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3173,15 +3839,21 @@ class RuntimeRepository:
                 audience,
                 source,
                 appointment_booking_id,
+                attempt_count,
+                max_attempts,
+                next_attempt_at,
+                claimed_at,
+                last_error,
+                failed_at,
                 created_at,
                 updated_at
             FROM customer_reminders
-            WHERE (? IS NULL OR company_id = ?)
-              AND (? IS NULL OR status = ?)
-              AND (? IS NULL OR audience = ?)
+            WHERE {company_id_condition}
+              AND {status_condition}
+              AND {audience_condition}
             ORDER BY remind_at ASC, id ASC
             """,
-            (company_id, company_id, status, status, audience, audience),
+            (*company_id_params, *status_params, *audience_params),
         )
 
         rows = cursor.fetchall()
@@ -3197,8 +3869,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3212,13 +3885,19 @@ class RuntimeRepository:
                 audience,
                 source,
                 appointment_booking_id,
+                attempt_count,
+                max_attempts,
+                next_attempt_at,
+                claimed_at,
+                last_error,
+                failed_at,
                 created_at,
                 updated_at
             FROM customer_reminders
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (reminder_id, company_id, company_id),
+            (reminder_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -3234,8 +3913,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3254,15 +3934,220 @@ class RuntimeRepository:
             FROM customer_reminders
             WHERE status = 'pending'
               AND remind_at <= ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             ORDER BY remind_at ASC, id ASC
             """,
-            (reference_time, company_id, company_id),
+            (reference_time, *company_id_params),
         )
 
         rows = cursor.fetchall()
         connection.close()
         return [dict(row) for row in rows]
+
+    def claim_due_customer_reminder(
+        self,
+        reference_time: str,
+        *,
+        claim_token: str,
+        audience: str | None = None,
+        company_id: int | None = None,
+        claim_ttl_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        now = datetime.now(UTC)
+        stale_before = (
+            now - timedelta(seconds=max(30, claim_ttl_seconds))
+        ).isoformat()
+        company_condition, company_params = _optional_equals("company_id", company_id)
+        audience_condition, audience_params = _optional_equals("audience", audience)
+        lock_clause = " FOR UPDATE SKIP LOCKED" if get_database_backend() == "postgres" else ""
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""
+                SELECT id
+                FROM customer_reminders
+                WHERE (
+                    status = 'pending'
+                    OR (
+                        status = 'processing'
+                        AND claimed_at <= ?
+                    )
+                )
+                  AND remind_at <= ?
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                  AND {company_condition}
+                  AND {audience_condition}
+                ORDER BY remind_at ASC, id ASC
+                LIMIT 1{lock_clause}
+                """,
+                (
+                    stale_before,
+                    reference_time,
+                    reference_time,
+                    *company_params,
+                    *audience_params,
+                ),
+            )
+            candidate = cursor.fetchone()
+            if not candidate:
+                return None
+            reminder_id = int(candidate["id"])
+            cursor.execute(
+                """
+                UPDATE customer_reminders
+                SET status = 'processing',
+                    attempt_count = attempt_count + 1,
+                    claimed_at = ?,
+                    claim_token = ?,
+                    last_error = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND (
+                      status = 'pending'
+                      OR (
+                          status = 'processing'
+                          AND claimed_at <= ?
+                      )
+                  )
+                """,
+                (now.isoformat(), claim_token, reminder_id, stale_before),
+            )
+            if cursor.rowcount != 1:
+                return None
+            cursor.execute(
+                """
+                SELECT *
+                FROM customer_reminders
+                WHERE id = ?
+                  AND claim_token = ?
+                """,
+                (reminder_id, claim_token),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def enqueue_claimed_reminder_outbound(
+        self,
+        reminder_id: int,
+        *,
+        claim_token: str,
+        channel: str,
+        message: str,
+        source: str,
+    ) -> int:
+        """Atomically create one outbound and close one reminder claim."""
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT contact_id, company_id
+                FROM customer_reminders
+                WHERE id = ?
+                  AND claim_token = ?
+                  AND status = 'processing'
+                """,
+                (reminder_id, claim_token),
+            )
+            reminder = cursor.fetchone()
+            if not reminder:
+                raise RuntimeError("Reminder claim was lost before outbound enqueue.")
+            cursor.execute(
+                """
+                INSERT INTO outbound_messages (
+                    contact_id,
+                    company_id,
+                    message,
+                    source,
+                    status,
+                    channel
+                )
+                VALUES (?, ?, ?, ?, 'pending', ?)
+                """,
+                (
+                    reminder["contact_id"],
+                    reminder["company_id"],
+                    message,
+                    source,
+                    channel,
+                ),
+            )
+            outbound_message_id = int(cursor.lastrowid)
+            cursor.execute(
+                """
+                UPDATE customer_reminders
+                SET status = 'sent',
+                    outbound_message_id = ?,
+                    claimed_at = NULL,
+                    claim_token = NULL,
+                    next_attempt_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND claim_token = ?
+                  AND status = 'processing'
+                """,
+                (outbound_message_id, reminder_id, claim_token),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Reminder claim was lost during outbound enqueue.")
+            return outbound_message_id
+
+    def mark_customer_reminder_failed(
+        self,
+        reminder_id: int,
+        *,
+        claim_token: str,
+        error: str,
+        retry_at: str | None,
+    ) -> str:
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT attempt_count, max_attempts
+                FROM customer_reminders
+                WHERE id = ?
+                  AND claim_token = ?
+                  AND status = 'processing'
+                """,
+                (reminder_id, claim_token),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise RuntimeError("Reminder claim was lost before failure handling.")
+            can_retry = (
+                retry_at is not None
+                and int(row["attempt_count"]) < int(row["max_attempts"])
+            )
+            status = "pending" if can_retry else "failed"
+            cursor.execute(
+                """
+                UPDATE customer_reminders
+                SET status = ?,
+                    next_attempt_at = ?,
+                    last_error = ?,
+                    failed_at = CASE
+                        WHEN ? = 'failed' THEN CURRENT_TIMESTAMP
+                        ELSE NULL
+                    END,
+                    claimed_at = NULL,
+                    claim_token = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND claim_token = ?
+                  AND status = 'processing'
+                """,
+                (
+                    status,
+                    retry_at if can_retry else None,
+                    str(error)[:2000],
+                    status,
+                    reminder_id,
+                    claim_token,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Reminder claim was lost during failure handling.")
+            return status
 
     def get_customer_reminders_for_booking(
         self,
@@ -3274,8 +4159,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3294,10 +4180,10 @@ class RuntimeRepository:
             FROM customer_reminders
             WHERE appointment_booking_id = ?
               AND audience = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             ORDER BY remind_at ASC, id ASC
             """,
-            (appointment_booking_id, audience, company_id, company_id),
+            (appointment_booking_id, audience, *company_id_params),
         )
 
         rows = cursor.fetchall()
@@ -3314,17 +4200,21 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE customer_reminders
             SET
                 status = 'sent',
                 outbound_message_id = ?,
+                claimed_at = NULL,
+                claim_token = NULL,
+                next_attempt_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (outbound_message_id, reminder_id, company_id, company_id),
+            (outbound_message_id, reminder_id, *company_id_params),
         )
 
         connection.commit()
@@ -3339,17 +4229,18 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE customer_reminders
             SET
                 status = 'cancelled',
                 updated_at = CURRENT_TIMESTAMP
             WHERE appointment_booking_id = ?
               AND status = 'pending'
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (appointment_booking_id, company_id, company_id),
+            (appointment_booking_id, *company_id_params),
         )
 
         updated_count = int(cursor.rowcount)
@@ -3440,8 +4331,10 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        status_condition, status_params = _optional_equals("status", status)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3464,11 +4357,11 @@ class RuntimeRepository:
                 created_at,
                 updated_at
             FROM appointment_queue_entries
-            WHERE (? IS NULL OR company_id = ?)
-              AND (? IS NULL OR status = ?)
+            WHERE {company_id_condition}
+              AND {status_condition}
             ORDER BY priority_score DESC, created_at ASC, id ASC
             """,
-            (company_id, company_id, status, status),
+            (*company_id_params, *status_params),
         )
 
         rows = cursor.fetchall()
@@ -3510,29 +4403,31 @@ class RuntimeRepository:
         cursor = connection.cursor()
 
         if notes is None:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE appointment_queue_entries
                 SET
                     status = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (status, entry_id, company_id, company_id),
+                (status, entry_id, *company_id_params),
             )
         else:
+            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
             cursor.execute(
-                """
+                f"""
                 UPDATE appointment_queue_entries
                 SET
                     status = ?,
                     notes = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
-                  AND (? IS NULL OR company_id = ?)
+                  AND {company_id_condition}
                 """,
-                (status, notes, entry_id, company_id, company_id),
+                (status, notes, entry_id, *company_id_params),
             )
 
         connection.commit()
@@ -3611,8 +4506,12 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        status_condition, status_params = _optional_equals("status", status)
+        released_booking_id_condition, released_booking_id_params = _optional_equals("released_booking_id", released_booking_id)
+        queue_entry_id_condition, queue_entry_id_params = _optional_equals("queue_entry_id", queue_entry_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3631,22 +4530,13 @@ class RuntimeRepository:
                 created_at,
                 updated_at
             FROM appointment_queue_offers
-            WHERE (? IS NULL OR company_id = ?)
-              AND (? IS NULL OR status = ?)
-              AND (? IS NULL OR released_booking_id = ?)
-              AND (? IS NULL OR queue_entry_id = ?)
+            WHERE {company_id_condition}
+              AND {status_condition}
+              AND {released_booking_id_condition}
+              AND {queue_entry_id_condition}
             ORDER BY created_at ASC, id ASC
             """,
-            (
-                company_id,
-                company_id,
-                status,
-                status,
-                released_booking_id,
-                released_booking_id,
-                queue_entry_id,
-                queue_entry_id,
-            ),
+            (*company_id_params, *status_params, *released_booking_id_params, *queue_entry_id_params),
         )
 
         rows = cursor.fetchall()
@@ -3662,8 +4552,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             SELECT
                 id,
                 company_id,
@@ -3683,9 +4574,9 @@ class RuntimeRepository:
                 updated_at
             FROM appointment_queue_offers
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (offer_id, company_id, company_id),
+            (offer_id, *company_id_params),
         )
 
         row = cursor.fetchone()
@@ -3708,8 +4599,9 @@ class RuntimeRepository:
         connection = get_connection()
         cursor = connection.cursor()
 
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE appointment_queue_offers
             SET
                 status = ?,
@@ -3721,20 +4613,9 @@ class RuntimeRepository:
                 response_notes = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (
-                status,
-                outbound_message_id,
-                new_booking_id,
-                response_deadline_at,
-                follow_up_after,
-                responded_at,
-                response_notes,
-                offer_id,
-                company_id,
-                company_id,
-            ),
+            (status, outbound_message_id, new_booking_id, response_deadline_at, follow_up_after, responded_at, response_notes, offer_id, *company_id_params),
         )
 
         connection.commit()
@@ -3752,17 +4633,18 @@ class RuntimeRepository:
     ) -> None:
         connection = get_connection()
         cursor = connection.cursor()
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE appointment_bookings
             SET booking_outcome = ?,
                 booking_outcome_at = CURRENT_TIMESTAMP,
                 booking_outcome_notes = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (outcome, notes, booking_id, company_id, company_id),
+            (outcome, notes, booking_id, *company_id_params),
         )
         connection.commit()
         connection.close()
@@ -3776,15 +4658,16 @@ class RuntimeRepository:
     ) -> None:
         connection = get_connection()
         cursor = connection.cursor()
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
         cursor.execute(
-            """
+            f"""
             UPDATE appointment_bookings
             SET cancellation_reason = ?,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
-            (reason, booking_id, company_id, company_id),
+            (reason, booking_id, *company_id_params),
         )
         connection.commit()
         connection.close()
@@ -4166,6 +5049,10 @@ class RuntimeRepository:
         features_json: str,
         display_order: int = 0,
         price_annual_monthly_cents: int | None = None,
+        currency: str = "brl",
+        stripe_product_id: str | None = None,
+        stripe_monthly_price_id: str | None = None,
+        stripe_annual_price_id: str | None = None,
     ) -> int:
         connection = get_connection()
         cursor = connection.cursor()
@@ -4178,22 +5065,30 @@ class RuntimeRepository:
                 """
                 UPDATE billing_plans
                 SET name = ?, price_monthly_cents = ?, price_annual_monthly_cents = ?,
-                    limits_json = ?, features_json = ?, display_order = ?, active = 1
+                    limits_json = ?, features_json = ?, display_order = ?, active = 1,
+                    currency = ?, stripe_product_id = ?,
+                    stripe_monthly_price_id = ?, stripe_annual_price_id = ?
                 WHERE plan_key = ?
                 """,
                 (name, price_monthly_cents, price_annual_monthly_cents,
-                 limits_json, features_json, display_order, plan_key),
+                 limits_json, features_json, display_order, currency,
+                 stripe_product_id, stripe_monthly_price_id,
+                 stripe_annual_price_id, plan_key),
             )
             plan_id = int(existing["id"])
         else:
             cursor.execute(
                 """
                 INSERT INTO billing_plans (plan_key, name, price_monthly_cents,
-                    price_annual_monthly_cents, limits_json, features_json, display_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    price_annual_monthly_cents, limits_json, features_json, display_order,
+                    currency, stripe_product_id, stripe_monthly_price_id,
+                    stripe_annual_price_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (plan_key, name, price_monthly_cents, price_annual_monthly_cents,
-                 limits_json, features_json, display_order),
+                 limits_json, features_json, display_order, currency,
+                 stripe_product_id, stripe_monthly_price_id,
+                 stripe_annual_price_id),
             )
             plan_id = cursor.lastrowid
 
@@ -4213,10 +5108,58 @@ class RuntimeRepository:
         connection.close()
         return [dict(row) for row in rows]
 
+    def update_billing_plan_gateway_mapping(
+        self,
+        plan_id: int,
+        *,
+        currency: str,
+        stripe_product_id: str | None = None,
+        stripe_monthly_price_id: str | None = None,
+        stripe_annual_price_id: str | None = None,
+    ) -> None:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE billing_plans
+            SET currency = ?,
+                stripe_product_id = ?,
+                stripe_monthly_price_id = ?,
+                stripe_annual_price_id = ?
+            WHERE id = ?
+            """,
+            (
+                currency,
+                stripe_product_id,
+                stripe_monthly_price_id,
+                stripe_annual_price_id,
+                plan_id,
+            ),
+        )
+        connection.commit()
+        connection.close()
+
     def get_billing_plan(self, plan_key: str) -> dict[str, Any] | None:
         connection = get_connection()
         cursor = connection.cursor()
         cursor.execute("SELECT * FROM billing_plans WHERE plan_key = ?", (plan_key,))
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
+
+    def get_billing_plan_by_price_id(self, stripe_price_id: str) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM billing_plans
+            WHERE stripe_monthly_price_id = ?
+               OR stripe_annual_price_id = ?
+            LIMIT 1
+            """,
+            (stripe_price_id, stripe_price_id),
+        )
         row = cursor.fetchone()
         connection.close()
         return dict(row) if row else None
@@ -4230,6 +5173,10 @@ class RuntimeRepository:
         current_period_start: str,
         current_period_end: str,
         trial_ends_at: str | None = None,
+        stripe_customer_id: str | None = None,
+        stripe_subscription_id: str | None = None,
+        stripe_price_id: str | None = None,
+        gateway: str | None = None,
     ) -> int:
         connection = get_connection()
         cursor = connection.cursor()
@@ -4237,11 +5184,13 @@ class RuntimeRepository:
             """
             INSERT INTO billing_subscriptions (
                 company_id, plan_key, status, billing_cycle,
-                current_period_start, current_period_end, trial_ends_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                current_period_start, current_period_end, trial_ends_at,
+                stripe_customer_id, stripe_subscription_id, stripe_price_id, gateway
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (company_id, plan_key, status, billing_cycle,
-             current_period_start, current_period_end, trial_ends_at),
+             current_period_start, current_period_end, trial_ends_at,
+             stripe_customer_id, stripe_subscription_id, stripe_price_id, gateway),
         )
         sub_id = cursor.lastrowid
         connection.commit()
@@ -4264,6 +5213,25 @@ class RuntimeRepository:
         connection.close()
         return dict(row) if row else None
 
+    def get_billing_subscription_by_stripe_id(
+        self,
+        stripe_subscription_id: str,
+    ) -> dict[str, Any] | None:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT *
+            FROM billing_subscriptions
+            WHERE stripe_subscription_id = ?
+            LIMIT 1
+            """,
+            (stripe_subscription_id,),
+        )
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
+
     def update_billing_subscription(
         self,
         subscription_id: int,
@@ -4275,13 +5243,18 @@ class RuntimeRepository:
             "plan_key", "status", "billing_cycle", "current_period_start",
             "current_period_end", "trial_ends_at", "stripe_customer_id",
             "stripe_subscription_id", "cancelled_at", "cancel_reason",
+            "gateway", "stripe_price_id", "payment_status",
+            "cancel_at_period_end", "grace_period_ends_at", "last_invoice_id",
+            "gateway_event_created", "gateway_event_id", "gateway_updated_at",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
 
+        # Column names come from the `allowed` whitelist above, never from callers.
         set_clause = ", ".join(f"{k} = ?" for k in updates)
-        params = list(updates.values()) + [subscription_id, company_id, company_id]
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        params = list(updates.values()) + [subscription_id, *company_id_params]
 
         connection = get_connection()
         cursor = connection.cursor()
@@ -4290,12 +5263,318 @@ class RuntimeRepository:
             UPDATE billing_subscriptions
             SET {set_clause}, updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
-              AND (? IS NULL OR company_id = ?)
+              AND {company_id_condition}
             """,
             tuple(params),
         )
         connection.commit()
         connection.close()
+
+    def claim_billing_webhook_event(
+        self,
+        *,
+        provider: str,
+        event_id: str,
+        event_type: str,
+        event_created: int,
+        livemode: bool,
+        payload_hash: str,
+        processing_timeout_seconds: int = 300,
+    ) -> dict[str, Any]:
+        stale_before = (
+            datetime.now(UTC)
+            - timedelta(seconds=max(30, processing_timeout_seconds))
+        ).isoformat()
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO billing_webhook_events (
+                    provider,
+                    event_id,
+                    event_type,
+                    event_created,
+                    livemode,
+                    payload_hash,
+                    status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 'processing')
+                ON CONFLICT (provider, event_id) DO NOTHING
+                """,
+                (
+                    provider,
+                    event_id,
+                    event_type,
+                    event_created,
+                    1 if livemode else 0,
+                    payload_hash,
+                ),
+            )
+            if cursor.rowcount == 1:
+                return {"claimed": True, "status": "processing", "duplicate": False}
+            cursor.execute(
+                """
+                SELECT status, attempt_count, payload_hash, updated_at
+                FROM billing_webhook_events
+                WHERE provider = ?
+                  AND event_id = ?
+                """,
+                (provider, event_id),
+            )
+            existing = cursor.fetchone()
+            if not existing:
+                raise RuntimeError("Webhook event conflict could not be re-read.")
+            if not hmac.compare_digest(str(existing["payload_hash"]), payload_hash):
+                raise RuntimeError("Webhook event id was replayed with a different payload.")
+            existing_status = str(existing["status"])
+            retryable_status = existing_status == "failed"
+            if existing_status == "processing":
+                raw_updated_at = existing["updated_at"]
+                if isinstance(raw_updated_at, datetime):
+                    updated_at = raw_updated_at
+                else:
+                    updated_at = datetime.fromisoformat(
+                        str(raw_updated_at).replace("Z", "+00:00")
+                    )
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=UTC)
+                retryable_status = updated_at.astimezone(UTC) <= datetime.fromisoformat(
+                    stale_before
+                )
+            if retryable_status:
+                cursor.execute(
+                    """
+                    UPDATE billing_webhook_events
+                    SET status = 'processing',
+                        attempt_count = attempt_count + 1,
+                        last_error = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE provider = ?
+                      AND event_id = ?
+                      AND (
+                          status = 'failed'
+                          OR (
+                              status = 'processing'
+                              AND updated_at <= ?
+                          )
+                      )
+                    """,
+                    (provider, event_id, stale_before),
+                )
+                if cursor.rowcount == 1:
+                    return {
+                        "claimed": True,
+                        "status": "processing",
+                        "duplicate": True,
+                    }
+            return {
+                "claimed": False,
+                "status": str(existing["status"]),
+                "duplicate": True,
+            }
+
+    def complete_billing_webhook_event(
+        self,
+        *,
+        provider: str,
+        event_id: str,
+        status: str,
+        company_id: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"processed", "ignored", "failed"}:
+            raise ValueError("Invalid billing webhook completion status.")
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE billing_webhook_events
+                SET status = ?,
+                    company_id = COALESCE(?, company_id),
+                    last_error = ?,
+                    processed_at = CASE
+                        WHEN ? IN ('processed', 'ignored') THEN CURRENT_TIMESTAMP
+                        ELSE NULL
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE provider = ?
+                  AND event_id = ?
+                """,
+                (
+                    status,
+                    company_id,
+                    str(error)[:2000] if error else None,
+                    status,
+                    provider,
+                    event_id,
+                ),
+            )
+
+    def reconcile_billing_subscription(
+        self,
+        *,
+        company_id: int,
+        plan_key: str,
+        status: str,
+        billing_cycle: str,
+        current_period_start: str,
+        current_period_end: str,
+        stripe_customer_id: str,
+        stripe_subscription_id: str,
+        stripe_price_id: str,
+        event_created: int,
+        event_id: str,
+        trial_ends_at: str | None = None,
+        payment_status: str | None = None,
+        cancel_at_period_end: bool = False,
+        grace_period_ends_at: str | None = None,
+        last_invoice_id: str | None = None,
+    ) -> dict[str, Any]:
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT *
+                FROM billing_subscriptions
+                WHERE stripe_subscription_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (stripe_subscription_id,),
+            )
+            existing = cursor.fetchone()
+            if not existing:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM billing_subscriptions
+                    WHERE company_id = ?
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (company_id,),
+                )
+                existing = cursor.fetchone()
+
+            if existing:
+                previous_event_created = int(existing["gateway_event_created"] or 0)
+                terminal_regression_at_same_second = (
+                    previous_event_created == event_created
+                    and str(existing["status"]) == "cancelled"
+                    and status != "cancelled"
+                )
+                if previous_event_created > event_created or terminal_regression_at_same_second:
+                    return {
+                        "applied": False,
+                        "reason": "stale_event",
+                        "subscription_id": int(existing["id"]),
+                    }
+                cursor.execute(
+                    """
+                    UPDATE billing_subscriptions
+                    SET company_id = ?,
+                        plan_key = ?,
+                        status = ?,
+                        billing_cycle = ?,
+                        trial_ends_at = ?,
+                        current_period_start = ?,
+                        current_period_end = ?,
+                        stripe_customer_id = ?,
+                        stripe_subscription_id = ?,
+                        stripe_price_id = ?,
+                        gateway = 'stripe',
+                        payment_status = COALESCE(?, payment_status),
+                        cancel_at_period_end = ?,
+                        grace_period_ends_at = CASE
+                            WHEN ? = 'paid' THEN NULL
+                            WHEN CAST(? AS TEXT) IS NULL THEN grace_period_ends_at
+                            ELSE ?
+                        END,
+                        last_invoice_id = COALESCE(?, last_invoice_id),
+                        gateway_event_created = ?,
+                        gateway_event_id = ?,
+                        gateway_updated_at = CURRENT_TIMESTAMP,
+                        cancelled_at = CASE
+                            WHEN ? = 'cancelled' THEN COALESCE(cancelled_at, CURRENT_TIMESTAMP)
+                            ELSE NULL
+                        END,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (
+                        company_id,
+                        plan_key,
+                        status,
+                        billing_cycle,
+                        trial_ends_at,
+                        current_period_start,
+                        current_period_end,
+                        stripe_customer_id,
+                        stripe_subscription_id,
+                        stripe_price_id,
+                        payment_status,
+                        1 if cancel_at_period_end else 0,
+                        payment_status,
+                        payment_status,
+                        grace_period_ends_at,
+                        last_invoice_id,
+                        event_created,
+                        event_id,
+                        status,
+                        int(existing["id"]),
+                    ),
+                )
+                subscription_id = int(existing["id"])
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO billing_subscriptions (
+                        company_id,
+                        plan_key,
+                        status,
+                        billing_cycle,
+                        trial_ends_at,
+                        current_period_start,
+                        current_period_end,
+                        stripe_customer_id,
+                        stripe_subscription_id,
+                        stripe_price_id,
+                        gateway,
+                        payment_status,
+                        cancel_at_period_end,
+                        grace_period_ends_at,
+                        last_invoice_id,
+                        gateway_event_created,
+                        gateway_event_id,
+                        gateway_updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'stripe', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (
+                        company_id,
+                        plan_key,
+                        status,
+                        billing_cycle,
+                        trial_ends_at,
+                        current_period_start,
+                        current_period_end,
+                        stripe_customer_id,
+                        stripe_subscription_id,
+                        stripe_price_id,
+                        payment_status,
+                        1 if cancel_at_period_end else 0,
+                        grace_period_ends_at,
+                        last_invoice_id,
+                        event_created,
+                        event_id,
+                    ),
+                )
+                subscription_id = int(cursor.lastrowid)
+        return {
+            "applied": True,
+            "reason": "reconciled",
+            "subscription_id": subscription_id,
+        }
 
     def record_billing_usage(
         self,
@@ -4322,6 +5601,105 @@ class RuntimeRepository:
         connection.commit()
         connection.close()
         return int(record_id)
+
+    def consume_billing_usage(
+        self,
+        *,
+        company_id: int,
+        subscription_id: int,
+        metric: str,
+        period_start: str,
+        period_end: str,
+        quantity: int,
+        limit: int | None,
+    ) -> dict[str, Any]:
+        """Serialize limit check + usage insert on the subscription row."""
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE billing_subscriptions
+                SET updated_at = updated_at
+                WHERE id = ?
+                  AND company_id = ?
+                """,
+                (subscription_id, company_id),
+            )
+            if cursor.rowcount != 1:
+                return {"consumed": False, "reason": "subscription_not_found"}
+            cursor.execute(
+                """
+                SELECT COALESCE(SUM(quantity), 0) AS total
+                FROM billing_usage_records
+                WHERE company_id = ?
+                  AND subscription_id = ?
+                  AND metric = ?
+                  AND period_start >= ?
+                  AND period_end <= ?
+                """,
+                (
+                    company_id,
+                    subscription_id,
+                    metric,
+                    period_start,
+                    period_end,
+                ),
+            )
+            used = int(cursor.fetchone()["total"] or 0)
+            if limit is not None and used + quantity > limit:
+                return {
+                    "consumed": False,
+                    "reason": "limit_exceeded",
+                    "used": used,
+                    "limit": limit,
+                }
+            cursor.execute(
+                """
+                INSERT INTO billing_usage_records (
+                    company_id,
+                    subscription_id,
+                    metric,
+                    quantity,
+                    period_start,
+                    period_end
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    company_id,
+                    subscription_id,
+                    metric,
+                    quantity,
+                    period_start,
+                    period_end,
+                ),
+            )
+            usage_record_id = int(cursor.lastrowid)
+            return {
+                "consumed": True,
+                "reason": "recorded",
+                "used": used + quantity,
+                "limit": limit,
+                "usage_record_id": usage_record_id,
+            }
+
+    def refund_billing_usage(
+        self,
+        *,
+        usage_record_id: int,
+        company_id: int,
+    ) -> bool:
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                DELETE FROM billing_usage_records
+                WHERE id = ?
+                  AND company_id = ?
+                """,
+                (usage_record_id, company_id),
+            )
+            return cursor.rowcount == 1
 
     def get_billing_usage_totals(
         self,
@@ -4384,3 +5762,36 @@ class RuntimeRepository:
         rows = cursor.fetchall()
         connection.close()
         return [dict(row) for row in rows]
+
+
+def _guard_connections(method: Callable[..., Any]) -> Callable[..., Any]:
+    """Run a repository method inside a connection scope."""
+
+    @functools.wraps(method)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        with connection_scope():
+            return method(*args, **kwargs)
+
+    wrapper.__connection_guarded__ = True  # type: ignore[attr-defined]
+    return wrapper
+
+
+def _install_connection_guard(repository_class: type) -> None:
+    """Guarantee connection release for every public repository method.
+
+    Most repository methods release their connection on the success path only.
+    This guard makes the release unconditional: whatever happens inside the
+    call — a failed ``execute``, ``fetchall``, ``commit`` or serialization — the
+    connections acquired during it are rolled back and returned to the pool
+    exactly once. ``close()`` is idempotent, so a method that already closed its
+    own connection is unaffected, and transaction boundaries are untouched.
+    """
+    for attribute_name, attribute in list(vars(repository_class).items()):
+        if attribute_name.startswith("_") or not inspect.isfunction(attribute):
+            continue
+        if getattr(attribute, "__connection_guarded__", False):
+            continue
+        setattr(repository_class, attribute_name, _guard_connections(attribute))
+
+
+_install_connection_guard(RuntimeRepository)

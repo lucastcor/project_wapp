@@ -2,7 +2,7 @@
 title: Melhorias de Escalabilidade
 type: improvement
 tags: [melhorias, escalabilidade]
-updated: 2026-04-28
+updated: 2026-07-26
 ---
 
 # Melhorias de Escalabilidade
@@ -10,14 +10,15 @@ updated: 2026-04-28
 ## Eixos
 
 ### E-001 — Rate limit compartilhado
-- **Hoje**: in-memory por processo.
-- **Para**: Redis (sliding window log ou token bucket).
-- **Tracking**: I-007.
+- **Estado**: concluído no Release 1B.
+- **Hoje**: decisão atômica e contador compartilhado no Redis; fallback local
+  restrito a desenvolvimento.
 
 ### E-002 — Worker robusto
-- **Hoje**: loop simples em `reminder_worker.py`, single-instance.
-- **Para**: RQ / Celery / Arq com queues nomeadas, retries, dead letter.
-- **Tracking**: I-004.
+- **Estado**: fundação concluída no Release 1B.
+- **Hoje**: claim/lease no banco, retry com backoff, dead-letter e recuperação
+  de claims abandonados permitem múltiplas réplicas.
+- **Depois**: adotar uma fila dedicada somente quando volume/latência justificarem.
 
 ### E-003 — Tracing distribuído
 - **Hoje**: apenas `X-Request-ID`.
@@ -50,8 +51,10 @@ updated: 2026-04-28
 - **Para**: pools por `company_id` em deploys com tenants pesados.
 
 ### E-011 — Realtime WebSocket dedicado
-- **Hoje**: `broadcast_event` em memória.
-- **Para**: WebSocket via FastAPI + Redis pub/sub ou similar para escala horizontal.
+- **Hoje**: SSE mantém conexões por processo e Redis Pub/Sub distribui eventos
+  entre réplicas.
+- **Para**: adicionar replay/cursor durável; WebSocket apenas se comunicação
+  bidirecional em tempo real se tornar necessária.
 
 ### E-012 — Async I/O para chamadas de provider
 - **Hoje**: `requests` síncrono em `whatsapp_provider`.

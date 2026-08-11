@@ -1,7 +1,7 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from app.api.schemas import (
     AppointmentBookingPayload,
@@ -16,17 +16,24 @@ from app.api.schemas import (
     CancellationReasonPayload,
     OnboardingSetupPayload,
     CompanyContextPayload,
+    CompanyContextRecordResponse,
     CompanyCreatePayload,
     CompanyResponse,
     ContactUpdatePayload,
+    IncomingMessageRequest,
+    IncomingMessageResponse,
     InternalReminderPayload,
     MessageExampleCreatePayload,
     PendingQuestionAnswerPayload,
     PlanChangePayload,
     ReactivateSubscriptionPayload,
     SubscriptionActivatePayload,
+    StripeCheckoutPayload,
     TrainingImportPayload,
     UsageRecordPayload,
+    WhatsAppBindingPayload,
+    WhatsAppBindingResponse,
+    WhatsAppBindingStatePayload,
 )
 from app.api.admin_security import (
     build_require_admin_access,
@@ -34,12 +41,15 @@ from app.api.admin_security import (
 )
 from app.api.admin_support import build_prometheus_metrics, record_audit_event
 
+from app.core.orchestrator import process_incoming_message
 from app.storage.repository import RuntimeRepository
 
 from app.core.company_context import (
+    CompanyContextConflictError,
     CompanyContextError,
     get_company_context,
-    save_company_context,
+    get_company_context_record,
+    save_company_context_record,
 )
 from app.services.handoff_service import normalize_owner_resolution
 from app.services.knowledge_service import (
@@ -97,9 +107,9 @@ from app.services.appointment_queue_service import (
 )
 
 from app.core.config import settings
-from app.services.realtime_service import broadcast_event
+from app.services.realtime_service import broadcast_event, publish_incoming_message_event
 from app.services.finetuning_service import FineTuningError, FineTuningService
-from app.core.logging import get_logger, log_event
+from app.core.logging import get_logger, log_event, mask_identifier
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
@@ -112,6 +122,26 @@ def _get_finetuning_service() -> FineTuningService:
 
 def _get_repository() -> RuntimeRepository:
     return repository
+
+
+def _deny_identity_for_platform_operation(request: Request) -> None:
+    """Reserve cross-tenant platform operations for break-glass credentials."""
+    if getattr(request.state, "admin_auth_mode", None) == "identity":
+        raise HTTPException(
+            status_code=403,
+            detail="This platform-level operation requires break-glass administrator credentials.",
+        )
+
+
+def _require_company_owner_or_break_glass(request: Request) -> None:
+    if (
+        getattr(request.state, "admin_auth_mode", None) == "identity"
+        and getattr(request.state, "admin_identity_role", None) != "owner"
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Only the company owner can manage billing.",
+        )
 
 
 def _resolve_company_scope(
@@ -127,6 +157,18 @@ def _resolve_company_scope(
     if required and resolved_company_id is None:
         raise HTTPException(status_code=400, detail="company_id or company_slug must resolve to an existing company.")
     return resolved_company_id
+
+
+def _broadcast_reminders_dispatched(results: list[dict]) -> None:
+    """Emit one tenant-scoped event per company so scopes stay isolated."""
+    counts_by_company: dict[int | None, int] = {}
+    for result in results:
+        raw_company_id = result.get("company_id")
+        company_key = int(raw_company_id) if raw_company_id is not None else None
+        counts_by_company[company_key] = counts_by_company.get(company_key, 0) + 1
+
+    for company_key, count in counts_by_company.items():
+        broadcast_event("reminders_dispatched", {"count": count}, company_id=company_key)
 
 
 def _record_audit_event(
@@ -174,13 +216,17 @@ admin_router = APIRouter(
 
 
 @admin_router.get("/state")
-def read_state() -> dict:
-    return repository.get_state()
+def read_state(company_id: int | None = Query(default=None)) -> dict:
+    return repository.get_state() if company_id is None else repository.get_state(company_id=company_id)
 
 
 @admin_router.get("/observability/summary")
-def read_observability_summary() -> dict:
-    summary = repository.get_observability_summary()
+def read_observability_summary(company_id: int | None = Query(default=None)) -> dict:
+    summary = (
+        repository.get_observability_summary()
+        if company_id is None
+        else repository.get_observability_summary(company_id=company_id)
+    )
     log_event(
         logger,
         logging.INFO,
@@ -192,8 +238,14 @@ def read_observability_summary() -> dict:
 
 
 @admin_router.get("/observability/metrics", response_class=PlainTextResponse)
-def read_observability_metrics() -> PlainTextResponse:
-    summary = repository.get_observability_summary()
+def read_observability_metrics(
+    company_id: int | None = Query(default=None),
+) -> PlainTextResponse:
+    summary = (
+        repository.get_observability_summary()
+        if company_id is None
+        else repository.get_observability_summary(company_id=company_id)
+    )
     metrics_payload = _build_prometheus_metrics(summary)
     log_event(
         logger,
@@ -232,6 +284,7 @@ def cleanup_audit_events(
     request: Request,
     older_than_days: int | None = Query(default=None),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     retention_days = older_than_days or settings.audit_retention_days
     if retention_days <= 0:
         raise HTTPException(status_code=400, detail="older_than_days must be greater than zero.")
@@ -564,12 +617,16 @@ def create_calendar_booking_endpoint(
             "confirmation_outbound_message_id": confirmation_outbound_id,
         },
     )
-    broadcast_event("new_booking", {
-        "booking_id": booking.get("id"),
-        "title": booking.get("title"),
-        "starts_at": booking.get("starts_at"),
-        "contact_id": booking.get("contact_id"),
-    })
+    broadcast_event(
+        "new_booking",
+        {
+            "booking_id": booking.get("id"),
+            "title": booking.get("title"),
+            "starts_at": booking.get("starts_at"),
+            "contact_id": mask_identifier(str(booking.get("contact_id") or "")) or None,
+        },
+        company_id=booking.get("company_id") or company_id,
+    )
     if confirmation_outbound_id is not None:
         return {**booking, "confirmation_outbound_message_id": confirmation_outbound_id}
     return booking
@@ -582,17 +639,32 @@ def reschedule_calendar_booking_endpoint(
     booking_id: int,
     payload: AppointmentBookingReschedulePayload,
     request: Request,
+    company_id: int | None = Query(default=None),
 ) -> dict:
     try:
-        booking = reschedule_calendar_booking(
-            booking_id=booking_id,
-            starts_at=payload.starts_at,
-            ends_at=payload.ends_at,
-            timezone_name=payload.timezone,
-            title=payload.title,
-            description=payload.description,
-            scheduling_profile_key=payload.scheduling_profile_key,
-            customer_profile=payload.customer_profile,
+        booking = (
+            reschedule_calendar_booking(
+                booking_id=booking_id,
+                starts_at=payload.starts_at,
+                ends_at=payload.ends_at,
+                timezone_name=payload.timezone,
+                title=payload.title,
+                description=payload.description,
+                scheduling_profile_key=payload.scheduling_profile_key,
+                customer_profile=payload.customer_profile,
+            )
+            if company_id is None
+            else reschedule_calendar_booking(
+                booking_id=booking_id,
+                starts_at=payload.starts_at,
+                ends_at=payload.ends_at,
+                timezone_name=payload.timezone,
+                title=payload.title,
+                description=payload.description,
+                scheduling_profile_key=payload.scheduling_profile_key,
+                customer_profile=payload.customer_profile,
+                company_id=company_id,
+            )
         )
     except CalendarProviderError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -622,12 +694,21 @@ def cancel_calendar_booking_endpoint(
     booking_id: int,
     payload: AppointmentBookingCancellationPayload,
     request: Request,
+    company_id: int | None = Query(default=None),
 ) -> dict:
     try:
         if payload.trigger_queue_recovery:
-            result = release_booking_slot(booking_id=booking_id)
+            result = (
+                release_booking_slot(booking_id=booking_id)
+                if company_id is None
+                else release_booking_slot(booking_id=booking_id, company_id=company_id)
+            )
         else:
-            result = cancel_calendar_booking(booking_id=booking_id)
+            result = (
+                cancel_calendar_booking(booking_id=booking_id)
+                if company_id is None
+                else cancel_calendar_booking(booking_id=booking_id, company_id=company_id)
+            )
             result = {
                 "booking": result["booking"],
                 "cancelled_reminders": result["cancelled_reminders"],
@@ -669,13 +750,24 @@ def respond_to_appointment_queue_offer_endpoint(
     offer_id: int,
     payload: AppointmentQueueOfferResponsePayload,
     request: Request,
+    company_id: int | None = Query(default=None),
 ) -> dict:
     try:
-        result = respond_to_queue_offer(
-            offer_id=offer_id,
-            response_status=payload.response_status,
-            wait_minutes=payload.wait_minutes,
-            response_notes=payload.response_notes,
+        result = (
+            respond_to_queue_offer(
+                offer_id=offer_id,
+                response_status=payload.response_status,
+                wait_minutes=payload.wait_minutes,
+                response_notes=payload.response_notes,
+            )
+            if company_id is None
+            else respond_to_queue_offer(
+                offer_id=offer_id,
+                response_status=payload.response_status,
+                wait_minutes=payload.wait_minutes,
+                response_notes=payload.response_notes,
+                company_id=company_id,
+            )
         )
     except AppointmentQueueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -756,11 +848,21 @@ def dispatch_due_customer_reminders(
     dispatch_immediately: bool = Query(default=False),
     channel: str | None = Query(default=None),
     audience: str | None = Query(default=None),
+    company_id: int | None = Query(default=None),
 ) -> list[dict]:
-    results = dispatch_due_reminders(
-        dispatch_immediately=dispatch_immediately,
-        channel=channel,
-        audience=audience,
+    results = (
+        dispatch_due_reminders(
+            dispatch_immediately=dispatch_immediately,
+            channel=channel,
+            audience=audience,
+        )
+        if company_id is None
+        else dispatch_due_reminders(
+            dispatch_immediately=dispatch_immediately,
+            channel=channel,
+            audience=audience,
+            company_id=company_id,
+        )
     )
     _record_audit_event(
         request=request,
@@ -773,8 +875,7 @@ def dispatch_due_customer_reminders(
             "count": len(results),
         },
     )
-    if results:
-        broadcast_event("reminders_dispatched", {"count": len(results)})
+    _broadcast_reminders_dispatched(results)
     return results
 
 
@@ -855,6 +956,7 @@ def update_contact_endpoint(
     dependencies=[Depends(require_admin_role("superadmin"))],
 )
 def create_company(payload: CompanyCreatePayload, request: Request) -> CompanyResponse:
+    _deny_identity_for_platform_operation(request)
     existing_company = repository.get_company_by_slug(payload.slug)
     if existing_company:
         raise HTTPException(status_code=400, detail="Company slug already exists.")
@@ -892,8 +994,13 @@ def create_company(payload: CompanyCreatePayload, request: Request) -> CompanyRe
 
 
 @admin_router.get("/companies", response_model=list[CompanyResponse])
-def read_companies() -> list[CompanyResponse]:
-    return [CompanyResponse(**company) for company in repository.get_companies()]
+def read_companies(request: Request) -> list[CompanyResponse]:
+    companies = repository.get_companies()
+    company_ids = getattr(request.state, "admin_company_ids", None)
+    if company_ids is not None:
+        allowed = {int(company_id) for company_id in company_ids}
+        companies = [company for company in companies if int(company["id"]) in allowed]
+    return [CompanyResponse(**company) for company in companies]
 
 
 @admin_router.get("/companies/{company_id}", response_model=CompanyResponse)
@@ -912,6 +1019,19 @@ def read_company_context(company_slug: str | None = Query(default=None)) -> dict
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@admin_router.get("/company-context/record", response_model=CompanyContextRecordResponse)
+def read_company_context_record(
+    company_slug: str | None = Query(default=None),
+) -> CompanyContextRecordResponse:
+    """Return the context plus its revision, for optimistic-concurrency updates."""
+    try:
+        record = get_company_context_record(company_slug=company_slug)
+    except CompanyContextError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return CompanyContextRecordResponse(**record)
+
+
 @admin_router.put(
     "/company-context",
     dependencies=[Depends(require_admin_role("superadmin"))],
@@ -922,26 +1042,50 @@ def update_company_context(
     company_slug: str | None = Query(default=None),
 ) -> dict:
     try:
-        result = save_company_context(payload.data, company_slug=company_slug)
-        log_event(
-            logger,
-            logging.INFO,
-            "admin.company_context.updated",
-            company_slug=company_slug or "global",
+        record = save_company_context_record(
+            payload.data,
+            company_slug=company_slug,
+            expected_revision=payload.expected_revision,
+            updated_by=getattr(request.state, "admin_actor", None),
         )
+    except CompanyContextConflictError as exc:
         _record_audit_event(
             request=request,
             action="update",
             resource_type="company_context",
             resource_id=company_slug or "global",
+            status="conflict",
             metadata={
                 "company_slug": company_slug or "global",
-                "top_level_keys": sorted(payload.data.keys()),
+                "expected_revision": payload.expected_revision,
             },
         )
-        return result
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except CompanyContextError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.company_context.updated",
+        company_slug=company_slug or "global",
+        company_id=record["company_id"],
+        revision=record["revision"],
+    )
+    _record_audit_event(
+        request=request,
+        action="update",
+        resource_type="company_context",
+        resource_id=company_slug or "global",
+        company_id=record["company_id"],
+        metadata={
+            "company_slug": company_slug or "global",
+            "revision": record["revision"],
+            "schema_version": record["schema_version"],
+            "top_level_keys": sorted(payload.data.keys()),
+        },
+    )
+    return record["data"]
 
 
 @admin_router.get("/pending-questions")
@@ -1324,9 +1468,17 @@ def dispatch_single_outbound_message(
     "/outbound-messages/dispatch-pending",
     dependencies=[Depends(require_admin_role("operator"))],
 )
-def dispatch_all_pending_outbound_messages(request: Request, channel: str = "generic") -> list[dict]:
+def dispatch_all_pending_outbound_messages(
+    request: Request,
+    channel: str = "generic",
+    company_id: int | None = Query(default=None),
+) -> list[dict]:
     try:
-        results = dispatch_pending_outbound_messages(channel=channel)
+        results = (
+            dispatch_pending_outbound_messages(channel=channel)
+            if company_id is None
+            else dispatch_pending_outbound_messages(channel=channel, company_id=company_id)
+        )
         log_event(
             logger,
             logging.INFO,
@@ -1501,19 +1653,32 @@ def read_analytics_dashboard(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/analytics/bookings/{booking_id}/outcome")
+@admin_router.post(
+    "/analytics/bookings/{booking_id}/outcome",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
 def record_booking_outcome_endpoint(
     booking_id: int,
     payload: BookingOutcomePayload,
     request: Request,
+    company_id: int | None = Query(default=None),
 ) -> dict:
     from app.services.analytics_service import AnalyticsError, record_booking_outcome
 
     try:
-        result = record_booking_outcome(
-            booking_id,
-            outcome=payload.outcome,
-            notes=payload.notes,
+        result = (
+            record_booking_outcome(
+                booking_id,
+                outcome=payload.outcome,
+                notes=payload.notes,
+            )
+            if company_id is None
+            else record_booking_outcome(
+                booking_id,
+                outcome=payload.outcome,
+                notes=payload.notes,
+                company_id=company_id,
+            )
         )
         _record_audit_event(
             request=request,
@@ -1534,16 +1699,28 @@ def record_booking_outcome_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/analytics/bookings/{booking_id}/cancellation-reason")
+@admin_router.post(
+    "/analytics/bookings/{booking_id}/cancellation-reason",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
 def record_cancellation_reason_endpoint(
     booking_id: int,
     payload: CancellationReasonPayload,
     request: Request,
+    company_id: int | None = Query(default=None),
 ) -> dict:
     from app.services.analytics_service import AnalyticsError, record_cancellation_reason
 
     try:
-        result = record_cancellation_reason(booking_id, reason=payload.reason)
+        result = (
+            record_cancellation_reason(booking_id, reason=payload.reason)
+            if company_id is None
+            else record_cancellation_reason(
+                booking_id,
+                reason=payload.reason,
+                company_id=company_id,
+            )
+        )
         _record_audit_event(
             request=request,
             action="record_cancellation_reason",
@@ -1615,11 +1792,15 @@ def read_onboarding_presets() -> dict:
     return get_onboarding_presets()
 
 
-@admin_router.post("/onboarding/setup")
+@admin_router.post(
+    "/onboarding/setup",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def run_onboarding_setup(
     payload: OnboardingSetupPayload,
     request: Request,
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.onboarding_service import OnboardingError, setup_company
 
     try:
@@ -1690,11 +1871,105 @@ def read_billing_plans() -> list[dict]:
     return plans
 
 
-@admin_router.post("/billing/trial")
+@admin_router.post(
+    "/billing/checkout",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def create_stripe_checkout(
+    payload: StripeCheckoutPayload,
+    request: Request,
+    company_id: int = Query(...),
+    idempotency_key: str | None = Header(default=None, alias="X-Idempotency-Key"),
+) -> dict:
+    from app.services.stripe_billing_service import (
+        StripeBillingError,
+        create_checkout_session,
+    )
+
+    _require_company_owner_or_break_glass(request)
+    normalized_key = str(idempotency_key or "").strip()
+    if len(normalized_key) < 16 or len(normalized_key) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Idempotency-Key must contain 16-200 characters.",
+        )
+    customer_email = str(
+        getattr(request.state, "admin_email", None)
+        or payload.customer_email
+        or ""
+    ).strip()
+    if not customer_email:
+        raise HTTPException(status_code=400, detail="Customer email is required.")
+    try:
+        result = create_checkout_session(
+            company_id=company_id,
+            customer_email=customer_email,
+            plan_key=payload.plan_key,
+            billing_cycle=payload.billing_cycle,
+            idempotency_key=normalized_key,
+        )
+    except StripeBillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _record_audit_event(
+        request=request,
+        action="create_checkout",
+        resource_type="billing_subscription",
+        company_id=company_id,
+        metadata={
+            "plan_key": payload.plan_key,
+            "billing_cycle": payload.billing_cycle,
+            "status": result["status"],
+        },
+    )
+    return result
+
+
+@admin_router.post(
+    "/billing/portal",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def create_stripe_portal(
+    request: Request,
+    company_id: int = Query(...),
+    idempotency_key: str | None = Header(default=None, alias="X-Idempotency-Key"),
+) -> dict:
+    from app.services.stripe_billing_service import (
+        StripeBillingError,
+        create_customer_portal_session,
+    )
+
+    _require_company_owner_or_break_glass(request)
+    normalized_key = str(idempotency_key or "").strip()
+    if len(normalized_key) < 16 or len(normalized_key) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="X-Idempotency-Key must contain 16-200 characters.",
+        )
+    try:
+        result = create_customer_portal_session(
+            company_id=company_id,
+            idempotency_key=normalized_key,
+        )
+    except StripeBillingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _record_audit_event(
+        request=request,
+        action="create_portal",
+        resource_type="billing_subscription",
+        company_id=company_id,
+    )
+    return result
+
+
+@admin_router.post(
+    "/billing/trial",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def start_billing_trial(
     request: Request,
     company_id: int = Query(...),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.billing_service import BillingError, start_trial
 
     try:
@@ -1716,12 +1991,16 @@ def start_billing_trial(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/activate")
+@admin_router.post(
+    "/billing/activate",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def activate_billing_subscription(
     payload: SubscriptionActivatePayload,
     request: Request,
     company_id: int = Query(...),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.billing_service import BillingError, activate_subscription
 
     try:
@@ -1752,12 +2031,16 @@ def activate_billing_subscription(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/cancel")
+@admin_router.post(
+    "/billing/cancel",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def cancel_billing_subscription(
     payload: CancelSubscriptionPayload,
     request: Request,
     company_id: int = Query(...),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.billing_service import BillingError, cancel_subscription
 
     try:
@@ -1779,12 +2062,16 @@ def cancel_billing_subscription(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/reactivate")
+@admin_router.post(
+    "/billing/reactivate",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def reactivate_billing_subscription(
     payload: ReactivateSubscriptionPayload,
     request: Request,
     company_id: int = Query(...),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.billing_service import BillingError, reactivate_subscription
 
     try:
@@ -1813,12 +2100,16 @@ def reactivate_billing_subscription(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/change-plan")
+@admin_router.post(
+    "/billing/change-plan",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def change_billing_plan(
     payload: PlanChangePayload,
     request: Request,
     company_id: int = Query(...),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.billing_service import BillingError, change_plan
 
     try:
@@ -1858,12 +2149,16 @@ def read_billing_usage(company_id: int = Query(...)) -> dict:
     return dashboard
 
 
-@admin_router.post("/billing/usage/record")
+@admin_router.post(
+    "/billing/usage/record",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def record_billing_usage(
     payload: UsageRecordPayload,
     request: Request,
     company_id: int = Query(...),
 ) -> dict:
+    _deny_identity_for_platform_operation(request)
     from app.services.billing_service import BillingError, record_usage
 
     try:
@@ -1871,6 +2166,19 @@ def record_billing_usage(
             company_id=company_id,
             metric=payload.metric,
             quantity=payload.quantity,
+        )
+        _record_audit_event(
+            request=request,
+            action="record_usage",
+            resource_type="billing_usage",
+            company_id=company_id,
+            status="success" if result.get("recorded") else "skipped",
+            metadata={
+                "metric": payload.metric,
+                "quantity": payload.quantity,
+                "recorded": bool(result.get("recorded")),
+                "reason": result.get("reason"),
+            },
         )
         log_event(
             logger, logging.INFO, "admin.billing.usage.recorded",
@@ -1889,3 +2197,178 @@ def check_billing_limit(
     from app.services.billing_service import check_limit
 
     return check_limit(company_id=company_id, metric=metric)
+
+
+# ── WhatsApp channel bindings ─────────────────────────────────────────
+
+
+@admin_router.get("/whatsapp/bindings", response_model=list[WhatsAppBindingResponse])
+def read_whatsapp_bindings(
+    company_id: int | None = Query(default=None),
+    active_only: bool = Query(default=False),
+) -> list[WhatsAppBindingResponse]:
+    bindings = repository.get_whatsapp_bindings(company_id=company_id, active_only=active_only)
+    return [WhatsAppBindingResponse(**binding) for binding in bindings]
+
+
+@admin_router.put(
+    "/whatsapp/bindings",
+    response_model=WhatsAppBindingResponse,
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def upsert_whatsapp_binding_endpoint(
+    payload: WhatsAppBindingPayload,
+    request: Request,
+) -> WhatsAppBindingResponse:
+    """Bind a Meta phone_number_id to a company (superadmin only)."""
+    company = repository.get_company(payload.company_id)
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found.")
+
+    binding = repository.upsert_whatsapp_binding(
+        company_id=payload.company_id,
+        phone_number_id=payload.phone_number_id,
+        display_phone_number=payload.display_phone_number,
+        active=payload.active,
+        updated_by=getattr(request.state, "admin_actor", None),
+    )
+    if binding is None:
+        raise HTTPException(
+            status_code=409,
+            detail="This WhatsApp phone number is already actively bound to another company.",
+        )
+
+    _record_audit_event(
+        request=request,
+        action="upsert",
+        resource_type="whatsapp_channel_binding",
+        resource_id=str(binding["id"]),
+        company_id=payload.company_id,
+        metadata={
+            # Identifiers only: no access token or app secret is stored or logged.
+            "phone_number_id": payload.phone_number_id,
+            "active": payload.active,
+        },
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.whatsapp.binding.upserted",
+        company_id=payload.company_id,
+        binding_id=binding["id"],
+        active=payload.active,
+    )
+    return WhatsAppBindingResponse(**binding)
+
+
+@admin_router.post(
+    "/whatsapp/bindings/{binding_id}/state",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def set_whatsapp_binding_state(
+    binding_id: int,
+    payload: WhatsAppBindingStatePayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    if company_id is not None:
+        bindings = repository.get_whatsapp_bindings(company_id=company_id, active_only=False)
+        if not any(int(binding["id"]) == binding_id for binding in bindings):
+            raise HTTPException(status_code=404, detail="WhatsApp channel binding not found.")
+    result = repository.set_whatsapp_binding_active(
+        binding_id,
+        active=payload.active,
+        updated_by=getattr(request.state, "admin_actor", None),
+    )
+    if result == "not_found":
+        raise HTTPException(status_code=404, detail="WhatsApp channel binding not found.")
+    if result == "conflict":
+        # Reactivating a historical binding whose number moved to another tenant.
+        _record_audit_event(
+            request=request,
+            action="activate",
+            resource_type="whatsapp_channel_binding",
+            resource_id=str(binding_id),
+            status="conflict",
+            metadata={"active": payload.active},
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="This WhatsApp phone number is already actively bound to another company.",
+        )
+
+    _record_audit_event(
+        request=request,
+        action="activate" if payload.active else "deactivate",
+        resource_type="whatsapp_channel_binding",
+        resource_id=str(binding_id),
+        metadata={"active": payload.active},
+    )
+    return {"binding_id": binding_id, "active": payload.active}
+
+
+# ── Simulator ─────────────────────────────────────────────────────────
+
+
+@admin_router.post(
+    "/simulator/messages",
+    response_model=IncomingMessageResponse,
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def simulate_incoming_message(
+    payload: IncomingMessageRequest,
+    request: Request,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> IncomingMessageResponse:
+    """Authenticated replacement for calling the public ingress from the platform UI.
+
+    The company is resolved server-side and must exist; the caller cannot push a
+    simulated conversation into an arbitrary tenant.
+    """
+    normalized_message = payload.message.strip()
+    if not normalized_message:
+        raise HTTPException(status_code=400, detail="message must not be blank.")
+
+    resolved_company_id = None
+    resolved_company_slug = None
+    if company_id is not None or company_slug:
+        resolved_company_id = _resolve_company_scope(
+            company_id=company_id,
+            company_slug=company_slug,
+            required=True,
+        )
+        if resolved_company_id is None:  # Defensive guard for static and runtime safety.
+            raise HTTPException(status_code=400, detail="Company scope could not be resolved.")
+        company = repository.get_company(resolved_company_id)
+        resolved_company_slug = str(company["slug"]) if company else None
+
+    result = process_incoming_message(
+        contact_id=payload.contact_id,
+        contact_name=payload.contact_name,
+        message=normalized_message,
+        company_id=resolved_company_id,
+        company_slug=resolved_company_slug,
+    )
+    _record_audit_event(
+        request=request,
+        action="simulate_message",
+        resource_type="conversation",
+        resource_id=mask_identifier(payload.contact_id),
+        company_id=result.get("company_id"),
+        metadata={
+            "classification": result.get("classification"),
+            "action": result.get("action"),
+            "handoff_required": result.get("handoff_required"),
+        },
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.simulator.message.processed",
+        company_id=result.get("company_id"),
+        classification=result.get("classification"),
+        handoff_required=result.get("handoff_required"),
+    )
+    publish_incoming_message_event(result, contact_id=payload.contact_id)
+    return IncomingMessageResponse(**result)

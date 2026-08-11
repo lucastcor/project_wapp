@@ -1,19 +1,22 @@
 FROM python:3.13-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 
 RUN addgroup --system app && adduser --system --ingroup app app
 
+FROM base AS api-dependencies
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
+FROM api-dependencies AS application
+
 COPY app ./app
-COPY docs ./docs
-COPY README.md ./
 
 RUN chown -R app:app /app
 
@@ -23,5 +26,25 @@ EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+
+FROM api-dependencies AS admin-dependencies
+COPY requirements-admin.txt .
+RUN pip install --no-cache-dir -r requirements-admin.txt
+
+FROM admin-dependencies AS admin
+
+COPY app ./app
+RUN chown -R app:app /app
+
+USER app
+
+EXPOSE 8501
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"
+
+CMD ["streamlit", "run", "app/admin_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+
+FROM application AS api
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--access-log"]

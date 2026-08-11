@@ -2,7 +2,7 @@
 title: Multi-tenant
 type: data
 tags: [dados, multi-tenant, scopes]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Multi-tenant
@@ -47,9 +47,14 @@ Por quê? Porque o mesmo número de WhatsApp pode atender empresas diferentes em
 
 ## Contexto por empresa
 
-`get_company_context(company_slug=...)`:
-1. Procura `app/data/company_contexts/{slug}.json`.
-2. Se não existir, fallback `app/data/company_context.json`.
+`get_company_context(company_slug=...)` avalia o slug e depois o contexto global,
+nesta ordem por chave:
+1. Linha em `company_contexts` para a chave.
+2. Arquivo de seed correspondente — **somente** se seeds estiverem habilitados
+   (fora de `ENVIRONMENT=production` e de `STRICT_RUNTIME_VALIDATION=true`).
+
+Produção nunca cai em arquivo local mutável; sem linha no banco a leitura falha e
+o readiness reporta blocker.
 
 Ver [[40-Data/05-Company Context]].
 

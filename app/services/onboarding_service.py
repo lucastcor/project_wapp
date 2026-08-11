@@ -15,7 +15,7 @@ class OnboardingError(Exception):
     pass
 
 
-BUSINESS_TYPE_PRESETS = {
+BUSINESS_TYPE_PRESETS: dict[str, dict[str, Any]] = {
     "clinica": {
         "label": "Clinica / Consultorio",
         "business_model": ["services", "scheduling"],

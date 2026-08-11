@@ -1,6 +1,8 @@
 import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from app.core.config import settings
@@ -25,8 +27,54 @@ SQLITE_ID_TABLES = {
     "billing_subscriptions",
     "billing_usage_records",
     "inbound_message_receipts",
+    "whatsapp_channel_bindings",
+    "saas_users",
+    "company_memberships",
+    "user_invitations",
+    "user_sessions",
+    "password_reset_tokens",
+    "billing_webhook_events",
 }
+TENANT_REFERENCE_TABLES = (
+    "appointment_bookings",
+    "appointment_queue_entries",
+    "appointment_queue_offers",
+    "audit_events",
+    "billing_subscriptions",
+    "billing_usage_records",
+    "calendar_integrations",
+    "company_contexts",
+    "company_memberships",
+    "contact_company_profiles",
+    "contacts",
+    "conversation_flows",
+    "customer_reminders",
+    "finetuning_jobs",
+    "inbound_message_receipts",
+    "knowledge_entries",
+    "message_examples",
+    "messages",
+    "outbound_messages",
+    "pending_questions",
+    "user_invitations",
+    "whatsapp_channel_bindings",
+)
+TENANT_REFERENTIAL_LINKS = (
+    ("appointment_bookings", "integration_id", "calendar_integrations"),
+    ("appointment_queue_entries", "original_booking_id", "appointment_bookings"),
+    ("appointment_queue_offers", "queue_entry_id", "appointment_queue_entries"),
+    ("appointment_queue_offers", "released_booking_id", "appointment_bookings"),
+    ("appointment_queue_offers", "outbound_message_id", "outbound_messages"),
+    ("appointment_queue_offers", "new_booking_id", "appointment_bookings"),
+    ("billing_usage_records", "subscription_id", "billing_subscriptions"),
+    ("customer_reminders", "appointment_booking_id", "appointment_bookings"),
+    ("customer_reminders", "outbound_message_id", "outbound_messages"),
+    ("knowledge_entries", "source_question_id", "pending_questions"),
+    ("outbound_messages", "pending_question_id", "pending_questions"),
+)
 Migration = tuple[str, str, Callable[[Any], None]]
+# Fixed key for the Postgres advisory lock that serializes schema migrations.
+MIGRATION_ADVISORY_LOCK_KEY = 7723001122334455
 _POSTGRES_POOL = None
 
 
@@ -163,22 +211,109 @@ class PostgresCursorWrapper:
 
 
 class PostgresConnectionWrapper:
+    """Pooled Postgres connection with an idempotent, single-return release.
+
+    A connection must go back to the pool exactly once, and never while its
+    transaction is still open — an aborted transaction returned to the pool
+    poisons the next borrower and, repeated, exhausts the pool.
+    """
+
     def __init__(self, raw_connection: Any, pool: Any) -> None:
         self._connection = raw_connection
         self._pool = pool
+        self._released = False
+        # Set when release could not complete cleanly; useful for diagnostics.
+        self.release_error: Exception | None = None
+
+    @property
+    def released(self) -> bool:
+        return self._released
 
     def cursor(self) -> PostgresCursorWrapper:
+        if self._released:
+            raise RuntimeError("Cannot use a connection that was already returned to the pool.")
         return PostgresCursorWrapper(self._connection.cursor())
 
     def commit(self) -> None:
+        if self._released:
+            raise RuntimeError("Cannot commit a connection that was already returned to the pool.")
         self._connection.commit()
 
+    def rollback(self) -> None:
+        if self._released:
+            return
+        self._connection.rollback()
+
     def close(self) -> None:
+        """Return the connection to the pool exactly once.
+
+        Ordering matters: ``_released`` is set before any cleanup runs, so a
+        failure part-way through can never lead to a second ``putconn`` of the
+        same raw connection. Cleanup problems are recorded on ``release_error``
+        and never raised, so they cannot mask the application exception that was
+        already propagating when the connection was being released.
+        """
+        if self._released:
+            return
+        self._released = True
+
         try:
             self._connection.rollback()
-        except Exception:
-            pass
-        self._pool.putconn(self._connection)
+        except Exception as rollback_error:
+            self.release_error = rollback_error
+
+        try:
+            self._pool.putconn(self._connection)
+        except Exception as putconn_error:
+            # The pool would not take it back, so the slot is only recovered by
+            # closing the raw connection; leaving it open would strand it and
+            # eventually starve the pool.
+            self.release_error = putconn_error
+            self._discard_raw_connection()
+
+    def _discard_raw_connection(self) -> None:
+        try:
+            self._connection.close()
+        except Exception as discard_error:
+            self.release_error = discard_error
+
+
+class SqliteConnectionWrapper:
+    """SQLite connection with the same idempotent release contract as Postgres."""
+
+    def __init__(self, raw_connection: Any) -> None:
+        self._connection = raw_connection
+        self._released = False
+        self.release_error: Exception | None = None
+
+    @property
+    def released(self) -> bool:
+        return self._released
+
+    def cursor(self) -> Any:
+        if self._released:
+            raise RuntimeError("Cannot use a connection that was already closed.")
+        return self._connection.cursor()
+
+    def commit(self) -> None:
+        if self._released:
+            raise RuntimeError("Cannot commit a connection that was already closed.")
+        self._connection.commit()
+
+    def rollback(self) -> None:
+        if self._released:
+            return
+        self._connection.rollback()
+
+    def close(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        try:
+            self._connection.rollback()
+        except Exception as rollback_error:
+            self.release_error = rollback_error
+        self._connection.close()
 
 
 def _get_postgres_connect_kwargs() -> dict[str, Any]:
@@ -190,6 +325,10 @@ def _get_postgres_connect_kwargs() -> dict[str, Any]:
         },
         "min_size": 1,
         "max_size": max(1, settings.database_pool_size),
+        # Explicit rather than relying on the implicit-open default, which
+        # psycopg_pool deprecates. The pool is only built on first use, so this
+        # still does not open a connection at import time.
+        "open": True,
     }
 
 
@@ -223,9 +362,18 @@ def close_postgres_pool() -> None:
 def get_connection() -> Any:
     backend = get_database_backend()
     if backend == "sqlite":
-        connection = sqlite3.connect(get_runtime_database_path())
-        connection.row_factory = sqlite3.Row
-        return connection
+        raw_sqlite = sqlite3.connect(
+            get_runtime_database_path(),
+            timeout=max(5.0, settings.database_statement_timeout_ms / 1000),
+        )
+        raw_sqlite.row_factory = sqlite3.Row
+        # SQLite does not enforce declared foreign keys unless every connection
+        # enables them. Tenant isolation must not depend on the caller.
+        raw_sqlite.execute("PRAGMA foreign_keys = ON")
+        raw_sqlite.execute(
+            f"PRAGMA busy_timeout = {max(5000, settings.database_statement_timeout_ms)}"
+        )
+        return _register_connection(SqliteConnectionWrapper(raw_sqlite))
 
     pool = _get_postgres_pool()
     raw_connection = pool.getconn()
@@ -236,7 +384,137 @@ def get_connection() -> Any:
         raise RuntimeError("Postgres backend requires psycopg with dict_row support.") from exc
 
     raw_connection.row_factory = dict_row
-    return PostgresConnectionWrapper(raw_connection, pool)
+    return _register_connection(PostgresConnectionWrapper(raw_connection, pool))
+
+
+# ── Connection lifecycle ──────────────────────────────────────────────
+#
+# Every acquired connection must be released exactly once, and a failed
+# transaction must be rolled back before the connection returns to the pool.
+# Two mechanisms cooperate:
+#
+# 1. ``db_session`` / ``db_transaction`` context managers — the pattern for new
+#    code and for standalone tools.
+# 2. ``connection_scope`` — a guard installed around every public
+#    ``RuntimeRepository`` method, so the legacy methods that release on their
+#    success path only are still safe when an operation raises midway.
+#
+# Neither relies on ``__del__``, garbage collection or interpreter shutdown.
+
+_ACTIVE_CONNECTIONS: ContextVar[list[Any] | None] = ContextVar(
+    "project_wapp_active_connections",
+    default=None,
+)
+
+
+UNIQUE_VIOLATION_SQLSTATE = "23505"
+
+
+def is_unique_violation(
+    error: BaseException,
+    *,
+    postgres_constraint: str,
+    sqlite_qualified_column: str,
+) -> bool:
+    """Whether ``error`` is a unique violation on one specific constraint.
+
+    Deliberately narrow: an unrelated integrity error (a foreign key, a NOT NULL,
+    or a different unique index) must keep propagating instead of being
+    translated into a domain conflict.
+
+    * PostgreSQL exposes ``sqlstate`` 23505 plus the offending constraint name.
+    * SQLite only reports a message, so the qualified ``table.column`` is matched.
+    """
+    sqlstate = getattr(error, "sqlstate", None)
+    if sqlstate is not None:
+        if sqlstate != UNIQUE_VIOLATION_SQLSTATE:
+            return False
+        diagnostics = getattr(error, "diag", None)
+        constraint_name = getattr(diagnostics, "constraint_name", None) if diagnostics else None
+        return constraint_name == postgres_constraint
+
+    if isinstance(error, sqlite3.IntegrityError):
+        message = str(error)
+        return "UNIQUE constraint failed" in message and sqlite_qualified_column in message
+
+    return False
+
+
+def _log_release_errors(release_errors: list[Exception]) -> None:
+    """Surface degraded connection releases without masking the original error."""
+    # Imported lazily so the storage layer keeps no import-time dependency on
+    # the logging configuration.
+    import logging
+
+    from app.core.logging import get_logger, log_event
+
+    log_event(
+        get_logger(__name__),
+        logging.WARNING,
+        "storage.connection.release_failed",
+        failed_release_count=len(release_errors),
+        error_types=sorted({type(error).__name__ for error in release_errors}),
+    )
+
+
+def _register_connection(connection: Any) -> Any:
+    scope = _ACTIVE_CONNECTIONS.get()
+    if scope is not None:
+        scope.append(connection)
+    return connection
+
+
+@contextmanager
+def connection_scope() -> Iterator[None]:
+    """Release every connection acquired inside the block, on success or failure.
+
+    Nested scopes are independent: an inner scope only releases the connections
+    opened inside it. ``close()`` is idempotent, so connections a method already
+    closed on its own are left untouched.
+    """
+    token = _ACTIVE_CONNECTIONS.set([])
+    try:
+        yield
+    finally:
+        scope = _ACTIVE_CONNECTIONS.get() or []
+        _ACTIVE_CONNECTIONS.reset(token)
+        release_errors: list[Exception] = []
+        for connection in scope:
+            try:
+                connection.close()
+            except Exception as release_error:
+                # Releasing the remaining connections matters more than one
+                # failing release; a broken connection is dropped by the pool.
+                release_errors.append(release_error)
+        if release_errors:
+            _log_release_errors(release_errors)
+
+
+@contextmanager
+def db_session() -> Iterator[Any]:
+    """Read-oriented connection scope. Rolls back and releases on exit."""
+    connection = get_connection()
+    try:
+        yield connection
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+@contextmanager
+def db_transaction() -> Iterator[Any]:
+    """Write connection scope: commits on success, rolls back on failure."""
+    connection = get_connection()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def get_runtime_database_summary() -> dict[str, str | bool | int | None]:
@@ -318,11 +596,12 @@ def get_postgres_target_summary() -> dict[str, str | bool | int | None]:
 def check_runtime_database_connection() -> dict[str, str | bool]:
     backend = get_database_backend()
     try:
-        connection = get_connection()
-        cursor = connection.cursor()
-        cursor.execute("SELECT 1 AS ok")
-        cursor.fetchone()
-        connection.close()
+        # Readiness runs on every probe; a leaked connection here would drain the
+        # pool faster than any other code path.
+        with db_session() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1 AS ok")
+            cursor.fetchone()
     except Exception as exc:
         return {
             "ok": False,
@@ -332,6 +611,31 @@ def check_runtime_database_connection() -> dict[str, str | bool]:
     return {
         "ok": True,
         "detail": f"Runtime {backend} database accepted a SELECT 1 probe.",
+    }
+
+
+def check_database_schema_current() -> dict[str, Any]:
+    expected_versions = {version for version, _name, _migration in MIGRATIONS}
+    try:
+        with db_session() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT version FROM schema_migrations")
+            applied_versions = {str(row["version"]) for row in cursor.fetchall()}
+    except Exception as exc:
+        return {
+            "ok": False,
+            "missing_versions": sorted(expected_versions),
+            "detail": f"Schema migration ledger is unavailable: {type(exc).__name__}.",
+        }
+    missing_versions = sorted(expected_versions - applied_versions)
+    return {
+        "ok": not missing_versions,
+        "missing_versions": missing_versions,
+        "detail": (
+            "Database schema is current."
+            if not missing_versions
+            else f"Database schema is missing migrations: {', '.join(missing_versions)}."
+        ),
     }
 
 
@@ -1628,6 +1932,709 @@ def _create_inbound_message_receipt_indexes(cursor: Any) -> None:
     )
 
 
+def _create_company_contexts(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_contexts (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER,
+                company_slug TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_by TEXT,
+                UNIQUE(company_slug)
+            )
+            """
+        )
+        ensure_column = _ensure_postgres_column
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_contexts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER,
+                company_slug TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                schema_version INTEGER NOT NULL DEFAULT 1,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by TEXT,
+                UNIQUE(company_slug)
+            )
+            """
+        )
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "company_contexts", "company_id", "INTEGER")
+    ensure_column(cursor, "company_contexts", "schema_version", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(cursor, "company_contexts", "revision", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(cursor, "company_contexts", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "company_contexts", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "company_contexts", "updated_by", "TEXT")
+
+
+def _create_company_context_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_company_contexts_slug
+        ON company_contexts (company_slug)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_company_contexts_company
+        ON company_contexts (company_id)
+        """
+    )
+
+
+def _create_whatsapp_channel_bindings(cursor: Any) -> None:
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS whatsapp_channel_bindings (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id),
+                phone_number_id TEXT NOT NULL,
+                display_phone_number TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_by TEXT
+            )
+            """
+        )
+        ensure_column = _ensure_postgres_column
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS whatsapp_channel_bindings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                phone_number_id TEXT NOT NULL,
+                display_phone_number TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_by TEXT,
+                FOREIGN KEY (company_id) REFERENCES companies(id)
+            )
+            """
+        )
+        ensure_column = _ensure_sqlite_column
+
+    ensure_column(cursor, "whatsapp_channel_bindings", "display_phone_number", "TEXT")
+    ensure_column(cursor, "whatsapp_channel_bindings", "active", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(cursor, "whatsapp_channel_bindings", "created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "whatsapp_channel_bindings", "updated_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    ensure_column(cursor, "whatsapp_channel_bindings", "updated_by", "TEXT")
+
+
+def _create_whatsapp_channel_binding_indexes(cursor: Any) -> None:
+    # A phone_number_id may appear at most once among *active* bindings, so an
+    # inbound Meta event always resolves to exactly one company. Deactivated
+    # rows are kept for history and are excluded from the constraint.
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_bindings_active_phone
+        ON whatsapp_channel_bindings (phone_number_id)
+        WHERE active = 1
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_whatsapp_bindings_company
+        ON whatsapp_channel_bindings (company_id, active)
+        """
+    )
+
+
+def _create_identity_tables(cursor: Any) -> None:
+    """Create the human identity directory and revocable browser sessions."""
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saas_users (
+                id BIGSERIAL PRIMARY KEY,
+                email TEXT NOT NULL,
+                email_normalized TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                email_verified_at TIMESTAMPTZ,
+                last_login_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_memberships (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                user_id BIGINT NOT NULL REFERENCES saas_users(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                invited_by_user_id BIGINT REFERENCES saas_users(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (company_id, user_id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_invitations (
+                id BIGSERIAL PRIMARY KEY,
+                company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+                email TEXT NOT NULL,
+                email_normalized TEXT NOT NULL,
+                role TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                invited_by_user_id BIGINT NOT NULL REFERENCES saas_users(id) ON DELETE CASCADE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                accepted_at TIMESTAMPTZ,
+                revoked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES saas_users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                csrf_token_hash TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                revoked_at TIMESTAMPTZ,
+                user_agent TEXT,
+                ip_address TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES saas_users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMPTZ NOT NULL,
+                consumed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS saas_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                email_normalized TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                email_verified_at TIMESTAMP,
+                last_login_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS company_memberships (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                invited_by_user_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (company_id, user_id),
+                FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES saas_users(id) ON DELETE CASCADE,
+                FOREIGN KEY (invited_by_user_id) REFERENCES saas_users(id) ON DELETE SET NULL
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_invitations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                email TEXT NOT NULL,
+                email_normalized TEXT NOT NULL,
+                role TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                invited_by_user_id INTEGER NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                accepted_at TIMESTAMP,
+                revoked_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE CASCADE,
+                FOREIGN KEY (invited_by_user_id) REFERENCES saas_users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                csrf_token_hash TEXT NOT NULL,
+                expires_at TIMESTAMP NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                revoked_at TIMESTAMP,
+                user_agent TEXT,
+                ip_address TEXT,
+                FOREIGN KEY (user_id) REFERENCES saas_users(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TIMESTAMP NOT NULL,
+                consumed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES saas_users(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+
+def _create_identity_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memberships_user_active
+        ON company_memberships (user_id, active, company_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memberships_company_role
+        ON company_memberships (company_id, active, role)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_invitations_company_email
+        ON user_invitations (company_id, email_normalized, expires_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_sessions_user_expiry
+        ON user_sessions (user_id, expires_at, revoked_at)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_password_resets_user_expiry
+        ON password_reset_tokens (user_id, expires_at, consumed_at)
+        """
+    )
+
+
+def _create_reliable_job_state(cursor: Any) -> None:
+    """Add portable claims, retries, dead letters and distributed worker leases."""
+    ensure_column = (
+        _ensure_postgres_column
+        if get_database_backend() == "postgres"
+        else _ensure_sqlite_column
+    )
+    ensure_column(cursor, "outbound_messages", "channel", "TEXT")
+    ensure_column(cursor, "outbound_messages", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(cursor, "outbound_messages", "max_attempts", "INTEGER NOT NULL DEFAULT 5")
+    ensure_column(cursor, "outbound_messages", "next_attempt_at", "TIMESTAMP")
+    ensure_column(cursor, "outbound_messages", "claimed_at", "TIMESTAMP")
+    ensure_column(cursor, "outbound_messages", "claim_token", "TEXT")
+    ensure_column(cursor, "outbound_messages", "last_error", "TEXT")
+    ensure_column(cursor, "outbound_messages", "provider_message_id", "TEXT")
+    ensure_column(cursor, "outbound_messages", "provider_response_json", "TEXT")
+    ensure_column(cursor, "outbound_messages", "failed_at", "TIMESTAMP")
+
+    timestamp_type = "TIMESTAMPTZ" if get_database_backend() == "postgres" else "TIMESTAMP"
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS worker_leases (
+            lease_name TEXT PRIMARY KEY,
+            owner_token TEXT NOT NULL,
+            expires_at {timestamp_type} NOT NULL,
+            updated_at {timestamp_type} DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+
+def _create_reliable_job_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_outbound_dispatch_claim
+        ON outbound_messages (status, next_attempt_at, claimed_at, id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_outbound_company_dispatch
+        ON outbound_messages (company_id, status, next_attempt_at, id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_worker_leases_expiry
+        ON worker_leases (expires_at)
+        """
+    )
+
+
+def _create_reliable_reminder_state(cursor: Any) -> None:
+    ensure_column = (
+        _ensure_postgres_column
+        if get_database_backend() == "postgres"
+        else _ensure_sqlite_column
+    )
+    ensure_column(cursor, "customer_reminders", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(cursor, "customer_reminders", "max_attempts", "INTEGER NOT NULL DEFAULT 5")
+    ensure_column(cursor, "customer_reminders", "next_attempt_at", "TIMESTAMP")
+    ensure_column(cursor, "customer_reminders", "claimed_at", "TIMESTAMP")
+    ensure_column(cursor, "customer_reminders", "claim_token", "TEXT")
+    ensure_column(cursor, "customer_reminders", "last_error", "TEXT")
+    ensure_column(cursor, "customer_reminders", "failed_at", "TIMESTAMP")
+
+
+def _create_reliable_reminder_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_reminders_dispatch_claim
+        ON customer_reminders (
+            status,
+            audience,
+            next_attempt_at,
+            remind_at,
+            claimed_at,
+            id
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_reminders_company_dispatch_claim
+        ON customer_reminders (
+            company_id,
+            status,
+            next_attempt_at,
+            remind_at,
+            id
+        )
+        """
+    )
+
+
+def _create_billing_gateway_state(cursor: Any) -> None:
+    ensure_column = (
+        _ensure_postgres_column
+        if get_database_backend() == "postgres"
+        else _ensure_sqlite_column
+    )
+    ensure_column(cursor, "billing_plans", "currency", "TEXT NOT NULL DEFAULT 'brl'")
+    ensure_column(cursor, "billing_plans", "stripe_product_id", "TEXT")
+    ensure_column(cursor, "billing_plans", "stripe_monthly_price_id", "TEXT")
+    ensure_column(cursor, "billing_plans", "stripe_annual_price_id", "TEXT")
+
+    ensure_column(cursor, "billing_subscriptions", "gateway", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "stripe_price_id", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "payment_status", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "cancel_at_period_end", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(cursor, "billing_subscriptions", "grace_period_ends_at", "TIMESTAMP")
+    ensure_column(cursor, "billing_subscriptions", "last_invoice_id", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "gateway_event_created", "INTEGER")
+    ensure_column(cursor, "billing_subscriptions", "gateway_event_id", "TEXT")
+    ensure_column(cursor, "billing_subscriptions", "gateway_updated_at", "TIMESTAMP")
+
+    if get_database_backend() == "postgres":
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_webhook_events (
+                id BIGSERIAL PRIMARY KEY,
+                provider TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_created INTEGER NOT NULL,
+                livemode INTEGER NOT NULL DEFAULT 0,
+                company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'processing',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT,
+                processed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (provider, event_id)
+            )
+            """
+        )
+    else:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS billing_webhook_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                event_created INTEGER NOT NULL,
+                livemode INTEGER NOT NULL DEFAULT 0,
+                company_id INTEGER,
+                payload_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'processing',
+                attempt_count INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT,
+                processed_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (provider, event_id),
+                FOREIGN KEY (company_id) REFERENCES companies(id) ON DELETE SET NULL
+            )
+            """
+        )
+
+
+def _create_billing_gateway_indexes(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_plan_stripe_monthly_price
+        ON billing_plans (stripe_monthly_price_id)
+        WHERE stripe_monthly_price_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_plan_stripe_annual_price
+        ON billing_plans (stripe_annual_price_id)
+        WHERE stripe_annual_price_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_subscription_stripe_id
+        ON billing_subscriptions (stripe_subscription_id)
+        WHERE stripe_subscription_id IS NOT NULL
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_billing_subscription_customer
+        ON billing_subscriptions (stripe_customer_id, company_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_billing_webhook_status_created
+        ON billing_webhook_events (status, created_at)
+        """
+    )
+
+
+def _constraint_exists(cursor: Any, *, table: str, constraint: str) -> bool:
+    cursor.execute(
+        """
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = ?
+          AND conrelid = ?::regclass
+        """,
+        (constraint, table),
+    )
+    return cursor.fetchone() is not None
+
+
+def _create_tenant_integrity_guards(cursor: Any) -> None:
+    """Reject orphan and cross-tenant references at the database boundary."""
+    backend = get_database_backend()
+    for table in TENANT_REFERENCE_TABLES:
+        # Identifier comes from immutable migration metadata.
+        orphan_query = f"""
+            SELECT COUNT(*) AS total
+            FROM {table} AS tenant_row
+            WHERE tenant_row.company_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM companies AS company
+                  WHERE company.id = tenant_row.company_id
+              )
+            """  # nosec B608
+        cursor.execute(orphan_query)
+        orphan_count = int(cursor.fetchone()["total"] or 0)
+        if orphan_count:
+            raise RuntimeError(
+                f"Tenant integrity migration blocked: {table} has "
+                f"{orphan_count} orphan company reference(s)."
+            )
+
+        if backend == "postgres":
+            constraint = f"fk_{table}_company"
+            if not _constraint_exists(
+                cursor,
+                table=table,
+                constraint=constraint,
+            ):
+                cursor.execute(
+                    f"""
+                    ALTER TABLE {table}
+                    ADD CONSTRAINT {constraint}
+                    FOREIGN KEY (company_id)
+                    REFERENCES companies(id)
+                    ON DELETE RESTRICT
+                    NOT VALID
+                    """
+                )
+                cursor.execute(
+                    f"ALTER TABLE {table} VALIDATE CONSTRAINT {constraint}"
+                )
+            continue
+
+        trigger_prefix = f"trg_{table}_company"
+        # Identifiers come from immutable migration metadata.
+        insert_company_trigger = f"""
+            CREATE TRIGGER IF NOT EXISTS {trigger_prefix}_insert
+            BEFORE INSERT ON {table}
+            WHEN NEW.company_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM companies WHERE id = NEW.company_id
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid tenant company reference');
+            END
+            """  # nosec B608
+        cursor.execute(insert_company_trigger)
+        update_company_trigger = f"""
+            CREATE TRIGGER IF NOT EXISTS {trigger_prefix}_update
+            BEFORE UPDATE OF company_id ON {table}
+            WHEN NEW.company_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM companies WHERE id = NEW.company_id
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'invalid tenant company reference');
+            END
+            """  # nosec B608
+        cursor.execute(update_company_trigger)
+
+    parent_tables = {parent for _child, _column, parent in TENANT_REFERENTIAL_LINKS}
+    for parent in parent_tables:
+        cursor.execute(
+            f"""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_{parent}_id_company
+            ON {parent} (id, company_id)
+            """
+        )
+
+    for child, column, parent in TENANT_REFERENTIAL_LINKS:
+        # Identifiers come from immutable migration metadata.
+        tenant_mismatch_query = f"""
+            SELECT COUNT(*) AS total
+            FROM {child} AS child_row
+            JOIN {parent} AS parent_row
+              ON parent_row.id = child_row.{column}
+            WHERE child_row.{column} IS NOT NULL
+              AND child_row.company_id IS NOT NULL
+              AND (
+                  parent_row.company_id IS NULL
+                  OR parent_row.company_id <> child_row.company_id
+              )
+            """  # nosec B608
+        cursor.execute(tenant_mismatch_query)
+        mismatch_count = int(cursor.fetchone()["total"] or 0)
+        if mismatch_count:
+            raise RuntimeError(
+                f"Tenant integrity migration blocked: {child}.{column} has "
+                f"{mismatch_count} cross-tenant reference(s)."
+            )
+
+        suffix = f"{child}_{column}_tenant"
+        if backend == "postgres":
+            constraint = f"fk_{suffix}"
+            if not _constraint_exists(
+                cursor,
+                table=child,
+                constraint=constraint,
+            ):
+                cursor.execute(
+                    f"""
+                    ALTER TABLE {child}
+                    ADD CONSTRAINT {constraint}
+                    FOREIGN KEY ({column}, company_id)
+                    REFERENCES {parent} (id, company_id)
+                    ON DELETE RESTRICT
+                    NOT VALID
+                    """
+                )
+                cursor.execute(
+                    f"ALTER TABLE {child} VALIDATE CONSTRAINT {constraint}"
+                )
+            continue
+
+        insert_reference_trigger = f"""
+            CREATE TRIGGER IF NOT EXISTS trg_{suffix}_insert
+            BEFORE INSERT ON {child}
+            WHEN NEW.{column} IS NOT NULL
+              AND NEW.company_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {parent}
+                  WHERE id = NEW.{column}
+                    AND company_id = NEW.company_id
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'cross-tenant reference rejected');
+            END
+            """  # nosec B608
+        cursor.execute(insert_reference_trigger)
+        update_reference_trigger = f"""
+            CREATE TRIGGER IF NOT EXISTS trg_{suffix}_update
+            BEFORE UPDATE OF {column}, company_id ON {child}
+            WHEN NEW.{column} IS NOT NULL
+              AND NEW.company_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {parent}
+                  WHERE id = NEW.{column}
+                    AND company_id = NEW.company_id
+              )
+            BEGIN
+                SELECT RAISE(ABORT, 'cross-tenant reference rejected');
+            END
+            """  # nosec B608
+        cursor.execute(update_reference_trigger)
+
+
+def _import_company_context_seed_files(cursor: Any) -> None:
+    """Idempotently import the file-based seed contexts into the database.
+
+    Runs inside the migration transaction. Existing rows are never overwritten,
+    so a newer database context always wins over an older seed file.
+    """
+    from app.core.company_context import import_seed_contexts_with_cursor
+
+    import_seed_contexts_with_cursor(cursor)
+
+
 SQLITE_ID_TABLES_BILLING = {"billing_plans", "billing_subscriptions", "billing_usage_records"}
 
 
@@ -1669,6 +2676,20 @@ MIGRATIONS: list[Migration] = [
     ("021_audit_event_context_indexes", "Create audit event context indexes", _create_audit_event_context_indexes),
     ("022_contact_company_profiles", "Create tenant-scoped contact profiles", _create_contact_company_profiles),
     ("023_contact_company_profile_indexes", "Create contact profile indexes", _create_contact_company_profile_indexes),
+    ("024_company_contexts", "Create durable company context table", _create_company_contexts),
+    ("025_company_context_indexes", "Create company context indexes", _create_company_context_indexes),
+    ("026_company_context_seed_import", "Import file-based company contexts", _import_company_context_seed_files),
+    ("027_whatsapp_channel_bindings", "Create WhatsApp channel to company bindings", _create_whatsapp_channel_bindings),
+    ("028_whatsapp_channel_binding_indexes", "Create WhatsApp channel binding indexes", _create_whatsapp_channel_binding_indexes),
+    ("029_human_identity", "Create users, memberships, invitations and sessions", _create_identity_tables),
+    ("030_human_identity_indexes", "Create identity and session indexes", _create_identity_indexes),
+    ("031_reliable_job_state", "Add outbound claims, retries and worker leases", _create_reliable_job_state),
+    ("032_reliable_job_indexes", "Create outbound and worker lease indexes", _create_reliable_job_indexes),
+    ("033_billing_gateway_state", "Add Stripe billing state and webhook ledger", _create_billing_gateway_state),
+    ("034_billing_gateway_indexes", "Create Stripe billing and event indexes", _create_billing_gateway_indexes),
+    ("035_tenant_integrity", "Enforce tenant and cross-tenant references", _create_tenant_integrity_guards),
+    ("036_reliable_reminder_state", "Add reminder claims, retries and dead letters", _create_reliable_reminder_state),
+    ("037_reliable_reminder_indexes", "Create reminder dispatch claim indexes", _create_reliable_reminder_indexes),
 ]
 
 
@@ -1712,7 +2733,23 @@ def _record_migration(cursor: Any, version: str, name: str) -> None:
     )
 
 
+def _acquire_migration_lock(cursor: Any) -> None:
+    """Serialize migrations across processes on Postgres.
+
+    The API and the worker boot concurrently and both call ``init_db()``. The
+    lock is transaction-scoped, so it is released by the commit/rollback in
+    ``init_db``. SQLite acquires its write lock before reading the migration
+    ledger in ``init_db``; a deferred transaction would allow two processes to
+    read the same stale ledger and then race while recording a version.
+    """
+    if get_database_backend() != "postgres":
+        return
+    cursor.execute("SELECT pg_advisory_xact_lock(?)", (MIGRATION_ADVISORY_LOCK_KEY,))
+    cursor.fetchone()
+
+
 def _run_migrations(cursor: Any) -> None:
+    _acquire_migration_lock(cursor)
     _ensure_schema_migrations_table(cursor)
     applied_versions = _get_applied_migration_versions(cursor)
 
@@ -1724,8 +2761,16 @@ def _run_migrations(cursor: Any) -> None:
 
 
 def init_db() -> None:
-    connection = get_connection()
-    cursor = connection.cursor()
-    _run_migrations(cursor)
-    connection.commit()
-    connection.close()
+    # A failed migration must roll back and release the connection; on Postgres
+    # that also drops the transaction-scoped advisory lock, so a crashed boot
+    # cannot block every other process from migrating.
+    with db_transaction() as connection:
+        cursor = connection.cursor()
+        if get_database_backend() == "sqlite":
+            # SQLite transactions are deferred by default. Acquire the reserved
+            # write lock before inspecting schema_migrations so concurrent
+            # Uvicorn workers cannot both decide that the same migration is
+            # pending. The second worker waits, then observes the committed
+            # ledger and skips already-applied migrations.
+            cursor.execute("BEGIN IMMEDIATE")
+        _run_migrations(cursor)

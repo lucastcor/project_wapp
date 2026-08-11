@@ -5,6 +5,13 @@ from urllib.parse import urlparse
 from app.core.company_context import get_company_context_status
 from app.core.config import is_missing_or_placeholder, settings
 from app.services.calendar_service import get_calendar_profile
+from app.services.ingress_auth_service import (
+    get_configured_internal_ingress_secret,
+    internal_ingress_enforced,
+    normalized_whatsapp_ingress_enabled,
+    normalized_whatsapp_ingress_is_safe,
+)
+from app.services.rate_limit_service import check_shared_state_connection
 from app.services.training_export_service import get_finetuning_readiness_report
 from app.storage.db import (
     check_postgres_target_connection,
@@ -82,6 +89,89 @@ def _whatsapp_provider_credentials_are_real() -> bool:
     )
 
 
+def _stripe_configuration_status() -> dict[str, Any]:
+    required_values = {
+        "STRIPE_SECRET_KEY": settings.stripe_secret_key,
+        "STRIPE_WEBHOOK_SECRET": settings.stripe_webhook_secret,
+        "STRIPE_SUCCESS_URL": settings.stripe_success_url,
+        "STRIPE_CANCEL_URL": settings.stripe_cancel_url,
+        "STRIPE_PORTAL_RETURN_URL": settings.stripe_portal_return_url,
+        "STRIPE_PRICE_ESSENCIAL_MONTHLY": settings.stripe_price_essencial_monthly,
+        "STRIPE_PRICE_ESSENCIAL_ANNUAL": settings.stripe_price_essencial_annual,
+        "STRIPE_PRICE_AVANCADO_MONTHLY": settings.stripe_price_avancado_monthly,
+        "STRIPE_PRICE_AVANCADO_ANNUAL": settings.stripe_price_avancado_annual,
+        "STRIPE_PRICE_PREMIUM_MONTHLY": settings.stripe_price_premium_monthly,
+        "STRIPE_PRICE_PREMIUM_ANNUAL": settings.stripe_price_premium_annual,
+    }
+    missing = [
+        key
+        for key, value in required_values.items()
+        if not _has_real_secret(value)
+    ]
+    invalid_urls = []
+    for key in ("STRIPE_SUCCESS_URL", "STRIPE_CANCEL_URL", "STRIPE_PORTAL_RETURN_URL"):
+        value = str(required_values[key] or "").strip()
+        parsed = urlparse(value)
+        if value and (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or str(parsed.hostname or "").endswith("example.com")
+            or (
+                _production_guard_enabled()
+                and parsed.scheme != "https"
+            )
+        ):
+            invalid_urls.append(key)
+    invalid_identifiers = []
+    expected_prefixes = {
+        "STRIPE_SECRET_KEY": "sk_",
+        "STRIPE_WEBHOOK_SECRET": "whsec_",
+        "STRIPE_PRICE_ESSENCIAL_MONTHLY": "price_",
+        "STRIPE_PRICE_ESSENCIAL_ANNUAL": "price_",
+        "STRIPE_PRICE_AVANCADO_MONTHLY": "price_",
+        "STRIPE_PRICE_AVANCADO_ANNUAL": "price_",
+        "STRIPE_PRICE_PREMIUM_MONTHLY": "price_",
+        "STRIPE_PRICE_PREMIUM_ANNUAL": "price_",
+    }
+    for key, expected_prefix in expected_prefixes.items():
+        value = str(required_values[key] or "").strip()
+        if value and not value.startswith(expected_prefix):
+            invalid_identifiers.append(key)
+    return {
+        "ok": not missing and not invalid_urls and not invalid_identifiers,
+        "missing": missing,
+        "invalid_urls": invalid_urls,
+        "invalid_identifiers": invalid_identifiers,
+    }
+
+
+def _transactional_email_configuration_status() -> dict[str, Any]:
+    provider = settings.transactional_email_provider
+    sender = str(settings.transactional_email_from or "").strip()
+    public_url = str(settings.platform_public_url or "").strip()
+    parsed_url = urlparse(public_url)
+    url_ok = bool(
+        parsed_url.scheme in {"http", "https"}
+        and parsed_url.netloc
+        and not str(parsed_url.hostname or "").endswith("example.com")
+        and (
+            not _production_guard_enabled()
+            or parsed_url.scheme == "https"
+        )
+    )
+    return {
+        "ok": bool(
+            provider == "resend"
+            and _has_real_secret(settings.resend_api_key)
+            and "@" in sender
+            and url_ok
+        ),
+        "provider": provider,
+        "sender_configured": "@" in sender,
+        "public_url_valid": url_ok,
+    }
+
+
 def _configured_postgres_urls() -> list[str]:
     urls: list[str] = []
     for configured_url in [settings.database_url, settings.postgres_database_url]:
@@ -123,6 +213,61 @@ def _configured_reminder_worker_audiences() -> list[str]:
     return normalized or ["customer", "internal"]
 
 
+def _whatsapp_channel_binding_status() -> dict[str, Any]:
+    """The configured business number must map to exactly one active company.
+
+    A signed Meta event resolves its tenant from this binding, so zero or
+    multiple matches means inbound traffic would fail closed.
+    """
+    configured_phone_number_id = str(settings.whatsapp_phone_number_id or "").strip()
+    if not configured_phone_number_id:
+        return {
+            "ok": False,
+            "detail": "WHATSAPP_PHONE_NUMBER_ID não configurado; eventos do Meta não resolvem empresa.",
+        }
+
+    try:
+        bindings = repository.get_whatsapp_bindings(active_only=True)
+    except Exception as exc:  # pragma: no cover - defensive readiness probe
+        return {"ok": False, "detail": f"Falha ao ler os vínculos de canal: {exc}"}
+
+    matching = [
+        binding
+        for binding in bindings
+        if str(binding.get("phone_number_id") or "") == configured_phone_number_id
+    ]
+    if not matching:
+        return {
+            "ok": False,
+            "detail": (
+                f"Nenhum vínculo ativo para o phone_number_id configurado "
+                f"({_mask_phone_number_id(configured_phone_number_id)})."
+            ),
+        }
+    if len(matching) > 1:
+        return {
+            "ok": False,
+            "detail": (
+                f"Vínculo ambíguo: {len(matching)} empresas ativas para o mesmo phone_number_id "
+                f"({_mask_phone_number_id(configured_phone_number_id)})."
+            ),
+        }
+
+    return {
+        "ok": True,
+        "detail": (
+            f"phone_number_id {_mask_phone_number_id(configured_phone_number_id)} vinculado à "
+            f"empresa {matching[0]['company_id']}."
+        ),
+    }
+
+
+def _mask_phone_number_id(phone_number_id: str) -> str:
+    if len(phone_number_id) <= 4:
+        return phone_number_id
+    return f"***{phone_number_id[-4:]}"
+
+
 def get_system_profile() -> dict[str, Any]:
     runtime_database = get_runtime_database_summary()
     postgres_target = get_postgres_target_summary()
@@ -151,6 +296,19 @@ def get_system_profile() -> dict[str, Any]:
             "rate_limiting_enabled": settings.enable_rate_limiting,
             "rate_limit_window_seconds": settings.rate_limit_window_seconds,
             "audit_retention_days": settings.audit_retention_days,
+        },
+        "billing": {
+            "provider": "stripe",
+            "configured": bool(_stripe_configuration_status()["ok"]),
+            "enforcement_enabled": settings.enable_billing_enforcement,
+            "grace_period_days": settings.billing_grace_period_days,
+        },
+        "identity": {
+            "self_service_signup_enabled": settings.enable_self_service_signup,
+            "transactional_email_provider": settings.transactional_email_provider,
+            "transactional_email_configured": bool(
+                _transactional_email_configuration_status()["ok"]
+            ),
         },
         "ai": {
             "openai_configured": _has_real_secret(settings.openai_api_key),
@@ -203,6 +361,7 @@ def get_system_readiness() -> dict[str, Any]:
     configured_roles = _configured_admin_roles()
     calendar_profile = get_calendar_profile()
     hygiene_summary = repository.get_operational_hygiene_summary()
+    shared_state_probe = check_shared_state_connection()
     production_guard_enabled = _production_guard_enabled()
 
     checks: list[dict[str, str | None]] = []
@@ -219,6 +378,84 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+    shared_state_required = settings.require_shared_state
+    shared_state_ok = bool(shared_state_probe["ok"])
+    checks.append(
+        _make_check(
+            code="shared_state",
+            title="Estado distribuído",
+            status="pass" if shared_state_ok else ("fail" if shared_state_required else "warn"),
+            severity="blocker" if shared_state_required else "warning",
+            detail=str(shared_state_probe["detail"]),
+            recommendation=(
+                "Configurar REDIS_URL e REQUIRE_SHARED_STATE=true antes de escalar "
+                "API/realtime/rate limiting horizontalmente."
+            )
+            if not shared_state_ok
+            else None,
+        )
+    )
+    stripe_status = _stripe_configuration_status()
+    stripe_required = settings.enable_billing_enforcement
+    stripe_detail = (
+        "Stripe Checkout, Customer Portal, webhook e catálogo de preços configurados."
+        if stripe_status["ok"]
+        else (
+            "Configuração Stripe incompleta. "
+            f"Ausentes: {', '.join(stripe_status['missing']) or 'nenhum'}; "
+            f"URLs inválidas: {', '.join(stripe_status['invalid_urls']) or 'nenhuma'}; "
+            "identificadores inválidos: "
+            f"{', '.join(stripe_status['invalid_identifiers']) or 'nenhum'}."
+        )
+    )
+    checks.append(
+        _make_check(
+            code="stripe_billing",
+            title="Cobrança Stripe",
+            status=(
+                "pass"
+                if stripe_status["ok"]
+                else ("fail" if stripe_required else "warn")
+            ),
+            severity="blocker" if stripe_required else "warning",
+            detail=stripe_detail,
+            recommendation=(
+                "Configurar chaves, URLs HTTPS, webhook e os seis Price IDs do Stripe "
+                "antes de habilitar ENABLE_BILLING_ENFORCEMENT=true."
+            )
+            if not stripe_status["ok"]
+            else None,
+        )
+    )
+    email_status = _transactional_email_configuration_status()
+    email_required = settings.enable_self_service_signup
+    checks.append(
+        _make_check(
+            code="transactional_email",
+            title="E-mail transacional",
+            status=(
+                "pass"
+                if email_status["ok"]
+                else ("fail" if email_required else "warn")
+            ),
+            severity="blocker" if email_required else "warning",
+            detail=(
+                "Resend configurado para convites e redefinição de senha."
+                if email_status["ok"]
+                else (
+                    f"Provider: {email_status['provider']}; "
+                    f"remetente configurado: {email_status['sender_configured']}; "
+                    f"URL pública válida: {email_status['public_url_valid']}."
+                )
+            ),
+            recommendation=(
+                "Configurar TRANSACTIONAL_EMAIL_PROVIDER=resend, RESEND_API_KEY, "
+                "TRANSACTIONAL_EMAIL_FROM e PLATFORM_PUBLIC_URL antes de habilitar signup."
+            )
+            if not email_status["ok"]
+            else None,
+        )
+    )
     checks.append(
         _make_check(
             code="global_company_context",
@@ -232,6 +469,70 @@ def get_system_readiness() -> dict[str, Any]:
             ),
             recommendation="Corrigir ou recriar o company_context global."
             if not global_context["is_valid"]
+            else None,
+        )
+    )
+
+    context_persisted_in_database = str(global_context.get("source")) == "database"
+    checks.append(
+        _make_check(
+            code="company_context_persistence",
+            title="Persistência do company context",
+            status="pass" if context_persisted_in_database else ("fail" if production_guard_enabled else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Company context global carregado do banco compartilhado."
+                if context_persisted_in_database
+                else f"Company context global resolvido de: {global_context.get('source')}."
+            ),
+            recommendation=(
+                "Executar `python -m app.tools.bootstrap_company_contexts` para importar os "
+                "contextos de seed para o banco antes de operar em produção."
+            )
+            if not context_persisted_in_database
+            else None,
+        )
+    )
+
+    normalized_ingress_safe = normalized_whatsapp_ingress_is_safe()
+    checks.append(
+        _make_check(
+            code="normalized_ingress_security",
+            title="Ingress normalizado",
+            status="pass" if normalized_ingress_safe else "fail",
+            severity="blocker",
+            detail=(
+                "Ingress normalizado desabilitado."
+                if not normalized_whatsapp_ingress_enabled()
+                else "Ingress normalizado habilitado com INTERNAL_INGRESS_SECRET real."
+                if normalized_ingress_safe
+                else "ENABLE_NORMALIZED_WHATSAPP_INGRESS=true sem INTERNAL_INGRESS_SECRET válido."
+            ),
+            recommendation="Definir INTERNAL_INGRESS_SECRET forte ou desabilitar ENABLE_NORMALIZED_WHATSAPP_INGRESS."
+            if not normalized_ingress_safe
+            else None,
+        )
+    )
+
+    internal_ingress_secret_configured = get_configured_internal_ingress_secret() is not None
+    internal_ingress_status = (
+        "pass"
+        if internal_ingress_secret_configured
+        else ("fail" if internal_ingress_enforced() else "warn")
+    )
+    checks.append(
+        _make_check(
+            code="internal_ingress_secret",
+            title="Segredo de ingress interno",
+            status=internal_ingress_status,
+            severity="blocker" if internal_ingress_enforced() else "warning",
+            detail=(
+                "INTERNAL_INGRESS_SECRET configurado com valor não-placeholder."
+                if internal_ingress_secret_configured
+                else "INTERNAL_INGRESS_SECRET ausente ou usando valor placeholder."
+            ),
+            recommendation="Definir INTERNAL_INGRESS_SECRET para autenticar /messages/incoming fora de desenvolvimento."
+            if not internal_ingress_secret_configured
             else None,
         )
     )
@@ -458,6 +759,24 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+    binding_status = _whatsapp_channel_binding_status()
+    binding_required = settings.outbound_provider == "whatsapp" or production_guard_enabled
+    checks.append(
+        _make_check(
+            code="whatsapp_channel_binding",
+            title="Vínculo do número WhatsApp",
+            status="pass" if binding_status["ok"] else ("fail" if binding_required else "warn"),
+            severity="blocker" if binding_required else "warning",
+            detail=str(binding_status["detail"]),
+            recommendation=(
+                "Vincular o WHATSAPP_PHONE_NUMBER_ID a exatamente uma empresa ativa via "
+                "PUT /admin/whatsapp/bindings antes de receber eventos reais do Meta."
+            )
+            if not binding_status["ok"]
+            else None,
+        )
+    )
+
     calendar_required = production_guard_enabled and settings.calendar_provider.strip().lower() != "mock"
     calendar_ready = bool(calendar_profile["provider_readiness"]["ready"])
     checks.append(
@@ -556,7 +875,7 @@ def get_system_readiness() -> dict[str, Any]:
 
     overall_status = "blocked" if has_blockers else ("warning" if has_warnings else "ready")
     pilot_ready = not has_blockers
-    scale_ready = pilot_ready and bool(postgres_probe["ok"])
+    scale_ready = pilot_ready and bool(postgres_probe["ok"]) and shared_state_ok
 
     return {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -649,11 +968,11 @@ def get_onboarding_status(
             status="pass" if context_status["is_valid"] else "fail",
             severity="blocker",
             detail=(
-                f"Contexto válido carregado de {context_status['resolved_path']}."
+                f"Contexto válido carregado de {context_status.get('source') or 'desconhecido'}."
                 if context_status["is_valid"]
                 else str(context_status["error"])
             ),
-            recommendation="Revisar o JSON de contexto e garantir todas as chaves obrigatórias."
+            recommendation="Revisar o contexto e garantir todas as chaves obrigatórias."
             if not context_status["is_valid"]
             else None,
         )

@@ -2,7 +2,7 @@
 title: Secrets e Ambiente
 type: security
 tags: [segurança, secrets, env]
-updated: 2026-04-28
+updated: 2026-07-26
 ---
 
 # Secrets e Ambiente
@@ -31,11 +31,16 @@ def is_missing_or_placeholder(value):
 
 Usado no readiness para flaggar:
 - `PLATFORM_SESSION_SECRET`
+- `INTERNAL_INGRESS_SECRET`
 - `ADMIN_*_TOKEN`
 - `OPENAI_API_KEY`
 - `WHATSAPP_APP_SECRET`
 - `WHATSAPP_API_TOKEN`
 - URLs Postgres (parcialmente)
+
+O mesmo detector governa o runtime, não só o relatório: um
+`INTERNAL_INGRESS_SECRET=change-me-...` é tratado como **não configurado**, então
+o ingress normalizado responde `503` em vez de aceitar o placeholder.
 
 ## Categorias de secret
 
@@ -46,6 +51,7 @@ Usado no readiness para flaggar:
 - `ADMIN_OPERATOR_TOKEN`
 - `ADMIN_SUPERADMIN_TOKEN`
 - `PLATFORM_SESSION_SECRET`
+- `INTERNAL_INGRESS_SECRET`
 
 ### Externas (provider real)
 - `OPENAI_API_KEY`
@@ -73,6 +79,23 @@ Usado no readiness para flaggar:
 - `contact_id`: passa por `mask_identifier` antes de logar.
 - Mensagem completa: **não** é logada (só metadata).
 - Tokens: nunca logados.
+
+## Portabilidade e credenciais persistidas
+
+O caminho preferido continua sendo variável de ambiente/cofre. Entretanto,
+`calendar_integrations.config_json` aceita configuração por tenant e instalações
+legadas podem conter `client_secret` ou `refresh_token` persistidos.
+
+Por isso backup e migração não presumem que o banco esteja livre de secrets:
+
+- chaves sensíveis em JSON são removidas recursivamente;
+- identificadores públicos (`client_id`, `calendar_id`, `phone_number_id`) são
+  preservados;
+- integração afetada é desativada e marcada para reconfiguração;
+- restore recusa credencial estruturada em texto claro.
+
+Backups v2 são gravados em `0600`, mas ainda carregam PII. Usar storage
+criptografado e controle de acesso continua obrigatório.
 
 ## Recomendações operacionais
 

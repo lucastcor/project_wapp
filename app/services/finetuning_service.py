@@ -6,6 +6,11 @@ from typing import Any
 from openai import APIError, OpenAI
 
 from app.core.config import settings
+from app.services.billing_service import (
+    BillingLimitError,
+    refund_usage_reservation,
+    require_usage_capacity,
+)
 from app.core.logging import get_logger, log_event
 from app.storage.repository import RuntimeRepository
 from app.services.training_export_service import (
@@ -103,6 +108,26 @@ class FineTuningService:
             )
 
         resolved_company_id = self._require_company_id(company_id)
+        try:
+            billing_decision = require_usage_capacity(
+                company_id=resolved_company_id,
+                metric="finetuning_jobs",
+            )
+        except BillingLimitError as exc:
+            raise FineTuningError(str(exc)) from exc
+        try:
+            return self._create_reserved_finetuning_job(resolved_company_id)
+        except Exception:
+            refund_usage_reservation(
+                company_id=resolved_company_id,
+                decision=billing_decision,
+            )
+            raise
+
+    def _create_reserved_finetuning_job(
+        self,
+        resolved_company_id: int,
+    ) -> dict[str, Any]:
         log_event(
             logger,
             logging.INFO,

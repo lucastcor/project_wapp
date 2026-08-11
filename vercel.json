@@ -1,0 +1,10 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "functions": {
+    "app/index.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{tests/**,docs/**,.venv/**,.pytest_cache/**,.mypy_cache/**,.ruff_cache/**,app/ui/**,app/admin_app.py,project_wapp_documentacao_oficial.docx,requirements-admin*,requirements-dev*}"
+    }
+  }
+}

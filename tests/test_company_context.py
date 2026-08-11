@@ -1,14 +1,20 @@
+"""Validation rules of the company context payload."""
+
 import copy
 
 import pytest
 
-from app.core.company_context import CompanyContextError, get_company_context, save_company_context
+from app.core.company_context import (
+    CompanyContextError,
+    get_company_context,
+    save_company_context,
+)
+
+COMPANY_SLUG = "context-validation-tenant"
 
 
-def test_save_company_context_accepts_conversation_pipelines(tmp_path, monkeypatch) -> None:
-    context = get_company_context()
-    monkeypatch.setattr("app.core.company_context.COMPANY_CONTEXT_PATH", tmp_path / "company_context.json")
-    updated_context = copy.deepcopy(context)
+def test_save_company_context_accepts_conversation_pipelines() -> None:
+    updated_context = copy.deepcopy(get_company_context())
     updated_context["conversation_pipelines"] = [
         {
             "key": "lead_capture",
@@ -26,16 +32,15 @@ def test_save_company_context_accepts_conversation_pipelines(tmp_path, monkeypat
         },
     ]
 
-    result = save_company_context(updated_context)
+    result = save_company_context(updated_context, company_slug=COMPANY_SLUG)
 
     assert result["conversation_pipelines"][0]["key"] == "lead_capture"
     assert result["conversation_pipelines"][1]["next_keys"] == []
+    assert get_company_context(company_slug=COMPANY_SLUG)["conversation_pipelines"][0]["key"] == "lead_capture"
 
 
-def test_save_company_context_rejects_unknown_pipeline_transition(tmp_path, monkeypatch) -> None:
-    context = get_company_context()
-    monkeypatch.setattr("app.core.company_context.COMPANY_CONTEXT_PATH", tmp_path / "company_context.json")
-    updated_context = copy.deepcopy(context)
+def test_save_company_context_rejects_unknown_pipeline_transition() -> None:
+    updated_context = copy.deepcopy(get_company_context())
     updated_context["conversation_pipelines"] = [
         {
             "key": "lead_capture",
@@ -45,4 +50,9 @@ def test_save_company_context_rejects_unknown_pipeline_transition(tmp_path, monk
     ]
 
     with pytest.raises(CompanyContextError):
-        save_company_context(updated_context)
+        save_company_context(updated_context, company_slug=COMPANY_SLUG)
+
+
+def test_save_company_context_rejects_missing_required_keys() -> None:
+    with pytest.raises(CompanyContextError):
+        save_company_context({"company_name": "Sem chaves"}, company_slug=COMPANY_SLUG)

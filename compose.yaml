@@ -22,14 +22,51 @@ services:
       retries: 10
       start_period: 10s
 
+  redis:
+    image: redis:7.4-alpine
+    container_name: project_wapp_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  migrate:
+    build:
+      context: .
+      target: api
+    container_name: project_wapp_migrate
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "app.tools.run_migrations"]
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
+      RUN_MIGRATIONS_ON_STARTUP: "true"
+
   api:
     build:
       context: .
+      target: api
     container_name: project_wapp_api
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-production}
       DEBUG: ${DEBUG:-false}
@@ -37,6 +74,9 @@ services:
       POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
+      RUN_MIGRATIONS_ON_STARTUP: "false"
+      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://redis:6379/0}
+      REQUIRE_SHARED_STATE: ${REQUIRE_SHARED_STATE:-true}
       OPERATIONS_BACKUP_DIR: ${OPERATIONS_BACKUP_DIR:-/app/backups}
       LOG_JSON: ${LOG_JSON:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -48,14 +88,48 @@ services:
       RATE_LIMIT_INCOMING_REQUESTS: ${RATE_LIMIT_INCOMING_REQUESTS:-120}
       RATE_LIMIT_WEBHOOK_REQUESTS: ${RATE_LIMIT_WEBHOOK_REQUESTS:-300}
       RATE_LIMIT_EXEMPT_LOCALHOST: ${RATE_LIMIT_EXEMPT_LOCALHOST:-false}
+      TRUST_PROXY_HEADERS: ${TRUST_PROXY_HEADERS:-false}
       ENABLE_ADMIN_AUTH: ${ENABLE_ADMIN_AUTH:-true}
       ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
       ADMIN_VIEWER_TOKEN: ${ADMIN_VIEWER_TOKEN:-}
       ADMIN_OPERATOR_TOKEN: ${ADMIN_OPERATOR_TOKEN:-}
       ADMIN_SUPERADMIN_TOKEN: ${ADMIN_SUPERADMIN_TOKEN:-}
+      ADMIN_VIEWER_COMPANY_IDS: ${ADMIN_VIEWER_COMPANY_IDS:-}
+      ADMIN_OPERATOR_COMPANY_IDS: ${ADMIN_OPERATOR_COMPANY_IDS:-}
+      ADMIN_SUPERADMIN_COMPANY_IDS: ${ADMIN_SUPERADMIN_COMPANY_IDS:-}
+      PLATFORM_SESSION_SECRET: ${PLATFORM_SESSION_SECRET:-}
+      PLATFORM_SESSION_TTL_SECONDS: ${PLATFORM_SESSION_TTL_SECONDS:-28800}
+      IDENTITY_SESSION_TTL_SECONDS: ${IDENTITY_SESSION_TTL_SECONDS:-43200}
+      IDENTITY_INVITATION_TTL_HOURS: ${IDENTITY_INVITATION_TTL_HOURS:-72}
+      IDENTITY_PASSWORD_RESET_TTL_MINUTES: ${IDENTITY_PASSWORD_RESET_TTL_MINUTES:-30}
+      ENABLE_SELF_SERVICE_SIGNUP: ${ENABLE_SELF_SERVICE_SIGNUP:-false}
+      IDENTITY_EXPOSE_ACTION_TOKENS: ${IDENTITY_EXPOSE_ACTION_TOKENS:-false}
+      PLATFORM_PUBLIC_URL: ${PLATFORM_PUBLIC_URL:-}
+      TRANSACTIONAL_EMAIL_PROVIDER: ${TRANSACTIONAL_EMAIL_PROVIDER:-disabled}
+      TRANSACTIONAL_EMAIL_FROM: ${TRANSACTIONAL_EMAIL_FROM:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      TRANSACTIONAL_EMAIL_TIMEOUT_SECONDS: ${TRANSACTIONAL_EMAIL_TIMEOUT_SECONDS:-10}
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+      STRIPE_PUBLISHABLE_KEY: ${STRIPE_PUBLISHABLE_KEY:-}
+      STRIPE_SUCCESS_URL: ${STRIPE_SUCCESS_URL:-}
+      STRIPE_CANCEL_URL: ${STRIPE_CANCEL_URL:-}
+      STRIPE_PORTAL_RETURN_URL: ${STRIPE_PORTAL_RETURN_URL:-}
+      STRIPE_PRICE_ESSENCIAL_MONTHLY: ${STRIPE_PRICE_ESSENCIAL_MONTHLY:-}
+      STRIPE_PRICE_ESSENCIAL_ANNUAL: ${STRIPE_PRICE_ESSENCIAL_ANNUAL:-}
+      STRIPE_PRICE_AVANCADO_MONTHLY: ${STRIPE_PRICE_AVANCADO_MONTHLY:-}
+      STRIPE_PRICE_AVANCADO_ANNUAL: ${STRIPE_PRICE_AVANCADO_ANNUAL:-}
+      STRIPE_PRICE_PREMIUM_MONTHLY: ${STRIPE_PRICE_PREMIUM_MONTHLY:-}
+      STRIPE_PRICE_PREMIUM_ANNUAL: ${STRIPE_PRICE_PREMIUM_ANNUAL:-}
+      BILLING_GRACE_PERIOD_DAYS: ${BILLING_GRACE_PERIOD_DAYS:-3}
+      STRIPE_WEBHOOK_CLAIM_TTL_SECONDS: ${STRIPE_WEBHOOK_CLAIM_TTL_SECONDS:-300}
+      ENABLE_BILLING_ENFORCEMENT: ${ENABLE_BILLING_ENFORCEMENT:-false}
+      ENABLE_NORMALIZED_WHATSAPP_INGRESS: ${ENABLE_NORMALIZED_WHATSAPP_INGRESS:-false}
+      INTERNAL_INGRESS_SECRET: ${INTERNAL_INGRESS_SECRET:-}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
       REMINDER_WORKER_ENABLED: ${REMINDER_WORKER_ENABLED:-true}
       REMINDER_WORKER_POLL_SECONDS: ${REMINDER_WORKER_POLL_SECONDS:-60}
+      REMINDER_WORKER_BATCH_SIZE: ${REMINDER_WORKER_BATCH_SIZE:-100}
       REMINDER_WORKER_DISPATCH_IMMEDIATELY: ${REMINDER_WORKER_DISPATCH_IMMEDIATELY:-true}
       REMINDER_WORKER_CHANNEL: ${REMINDER_WORKER_CHANNEL:-}
       REMINDER_WORKER_AUDIENCES: ${REMINDER_WORKER_AUDIENCES:-customer,internal}
@@ -111,11 +185,16 @@ services:
   worker:
     build:
       context: .
+      target: api
     container_name: project_wapp_worker
     restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     command: ["python", "-m", "app.tools.reminder_worker"]
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-production}
@@ -126,6 +205,9 @@ services:
       POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
       DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
       DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
+      RUN_MIGRATIONS_ON_STARTUP: "false"
+      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://redis:6379/0}
+      REQUIRE_SHARED_STATE: ${REQUIRE_SHARED_STATE:-true}
       LOG_JSON: ${LOG_JSON:-true}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       ENABLE_ADMIN_AUTH: ${ENABLE_ADMIN_AUTH:-true}
@@ -133,6 +215,11 @@ services:
       ADMIN_VIEWER_TOKEN: ${ADMIN_VIEWER_TOKEN:-}
       ADMIN_OPERATOR_TOKEN: ${ADMIN_OPERATOR_TOKEN:-}
       ADMIN_SUPERADMIN_TOKEN: ${ADMIN_SUPERADMIN_TOKEN:-}
+      # The worker runs the same readiness gate as the API, so it needs the
+      # security settings those checks inspect.
+      PLATFORM_SESSION_SECRET: ${PLATFORM_SESSION_SECRET:-}
+      ENABLE_NORMALIZED_WHATSAPP_INGRESS: ${ENABLE_NORMALIZED_WHATSAPP_INGRESS:-false}
+      INTERNAL_INGRESS_SECRET: ${INTERNAL_INGRESS_SECRET:-}
       AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       CLASSIFICATION_PROVIDER: ${CLASSIFICATION_PROVIDER:-openai}
@@ -145,6 +232,7 @@ services:
       WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
       REMINDER_WORKER_ENABLED: ${REMINDER_WORKER_ENABLED:-true}
       REMINDER_WORKER_POLL_SECONDS: ${REMINDER_WORKER_POLL_SECONDS:-60}
+      REMINDER_WORKER_BATCH_SIZE: ${REMINDER_WORKER_BATCH_SIZE:-100}
       REMINDER_WORKER_DISPATCH_IMMEDIATELY: ${REMINDER_WORKER_DISPATCH_IMMEDIATELY:-true}
       REMINDER_WORKER_CHANNEL: ${REMINDER_WORKER_CHANNEL:-}
       REMINDER_WORKER_AUDIENCES: ${REMINDER_WORKER_AUDIENCES:-customer,internal}
@@ -163,6 +251,7 @@ services:
   admin:
     build:
       context: .
+      target: admin
     container_name: project_wapp_admin
     restart: unless-stopped
     depends_on:
@@ -185,7 +274,20 @@ services:
       ADMIN_ACTOR: ${ADMIN_ACTOR:-streamlit-admin}
     ports:
       - "${ADMIN_PORT:-8501}:8501"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=5).read()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
 volumes:
   postgres_data:
+  redis_data:
   backups_data:

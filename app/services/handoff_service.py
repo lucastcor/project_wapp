@@ -1,6 +1,6 @@
 
 
-from typing import Any
+from typing import Any, TypedDict
 
 from app.core.config import settings
 from app.llm.providers.openai_provider import OpenAIProvider
@@ -18,6 +18,12 @@ VALID_KNOWLEDGE_ACTIONS = {
     "store_as_knowledge",
     "promote_to_company_context",
 }
+
+
+class HandoffDecision(TypedDict):
+    should_handoff: bool
+    question_type: str | None
+    question_for_owner: str | None
 
 
 def _fallback_customer_facing_text(owner_answer: str) -> str:
@@ -57,7 +63,7 @@ def _handoff_result(
     should_handoff: bool,
     question_type: str | None = None,
     question_for_owner: str | None = None,
-) -> dict[str, Any]:
+) -> HandoffDecision:
     return {
         "should_handoff": should_handoff,
         "question_type": question_type,
@@ -70,7 +76,7 @@ def should_create_pending_question(
     confidence: float,
     message: str,
     company_context: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> HandoffDecision:
     normalized = message.lower()
     context = company_context or {}
 

@@ -1,7 +1,13 @@
-from typing import Any
+from typing import TypedDict
 
 
-def decide_message_action(classification: str, confidence: float) -> dict[str, Any]:
+class MessageDecision(TypedDict):
+    auto_reply: bool
+    action: str
+    priority: str
+
+
+def decide_message_action(classification: str, confidence: float) -> MessageDecision:
     if classification == "spam":
         return {
             "auto_reply": False,

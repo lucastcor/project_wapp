@@ -2,7 +2,7 @@
 title: Comandos Úteis
 type: reference
 tags: [referência, comandos, cli]
-updated: 2026-04-28
+updated: 2026-07-26
 ---
 
 # Comandos Úteis
@@ -71,6 +71,19 @@ docker compose --env-file .env.production exec api \
 ```bash
 python -m app.tools.export_runtime_backup
 python -m app.tools.export_runtime_backup --output backups/<nome>.json
+
+# restore completo v2
+python -m app.tools.export_runtime_backup --restore backups/<nome>.json
+
+# somente após revisão de formato antigo
+python -m app.tools.export_runtime_backup \
+  --restore backups/<legado>.json \
+  --allow-legacy
+
+# restore parcial explícito
+python -m app.tools.export_runtime_backup \
+  --restore backups/<parcial>.json \
+  --partial
 ```
 
 ## Limpeza operacional
@@ -91,6 +104,9 @@ python -m app.tools.migrate_sqlite_to_postgres \
   --sqlite-path project_wapp.db \
   --postgres-url "$POSTGRES_DATABASE_URL"
 ```
+
+Revisar o resumo `sanitization` ao final. Integrações desativadas precisam ser
+reconectadas antes do tráfego de produção.
 
 ## Worker
 
@@ -124,10 +140,17 @@ pytest --tb=short                     # traceback curto
 curl http://127.0.0.1:8000/health
 curl http://127.0.0.1:8000/health/ready
 
-# enviar mensagem
+# enviar mensagem (em produção adicione -H "X-Internal-Ingress-Secret: $INGRESS_SECRET")
 curl -X POST http://127.0.0.1:8000/messages/incoming \
   -H "Content-Type: application/json" \
   -d '{"contact_id":"5511999999999","contact_name":"Teste","message":"oi"}'
+
+# importar os company contexts de seed para o banco (idempotente)
+python -m app.tools.bootstrap_company_contexts --dry-run
+python -m app.tools.bootstrap_company_contexts
+
+# rodar a suíte contra Postgres em vez de SQLite
+TEST_DATABASE_URL="postgresql://user:pass@127.0.0.1:5432/wapp_test" pytest tests/
 
 # admin: listar empresas
 curl -H "Authorization: Bearer $TOKEN" \

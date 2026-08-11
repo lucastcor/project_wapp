@@ -2,7 +2,7 @@
 title: Melhorias de Segurança
 type: improvement
 tags: [melhorias, segurança]
-updated: 2026-04-28
+updated: 2026-07-26
 ---
 
 # Melhorias de Segurança
@@ -12,9 +12,9 @@ Alinhar com [[50-Security/01-Modelo de Ameaças]].
 ## Prioridade alta
 
 ### S-001 — Identidade humana centralizada
-- **Hoje**: tokens estáticos por papel.
-- **Para**: OIDC/SAML (Auth0, Cognito, Keycloak). Cada usuário identificado individualmente.
-- **Benefícios**: revogação granular, MFA, audit por usuário real, rotação automática.
+- **Concluído**: identidade individual, password scrypt, memberships,
+  revogação, convite/reset e audit por usuário.
+- **Próxima evolução**: MFA e OIDC/SAML opcionais.
 
 ### S-002 — Sanitização avançada de PII no dataset
 - **Hoje**: markers + redação de `@`.
@@ -23,10 +23,8 @@ Alinhar com [[50-Security/01-Modelo de Ameaças]].
 - Tracking: I-006.
 
 ### S-003 — `compare_digest` em comparação de tokens
-- **Hoje**: `==` em `resolve_admin_role_from_token` e verify token.
-- **Para**: `hmac.compare_digest`.
-- **Custo**: trivial.
-- Tracking: I-001, I-008.
+- **Concluído**: tokens, assinaturas e hashes sensíveis usam comparação
+  constant-time.
 
 ### S-004 — Lockout temporário pós N falhas de login
 - **Hoje**: tentativas ilimitadas (rate limit do IP é o único freio).
@@ -40,8 +38,7 @@ Alinhar com [[50-Security/01-Modelo de Ameaças]].
 ## Prioridade média
 
 ### S-006 — CSP estrita na plataforma
-- **Hoje**: sem CSP definida.
-- **Para**: header `Content-Security-Policy` no `/platform`.
+- **Concluído**: CSP e headers de segurança são enviados pela API.
 
 ### S-007 — Scrubbing de `metadata` em audit_events
 - **Hoje**: payloads completos podem ir.

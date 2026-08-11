@@ -1,12 +1,21 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+# Inbound payload size limits. WhatsApp text bodies cap at 4096 characters and
+# E.164 identifiers never exceed a handful of digits, so anything larger is abuse.
+MAX_CONTACT_ID_LENGTH = 64
+MAX_CONTACT_NAME_LENGTH = 200
+MAX_MESSAGE_LENGTH = 4096
+MAX_PROVIDER_MESSAGE_ID_LENGTH = 200
+MAX_WEBHOOK_EVENT_LENGTH = 100
+
 
 class IncomingMessageRequest(BaseModel):
-    contact_id: str = Field(..., min_length=1)
-    contact_name: str | None = None
-    message: str = Field(..., min_length=1)
+    contact_id: str = Field(..., min_length=1, max_length=MAX_CONTACT_ID_LENGTH)
+    contact_name: str | None = Field(default=None, max_length=MAX_CONTACT_NAME_LENGTH)
+    message: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LENGTH)
 
 
 class IncomingMessageResponse(BaseModel):
@@ -39,6 +48,8 @@ class ChatResponse(BaseModel):
 class PlatformSessionLoginPayload(BaseModel):
     admin_token: str | None = None
     admin_actor: str | None = None
+    email: str | None = Field(default=None, max_length=254)
+    password: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class PlatformSessionResponse(BaseModel):
@@ -47,6 +58,44 @@ class PlatformSessionResponse(BaseModel):
     actor: str
     auth_mode: str
     expires_at: int
+    user_id: int | None = None
+    email: str | None = None
+    memberships: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class IdentityRegistrationPayload(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+    password: str = Field(..., min_length=12, max_length=256)
+    display_name: str = Field(..., min_length=1, max_length=120)
+    company_name: str = Field(..., min_length=1, max_length=160)
+    company_slug: str = Field(..., min_length=3, max_length=63)
+    business_type: str | None = Field(default=None, max_length=120)
+
+
+class IdentityInvitationCreatePayload(BaseModel):
+    company_id: int = Field(..., gt=0)
+    email: str = Field(..., min_length=3, max_length=254)
+    role: str = Field(default="operator")
+
+
+class IdentityInvitationAcceptPayload(BaseModel):
+    token: str = Field(..., min_length=20, max_length=512)
+    password: str = Field(..., min_length=12, max_length=256)
+    display_name: str = Field(..., min_length=1, max_length=120)
+
+
+class IdentityMembershipUpdatePayload(BaseModel):
+    role: str | None = None
+    active: bool | None = None
+
+
+class PasswordResetRequestPayload(BaseModel):
+    email: str = Field(..., min_length=3, max_length=254)
+
+
+class PasswordResetConfirmPayload(BaseModel):
+    token: str = Field(..., min_length=20, max_length=512)
+    password: str = Field(..., min_length=12, max_length=256)
 
 
 class HealthResponse(BaseModel):
@@ -54,10 +103,20 @@ class HealthResponse(BaseModel):
 
 
 class WhatsAppWebhookRequest(BaseModel):
-    event: str = Field(..., min_length=1)
-    from_number: str = Field(..., min_length=1)
-    from_name: str | None = None
-    text: str = Field(..., min_length=1)
+    event: str = Field(..., min_length=1, max_length=MAX_WEBHOOK_EVENT_LENGTH)
+    from_number: str = Field(..., min_length=1, max_length=MAX_CONTACT_ID_LENGTH)
+    from_name: str | None = Field(default=None, max_length=MAX_CONTACT_NAME_LENGTH)
+    text: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LENGTH)
+
+
+class NormalizedWhatsAppPayload(BaseModel):
+    """Validated shape of the internal (non-Meta) WhatsApp webhook payload."""
+
+    event: str = Field(default="message.received", min_length=1, max_length=MAX_WEBHOOK_EVENT_LENGTH)
+    from_number: str = Field(..., min_length=1, max_length=MAX_CONTACT_ID_LENGTH)
+    from_name: str | None = Field(default=None, max_length=MAX_CONTACT_NAME_LENGTH)
+    text: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LENGTH)
+    provider_message_id: str | None = Field(default=None, max_length=MAX_PROVIDER_MESSAGE_ID_LENGTH)
 
 
 class WhatsAppWebhookResponse(BaseModel):
@@ -79,6 +138,20 @@ class WhatsAppWebhookResponse(BaseModel):
 
 
 class CompanyContextPayload(BaseModel):
+    data: dict[str, Any]
+    # Optimistic concurrency token; when provided it must match the stored revision.
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class CompanyContextRecordResponse(BaseModel):
+    company_id: int | None
+    company_slug: str | None
+    revision: int
+    schema_version: int
+    source: str
+    created_at: datetime | None
+    updated_at: datetime | None
+    updated_by: str | None
     data: dict[str, Any]
 
 
@@ -109,8 +182,8 @@ class CompanyResponse(BaseModel):
     name: str
     business_type: str | None
     active: int
-    created_at: str
-    updated_at: str | None
+    created_at: datetime
+    updated_at: datetime | None
 
 
 # Schemas for approved message examples (used in style retrieval and fine-tuning preparation)
@@ -135,7 +208,7 @@ class MessageExampleResponse(BaseModel):
     quality_score: float
     used_for_training: int
     active: int
-    created_at: str
+    created_at: datetime
 
 
 class TrainingImportPayload(BaseModel):
@@ -289,3 +362,34 @@ class ReactivateSubscriptionPayload(BaseModel):
 class UsageRecordPayload(BaseModel):
     metric: str = Field(..., min_length=1)
     quantity: int = Field(default=1, ge=1)
+
+
+class StripeCheckoutPayload(BaseModel):
+    plan_key: str = Field(..., min_length=1, max_length=64)
+    billing_cycle: str = Field(default="monthly", pattern="^(monthly|annual)$")
+    customer_email: str | None = Field(default=None, max_length=254)
+
+
+class WhatsAppBindingPayload(BaseModel):
+    """Bind a Meta business number to a company. Never carries tokens/secrets."""
+
+    company_id: int = Field(..., gt=0)
+    phone_number_id: str = Field(..., min_length=1, max_length=64)
+    display_phone_number: str | None = Field(default=None, max_length=32)
+    active: bool = True
+
+
+class WhatsAppBindingStatePayload(BaseModel):
+    active: bool
+
+
+class WhatsAppBindingResponse(BaseModel):
+    id: int
+    company_id: int
+    company_slug: str | None = None
+    phone_number_id: str
+    display_phone_number: str | None
+    active: int
+    created_at: datetime | None
+    updated_at: datetime | None
+    updated_by: str | None

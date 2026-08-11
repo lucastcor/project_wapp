@@ -2,7 +2,7 @@
 title: Storage e Repository
 type: module
 tags: [módulo, storage, banco]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Módulo: Storage e Repository
@@ -13,8 +13,8 @@ updated: 2026-04-28
 
 | Arquivo | Linhas | Papel |
 |---------|--------|-------|
-| `app/storage/db.py` | ~1 731 | Conexão SQLite/Postgres, DDL, migrações versionadas, probes. |
-| `app/storage/repository.py` | ~4 386 | `RuntimeRepository` — todos os acessos a dados do runtime. |
+| `app/storage/db.py` | ~1 990 | Conexão SQLite/Postgres, ciclo de vida de conexão, DDL, migrações versionadas, probes. |
+| `app/storage/repository.py` | ~4 800 | `RuntimeRepository` — todos os acessos a dados do runtime. |
 | `app/storage/memory_store.py` | — | Legado / mínimo. |
 
 ## `db.py`
@@ -36,13 +36,59 @@ Wrappers `PostgresConnectionWrapper` e `PostgresCursorWrapper` traduzem queries 
 - `datetime('now', ?)` → `(CURRENT_TIMESTAMP + CAST(%s AS interval))`.
 - Captura `lastrowid` adicionando `RETURNING id` automaticamente para tabelas conhecidas (`SQLITE_ID_TABLES`).
 
+### Ciclo de vida da conexão (garantias)
+
+Toda conexão adquirida é devolvida **exatamente uma vez**, e uma transação que
+falhou sofre rollback **antes** de voltar ao pool. Três camadas cooperam:
+
+| Camada | Papel |
+|--------|-------|
+| `PostgresConnectionWrapper` / `SqliteConnectionWrapper` | `close()` idempotente: marca a conexão como liberada **antes** de qualquer limpeza, faz rollback e devolve ao pool uma única vez. Uma conexão já liberada recusa `cursor()` e `commit()` com `RuntimeError`. |
+| `db_session()` / `db_transaction()` | Context managers. `db_session` faz rollback e libera; `db_transaction` commita no sucesso e faz rollback na exceção. Padrão para código novo e para as tools. |
+| `connection_scope()` | Guarda instalada em **todo** método público de `RuntimeRepository` por `_install_connection_guard`. Libera as conexões abertas durante a chamada aconteça o que acontecer. Como `close()` é idempotente, métodos que já fecham sozinhos não são afetados e os limites de transação continuam iguais. |
+
+Nada depende de `__del__`, coleta de lixo ou fim do processo.
+
+#### Falhas durante a liberação
+
+`close()` nunca levanta exceção — se levantasse, mascararia a exceção da aplicação
+que já estava propagando. Cada falha é registrada em `release_error`:
+
+| Falha | Comportamento |
+|-------|---------------|
+| `rollback()` falha | Registrado; ainda tenta devolver ao pool |
+| `putconn()` falha após rollback bem-sucedido | Registrado; a conexão bruta é **fechada** para não ficar presa fora do pool |
+| `putconn()` falha após rollback falho | Registrado; mesma disposição |
+| Tudo falha, inclusive o fechamento | Registrado; `close()` ainda retorna sem levantar |
+
+Em nenhum caso a mesma conexão bruta é devolvida ao pool duas vezes.
+
+O pool é criado com `open=True` explícito, removendo a dependência do default
+implícito que o `psycopg_pool` deprecou. A criação continua preguiçosa: nenhuma
+conexão é aberta em tempo de import.
+
+`init_db()` roda dentro de `db_transaction()`: uma migração que falha faz rollback
+e libera a conexão — o que no Postgres também solta o advisory lock de migração,
+impedindo que um boot quebrado trave os demais processos.
+
+### Filtros opcionais e compatibilidade Postgres
+
+`_optional_equals(column, value)` monta condições parametrizadas para filtros
+opcionais. Com `value=None` devolve a condição neutra `1 = 1` e nenhum parâmetro,
+em vez do antigo `(? IS NULL OR col = ?)` — que o Postgres rejeitava com
+`IndeterminateDatatype` por não conseguir inferir o tipo do placeholder.
+Os nomes de coluna são literais do módulo, nunca entrada do chamador; os valores
+são sempre ligados como parâmetros.
+
+Cobertura em `tests/test_postgres_compatibility.py`, executada nos dois backends.
+
 ### DDL
 
 Tabelas criadas em duas variantes (sqlite e postgres) com `CREATE TABLE IF NOT EXISTS`. Detalhe em [[40-Data/02-Schema do Banco]].
 
 ### Migrações
 
-Lista versionada `MIGRATIONS` (23 migrações em 2026-04-28). `_run_migrations()` registra em `schema_migrations`. Detalhe em [[40-Data/03-Migrações]].
+Lista versionada `MIGRATIONS` (37 migrações em 2026-07-26). `_run_migrations()` registra em `schema_migrations` e, no Postgres, serializa processos concorrentes com `pg_advisory_xact_lock`. Detalhe em [[40-Data/03-Migrações]].
 
 ### Probes
 

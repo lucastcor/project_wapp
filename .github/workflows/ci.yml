@@ -6,9 +6,28 @@ on:
   pull_request:
     branches: [main]
 
+# Test-only credentials. These are throwaway values for the ephemeral CI
+# service container and must never match a real deployment.
+env:
+  CI_POSTGRES_USER: wapp_ci
+  CI_POSTGRES_PASSWORD: wapp_ci_test_only
+  CI_POSTGRES_DB: wapp_ci
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
 
     steps:
       - uses: actions/checkout@v4
@@ -28,58 +47,267 @@ jobs:
       - name: Run lint
         run: ruff check app tests --select F821,F822,F823,E9
 
-      - name: Run targeted type checks
+      - name: Run application type checks
         run: |
           mypy \
             --ignore-missing-imports \
             --follow-imports=silent \
             --disable-error-code=import-untyped \
-            app/api/admin_security.py \
-            app/api/routes.py \
-            app/services/finetuning_service.py \
-            app/services/rate_limit_service.py \
-            app/services/system_readiness_service.py \
-            app/tools/cleanup_operational_data.py \
-            app/tools/export_runtime_backup.py \
-            app/tools/preflight_check.py \
-            app/tools/reminder_worker.py
+            app
 
-      - name: Run targeted SAST
+      - name: Run application SAST
         run: |
-          bandit -q \
-            app/api/admin_security.py \
-            app/api/routes.py \
-            app/services/finetuning_service.py \
-            app/services/rate_limit_service.py \
-            app/services/system_readiness_service.py \
-            app/tools/cleanup_operational_data.py \
-            app/tools/export_runtime_backup.py \
-            app/tools/preflight_check.py \
-            app/tools/reminder_worker.py
+          # Runtime repository SQL fragments are assembled only from validated
+          # identifiers/internal predicates and are covered by DB portability
+          # and tenant-integrity tests; Bandit's B608 cannot distinguish them.
+          bandit -q -ll -r app -x app/storage/repository.py
 
       - name: Audit dependencies
         run: pip-audit -r requirements.txt
 
-      - name: Run tests
+      - name: Run tests (SQLite)
+        timeout-minutes: 10
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6379/0
         run: pytest tests/ -x -q --tb=short
 
-  docker:
-    needs: test
+      - name: Validate Vercel entrypoint
+        env:
+          DISABLE_DOTENV: "true"
+          VERCEL: "1"
+          RUN_MIGRATIONS_ON_STARTUP: "false"
+        run: python -c "from app.index import app; assert app is not None"
+
+  test-postgres:
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: wapp_ci
+          POSTGRES_PASSWORD: wapp_ci_test_only
+          POSTGRES_DB: wapp_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wapp_ci -d wapp_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 10s
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build Docker image
-        run: docker build -t wapp-api:${{ github.sha }} .
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
 
-      - name: Smoke test container
+      - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r requirements-dev.txt
+
+      - name: Wait for PostgreSQL
+        timeout-minutes: 2
+        run: |
+          for attempt in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U "$CI_POSTGRES_USER" -d "$CI_POSTGRES_DB"; then
+              echo "PostgreSQL is ready"
+              exit 0
+            fi
+            echo "waiting for PostgreSQL (attempt $attempt)"
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready in time"
+          exit 1
+
+      # A small pool makes a connection leak fail fast instead of slowly
+      # draining a large pool, and the timeouts guarantee the job cannot hang.
+      - name: Run tests (PostgreSQL)
+        timeout-minutes: 12
+        env:
+          TEST_DATABASE_URL: postgresql://wapp_ci:wapp_ci_test_only@127.0.0.1:5432/wapp_ci
+          DATABASE_POOL_SIZE: "5"
+          DATABASE_STATEMENT_TIMEOUT_MS: "10000"
+        run: pytest tests/ -q --tb=short --durations=10
+
+      - name: PostgreSQL regression suite (I-016 / I-017 / bindings / portability)
+        timeout-minutes: 8
+        env:
+          TEST_DATABASE_URL: postgresql://wapp_ci:wapp_ci_test_only@127.0.0.1:5432/wapp_ci_regression
+          # Real PostgreSQL for the SQLite -> PostgreSQL migration suite; it
+          # creates and drops its own throwaway target databases.
+          TEST_POSTGRES_MIGRATION_URL: postgresql://wapp_ci:wapp_ci_test_only@127.0.0.1:5432/postgres
+          DATABASE_POOL_SIZE: "3"
+        run: |
+          PGPASSWORD="$CI_POSTGRES_PASSWORD" createdb \
+            -h 127.0.0.1 -U "$CI_POSTGRES_USER" wapp_ci_regression
+          pytest \
+            tests/test_postgres_compatibility.py \
+            tests/test_company_context_concurrency.py \
+            tests/test_whatsapp_tenant_binding.py \
+            tests/test_backup_restore.py \
+            tests/test_sqlite_to_postgres_migration.py \
+            -q --tb=short
+
+  docker:
+    needs: [test, test-postgres]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: wapp_ci
+          POSTGRES_PASSWORD: wapp_ci_test_only
+          POSTGRES_DB: wapp_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U wapp_ci -d wapp_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 10s
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API and admin Docker images
+        run: |
+          docker build --target api -t wapp-api:${{ github.sha }} .
+          docker build --target admin -t wapp-admin:${{ github.sha }} .
+
+      - name: Validate Compose healthchecks
+        run: |
+          docker compose config --format json > compose-config.json
+          python - <<'PY'
+          import json
+
+          config = json.load(open("compose-config.json", encoding="utf-8"))
+          services = config["services"]
+          admin_test = " ".join(services["admin"]["healthcheck"]["test"])
+          worker_test = " ".join(services["worker"]["healthcheck"]["test"])
+          if "8501/_stcore/health" not in admin_test:
+              raise SystemExit("admin healthcheck does not target Streamlit")
+          if "reminder_worker --validate-only" not in worker_test:
+              raise SystemExit("worker healthcheck does not use validate-only")
+          print("Compose healthchecks are service-specific")
+          PY
+
+      - name: Smoke test container (SQLite)
+        run: |
+          set -euo pipefail
           docker run -d --name wapp-smoke -p 8000:8000 \
             -e DATABASE_URL=sqlite:///test.db \
             -e ENVIRONMENT=test \
             wapp-api:${{ github.sha }}
-          sleep 5
-          curl -sf http://localhost:8000/health || exit 1
-          docker stop wapp-smoke
+          for attempt in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health >/dev/null; then
+              echo "container healthy on SQLite"
+              break
+            fi
+            if [ "$attempt" -eq 20 ]; then
+              echo "::error::container did not become healthy on SQLite"
+              docker logs wapp-smoke
+              exit 1
+            fi
+            sleep 3
+          done
+          # A transient 200 from the first Uvicorn child is insufficient: both
+          # configured workers must complete startup and remain alive.
+          sleep 3
+          if [ "$(docker inspect -f '{{.State.Running}}' wapp-smoke)" != "true" ]; then
+            echo "::error::SQLite container exited after its first health response"
+            docker logs wapp-smoke
+            exit 1
+          fi
+          startup_count=$(docker logs wapp-smoke 2>&1 | grep -c "Application startup complete" || true)
+          if [ "$startup_count" -ne 2 ]; then
+            echo "::error::expected 2 stable Uvicorn workers, got $startup_count"
+            docker logs wapp-smoke
+            exit 1
+          fi
+          if docker logs wapp-smoke 2>&1 | grep -E \
+            "Traceback|Application startup failed|Child process .* failed"; then
+            echo "::error::SQLite container logged a startup failure"
+            exit 1
+          fi
+
+      - name: Clean up SQLite smoke container
+        if: always()
+        run: docker rm -f wapp-smoke 2>/dev/null || true
+
+      - name: Smoke test container (PostgreSQL)
+        run: |
+          set -euo pipefail
+          docker run -d --name wapp-smoke-pg --network host \
+            -e DATABASE_URL="postgresql://${CI_POSTGRES_USER}:${CI_POSTGRES_PASSWORD}@127.0.0.1:5432/${CI_POSTGRES_DB}" \
+            -e ENVIRONMENT=test \
+            wapp-api:${{ github.sha }}
+
+          for attempt in $(seq 1 20); do
+            if curl -sf http://localhost:8000/health >/dev/null; then
+              echo "container healthy on PostgreSQL"
+              break
+            fi
+            if [ "$attempt" -eq 20 ]; then
+              echo "::error::container did not become healthy on PostgreSQL"
+              docker logs wapp-smoke-pg
+              exit 1
+            fi
+            sleep 3
+          done
+
+          # Readiness is authoritative: a non-2xx response fails the job.
+          if ! curl -sf http://localhost:8000/health/ready -o readiness.json; then
+            echo "::error::/health/ready did not return success"
+            echo "--- readiness body ---"
+            cat readiness.json 2>/dev/null || echo "(no body captured)"
+            echo "--- container logs ---"
+            docker logs wapp-smoke-pg
+            exit 1
+          fi
+          cat readiness.json
+
+          # The container must have migrated the PostgreSQL database, not SQLite.
+          python -c "
+          import json, sys
+          readiness = json.load(open('readiness.json'))
+          if not readiness.get('database_ok'):
+              sys.exit('readiness reports database_ok=false')
+          if readiness.get('blocker_count'):
+              sys.exit(f\"readiness blockers: {readiness.get('blockers')}\")
+          print('readiness OK:', readiness['status'])
+          "
+          applied=$(PGPASSWORD="$CI_POSTGRES_PASSWORD" psql -h 127.0.0.1 -U "$CI_POSTGRES_USER" \
+            -d "$CI_POSTGRES_DB" -tAc "SELECT count(*) FROM schema_migrations")
+          echo "migrations applied on PostgreSQL: $applied"
+          if [ "$applied" -lt 1 ]; then
+            echo "::error::no migrations were applied to PostgreSQL"
+            docker logs wapp-smoke-pg
+            exit 1
+          fi
+
+      - name: Validate worker one-shot lifecycle
+        timeout-minutes: 2
+        run: |
+          timeout 30s docker run --rm --name wapp-worker-validate --network host \
+            -e DATABASE_URL="postgresql://${CI_POSTGRES_USER}:${CI_POSTGRES_PASSWORD}@127.0.0.1:5432/${CI_POSTGRES_DB}" \
+            -e ENVIRONMENT=test \
+            -e STRICT_RUNTIME_VALIDATION=false \
+            wapp-api:${{ github.sha }} \
+            python -m app.tools.reminder_worker --validate-only
+
+      - name: Clean up PostgreSQL smoke container
+        if: always()
+        run: |
+          docker rm -f wapp-smoke-pg 2>/dev/null || true
+          docker rm -f wapp-worker-validate 2>/dev/null || true

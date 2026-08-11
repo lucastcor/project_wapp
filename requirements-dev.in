@@ -1,0 +1,7 @@
+# Local development and CI dependencies.
+bandit
+httpx
+mypy
+pip-audit
+pytest
+ruff

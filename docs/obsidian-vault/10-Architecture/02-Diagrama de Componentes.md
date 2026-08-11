@@ -136,7 +136,7 @@ flowchart TB
 | `orchestrator.py` | `conversation_workflow_service.py` | função pura | Tenta primeiro tratar agenda/cancelamento/operador. |
 | `reply_services.py` | `openai_provider.py` | classe | Tem fallback determinístico se faltar `OPENAI_API_KEY`. |
 | `admin_routes.py` | `repository.py` | direto | Centraliza acesso a 20+ recursos administrativos. |
-| `platform_routes.py` | `platform_session_service.py` | função | Emite/lê cookie HTTP-only assinado. |
+| `platform_routes.py` | `platform_session_service.py` + `identity_service.py` | função | Resolve sessão opaca de identidade e cookie break-glass legado. |
 | `admin_security.py` | `admin_auth_service.py` + `platform_session_service.py` | função | Aceita token via header **ou** cookie de sessão. |
 | `reminder_worker.py` | `reminder_service.py` + `appointment_queue_service.py` | função | Loop com `REMINDER_WORKER_POLL_SECONDS`. |
 | `outbound_dispatch_service.py` | `whatsapp_provider.py` | classe | Por canal `whatsapp`, fallback genérico. |

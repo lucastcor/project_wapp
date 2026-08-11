@@ -2,7 +2,7 @@
 title: Modelo de Dados
 type: data
 tags: [dados, modelo, er]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Modelo de Dados (visão lógica)
@@ -111,9 +111,10 @@ erDiagram
 
 | Onde fica | Conteúdo |
 |-----------|----------|
-| Banco | Mensagens, contatos, bookings, fila, lembretes, jobs, auditoria, billing. |
-| `app/data/company_context.json` | Contexto global fallback. |
-| `app/data/company_contexts/{slug}.json` | Contexto por empresa, incluindo `conversation_pipelines` (canvas), `scheduling_policy.profiles`, `internal_operation`. |
+| Banco (`company_contexts`) | Contexto ativo por empresa: `conversation_pipelines` (canvas), `scheduling_policy.profiles`, `internal_operation`, `revision`, `schema_version`. |
+| Banco (demais tabelas) | Mensagens, contatos, bookings, fila, lembretes, jobs, auditoria, billing. |
+| `app/data/company_context.json` | **Seed** do contexto global. |
+| `app/data/company_contexts/{slug}.json` | **Seed** por empresa. |
 
 Detalhe em [[40-Data/05-Company Context]].
 

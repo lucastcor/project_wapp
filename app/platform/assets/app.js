@@ -105,6 +105,7 @@ const NAV_ITEMS = [
   { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
   { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
   { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
+  { key: "team", label: "Equipe", caption: "Acessos, papéis e convites", icon: "contacts" },
   { key: "billing", label: "Billing", caption: "Planos, uso e assinatura", icon: "tag" },
   { key: "onboarding", label: "Setup Wizard", caption: "Configurar nova empresa", icon: "spark" },
 ]
@@ -156,6 +157,18 @@ const state = {
   manualBookingOpen: false,
   connected: false,
   session: null,
+  authCapabilities: {
+    self_service_signup: false,
+    password_reset: false,
+  },
+  authMode: "login",
+  authAction: (() => {
+    const params = new URLSearchParams(window.location.search)
+    return {
+      invitationToken: params.get("invitation_token") || "",
+      passwordResetToken: params.get("password_reset_token") || "",
+    }
+  })(),
   errorMessage: "",
   toasts: [],
   config: loadStoredConfig(),
@@ -176,6 +189,8 @@ const state = {
   finetuningJobs: [],
   analyticsDashboard: null,
   analyticsPeriod: "30d",
+  teamMembers: [],
+  teamInvitation: null,
   onboardingPresets: null,
   onboardingWizard: {
     step: 0,
@@ -204,6 +219,7 @@ const state = {
   },
   billingPlans: null,
   billingUsage: null,
+  billingCycle: "monthly",
   trainingImportResult: null,
   availabilityResult: null,
   simulator: {
@@ -278,6 +294,11 @@ const state = {
     auth: {
       adminToken: "",
       adminActor: "platform-admin",
+      email: "",
+      password: "",
+      displayName: "",
+      companyName: "",
+      companySlug: "",
     },
   },
 }
@@ -338,18 +359,36 @@ function safeJsonParse(value, fallback) {
   }
 }
 
+const API_ERROR_TRANSLATIONS = {
+  "A company must keep at least one active owner.": "A empresa precisa manter ao menos um proprietário ativo.",
+  "Only a company owner or admin can invite members.": "Somente proprietários e administradores podem convidar membros.",
+  "Only a company owner or admin can list members.": "Somente proprietários e administradores podem listar membros.",
+  "Only a company owner or admin can manage members.": "Somente proprietários e administradores podem gerenciar membros.",
+  "Only an owner can invite another admin.": "Somente um proprietário pode convidar outro administrador.",
+  "Only an owner can grant owner or admin access.": "Somente um proprietário pode conceder acesso de proprietário ou administrador.",
+  "Owner access cannot be granted by invitation.": "O papel de proprietário não pode ser concedido por convite.",
+  "Membership not found.": "Vínculo de acesso não encontrado.",
+  "CSRF validation failed.": "A validação de segurança da sessão falhou. Atualize a página e tente novamente.",
+}
+
+function translateApiError(message) {
+  return API_ERROR_TRANSLATIONS[String(message || "")] || String(message || "")
+}
+
 function summarizeError(error) {
   if (!error) {
     return "Falha inesperada."
   }
   if (typeof error === "string") {
-    return error
+    return translateApiError(error)
   }
   if (error.detail) {
-    return typeof error.detail === "string" ? error.detail : JSON.stringify(error.detail)
+    return typeof error.detail === "string"
+      ? translateApiError(error.detail)
+      : JSON.stringify(error.detail)
   }
   if (error.message) {
-    return error.message
+    return translateApiError(error.message)
   }
   return "Falha inesperada."
 }
@@ -457,6 +496,7 @@ async function apiRequest(path, options = {}) {
     params = null,
     body = null,
     admin = true,
+    headers: customHeaders = {},
   } = options
 
   const url = new URL(path, window.location.origin)
@@ -468,12 +508,20 @@ async function apiRequest(path, options = {}) {
     })
   }
 
-  const headers = {}
+  const headers = { ...customHeaders }
   if (body !== null) {
     headers["Content-Type"] = "application/json"
   }
   if (admin && state.config.adminActor) {
     headers["X-Admin-Actor"] = state.config.adminActor
+  }
+  if (!["GET", "HEAD", "OPTIONS"].includes(method.toUpperCase())) {
+    const csrfCookie = document.cookie
+      .split("; ")
+      .find((item) => item.startsWith("project_wapp_csrf="))
+    if (csrfCookie) {
+      headers["X-CSRF-Token"] = decodeURIComponent(csrfCookie.split("=", 2)[1] || "")
+    }
   }
 
   const response = await fetch(url, {
@@ -512,6 +560,24 @@ async function fetchPlatformSession() {
   return session
 }
 
+async function fetchAuthCapabilities() {
+  state.authCapabilities = await apiRequest("/platform/auth/capabilities", {
+    admin: false,
+  })
+  return state.authCapabilities
+}
+
+function clearAuthActionFromUrl() {
+  state.authAction = {
+    invitationToken: "",
+    passwordResetToken: "",
+  }
+  const url = new URL(window.location.href)
+  url.searchParams.delete("invitation_token")
+  url.searchParams.delete("password_reset_token")
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
+}
+
 async function loginPlatformSession() {
   const session = await apiRequest("/platform/auth/session", {
     method: "POST",
@@ -519,12 +585,15 @@ async function loginPlatformSession() {
     body: {
       admin_token: state.drafts.auth.adminToken || null,
       admin_actor: state.drafts.auth.adminActor || state.config.adminActor || null,
+      email: state.drafts.auth.email || null,
+      password: state.drafts.auth.password || null,
     },
   })
   state.session = session
   state.connected = true
   state.config.adminActor = session.actor || state.config.adminActor
   state.drafts.auth.adminToken = ""
+  state.drafts.auth.password = ""
   state.drafts.auth.adminActor = session.actor || state.config.adminActor
   persistConfig()
   return session
@@ -537,6 +606,7 @@ async function logoutPlatformSession() {
   })
   state.session = null
   state.connected = false
+  disconnectSSE()
 }
 
 let _companiesLoaded = false
@@ -559,7 +629,7 @@ async function loadCompanies(force = false) {
 async function loadDashboardData() {
   await loadCompanies()
   const [observabilitySummary, readiness, systemProfile, onboarding] = await Promise.all([
-    apiRequest("/admin/observability/summary"),
+    apiRequest("/admin/observability/summary", { params: getAdminCompanyParams() }),
     apiRequest("/admin/system/readiness"),
     apiRequest("/admin/system/profile"),
     apiRequest("/admin/system/onboarding", {
@@ -586,13 +656,44 @@ async function loadOnboardingData() {
 }
 
 async function loadBillingData() {
-  const companyId = state.config.companyId || 1
+  await loadCompanies()
+  const companyId = state.config.companyId
+  if (!companyId) {
+    state.billingPlans = null
+    state.billingUsage = null
+    return
+  }
   const [plans, usage] = await Promise.all([
     apiRequest("/admin/billing/plans"),
     apiRequest("/admin/billing/usage", { params: { company_id: companyId } }),
   ])
   state.billingPlans = plans
   state.billingUsage = usage
+}
+
+function getCurrentIdentityMembership() {
+  if (state.session?.auth_mode !== "identity") return null
+  return (state.session.memberships || []).find(
+    (membership) => String(membership.company_id) === String(state.config.companyId)
+  ) || null
+}
+
+function canManageCurrentTeam() {
+  return ["owner", "admin"].includes(getCurrentIdentityMembership()?.role)
+}
+
+async function loadTeamData() {
+  await loadCompanies()
+  state.teamInvitation = null
+  if (!state.config.companyId || !canManageCurrentTeam()) {
+    state.teamMembers = []
+    return
+  }
+  const members = await apiRequest("/platform/identity/members", {
+    admin: false,
+    params: { company_id: state.config.companyId },
+  })
+  state.teamMembers = Array.isArray(members) ? members : []
 }
 
 async function loadStudioData() {
@@ -735,6 +836,8 @@ async function _doRefreshCurrentView({ silent = false } = {}) {
     } else if (state.view === "training") {
       await loadCompanies()
       await loadTrainingData()
+    } else if (state.view === "team") {
+      await loadTeamData()
     } else if (state.view === "billing") {
       await loadBillingData()
     } else if (state.view === "onboarding") {
@@ -744,10 +847,11 @@ async function _doRefreshCurrentView({ silent = false } = {}) {
     state.errorMessage = ""
   } catch (error) {
     state.errorMessage = summarizeError(error)
-    if (error.status === 401 || error.status === 403) {
+    if (error.status === 401) {
       state.connected = false
       state.session = null
       state.settingsOpen = true
+      disconnectSSE()
     }
     pushToast(state.errorMessage, "error")
   } finally {
@@ -767,6 +871,7 @@ function viewLoadingLabel(view) {
   if (view === "agenda") return "Buscando agenda e fila de prioridade..."
   if (view === "contacts") return "Buscando contatos..."
   if (view === "training") return "Montando operação de curadoria..."
+  if (view === "team") return "Carregando equipe e permissões..."
   return "Carregando..."
 }
 
@@ -838,6 +943,7 @@ function renderViewTitle() {
   if (state.view === "agenda") return "Agenda Console com controle manual e visão operacional"
   if (state.view === "contacts") return "Contacts Desk para decidir com contexto e precisão"
   if (state.view === "training") return "Training Ops para curar base histórica com segurança"
+  if (state.view === "team") return "Equipe — acessos, papéis e convites"
   return "Project WAPP Platform"
 }
 
@@ -851,6 +957,7 @@ function renderViewCopy() {
   if (state.view === "agenda") return "Monitore disponibilidade, bookings, remanejamento e ajustes manuais."
   if (state.view === "contacts") return "Enriqueça customer_profile, organize notas e desambiguação de atendimento."
   if (state.view === "training") return "Importe CRM, faça dry-run, acompanhe o dataset e acione fine-tuning."
+  if (state.view === "team") return "Convide colaboradores e controle permissões por empresa com segurança."
   return "Painel premium do Project WAPP."
 }
 
@@ -1068,7 +1175,7 @@ function billingUsageBar(metric, label, used, limit) {
   `
 }
 
-function renderBillingPlanCards(plans, currentPlanKey, billingCycle) {
+function renderBillingPlanCards(plans, currentPlanKey, billingCycle, managedByStripe = false) {
   if (!plans || plans.length === 0) return '<div class="empty-state">Nenhum plano disponível.</div>'
 
   const sorted = [...plans].sort((a, b) => (a.display_order || 0) - (b.display_order || 0))
@@ -1098,7 +1205,18 @@ function renderBillingPlanCards(plans, currentPlanKey, billingCycle) {
               ${p.features?.priority_support ? '<li>Suporte prioritário</li>' : ''}
               ${p.features?.dedicated_support ? '<li>Suporte dedicado</li>' : ''}
             </ul>
-            ${!isCurrent ? `<button class="button billing-change-plan-btn" data-plan-key="${escapeHtml(p.plan_key)}">Selecionar</button>` : ''}
+            ${!isCurrent ? `
+              <button
+                class="button billing-checkout-btn"
+                data-plan-key="${escapeHtml(p.plan_key)}"
+                ${p.stripe_checkout_ready ? "" : "disabled"}
+                title="${p.stripe_checkout_ready ? "Continuar para pagamento seguro" : "Preço Stripe ainda não configurado"}"
+              >${currentPlanKey ? "Gerenciar no portal" : "Assinar"}</button>
+            ` : (
+              managedByStripe
+                ? '<button class="button-ghost billing-portal-btn">Gerenciar assinatura</button>'
+                : '<span class="tag">Plano atual</span>'
+            )}
           </div>
         `
       }).join("")}
@@ -1109,6 +1227,16 @@ function renderBillingPlanCards(plans, currentPlanKey, billingCycle) {
 function renderBillingView() {
   const usage = state.billingUsage
   const plans = state.billingPlans
+
+  if (!state.config.companyId || !getSelectedCompany()) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Billing</span>
+        <h2 class="hero-title">Selecione uma empresa para consultar assinatura e consumo.</h2>
+        <p class="hero-copy">Cobrança e limites são sempre isolados por tenant; não existe operação financeira em escopo global.</p>
+      </section>
+    `
+  }
 
   if (!usage) {
     return `
@@ -1128,9 +1256,15 @@ function renderBillingView() {
       <section class="hero">
         <span class="brand-eyebrow">Billing</span>
         <h2 class="hero-title">Nenhuma assinatura ativa.</h2>
-        <p class="hero-copy">Inicie um trial gratuito de 7 dias para testar o plano Avançado completo, sem cartão de crédito.</p>
+        <p class="hero-copy">Escolha um plano e conclua a assinatura no checkout seguro do Stripe.</p>
         <div class="hero-actions">
-          <button class="button" id="billing-start-trial">Iniciar trial gratuito</button>
+          <label>
+            Ciclo
+            <select id="billing-cycle-select">
+              <option value="monthly" ${state.billingCycle === "monthly" ? "selected" : ""}>Mensal</option>
+              <option value="annual" ${state.billingCycle === "annual" ? "selected" : ""}>Anual</option>
+            </select>
+          </label>
         </div>
       </section>
 
@@ -1142,7 +1276,7 @@ function renderBillingView() {
               <p class="card-copy">Escolha o plano ideal para o volume do seu negócio.</p>
             </div>
           </div>
-          ${renderBillingPlanCards(plans, null, "monthly")}
+          ${renderBillingPlanCards(plans, null, state.billingCycle)}
         </article>
       </section>
     `
@@ -1165,11 +1299,15 @@ function renderBillingView() {
   const statusLabels = {
     trial: "Trial",
     active: "Ativa",
+    incomplete: "Pagamento pendente",
+    past_due: "Pagamento em atraso",
     cancelled: "Cancelada",
   }
   const statusTone = {
     trial: "tag-warn",
     active: "tag-success",
+    incomplete: "tag-warn",
+    past_due: "tag-danger",
     cancelled: "tag-danger",
   }
 
@@ -1236,9 +1374,8 @@ function renderBillingView() {
           </div>
         </div>
         <div class="billing-sub-actions">
-          ${sub.status !== "cancelled" ? `<button class="button-ghost billing-cancel-btn" id="billing-cancel">Cancelar assinatura</button>` : ''}
-          ${sub.status === "cancelled" ? `<button class="button" id="billing-reactivate">Reativar assinatura</button>` : ''}
-          ${sub.status === "trial" ? `<button class="button" id="billing-activate">Ativar plano</button>` : ''}
+          ${sub.gateway === "stripe" ? '<button class="button billing-portal-btn">Gerenciar no Stripe</button>' : ''}
+          ${sub.cancel_at_period_end ? '<span class="tag tag-warn">Cancelamento agendado</span>' : ''}
           ${sub.expired ? `<span class="tag tag-danger">Expirada</span>` : ''}
         </div>
       </article>
@@ -1267,7 +1404,7 @@ function renderBillingView() {
             <p class="card-copy">Compare os planos e faça upgrade ou downgrade quando quiser.</p>
           </div>
         </div>
-        ${renderBillingPlanCards(plans, sub.plan_key, billingCycle)}
+        ${renderBillingPlanCards(plans, sub.plan_key, billingCycle, sub.gateway === "stripe")}
       </article>
     </section>
   `
@@ -2162,7 +2299,7 @@ function renderStudioView() {
       <span class="brand-eyebrow">Bot Studio</span>
       <h2 class="hero-title">Teste conversa real antes de colocar para rodar.</h2>
       <p class="hero-copy">
-        Crie sessões de teste por contato, mantenha o histórico e valide o fluxo natural sem reinformar telefone a cada mensagem. Toda troca passa pelo mesmo runtime público (/messages/incoming).
+        Crie sessões de teste por contato, mantenha o histórico e valide o fluxo natural sem reinformar telefone a cada mensagem. Toda troca passa pelo mesmo runtime, através da rota autenticada /admin/simulator/messages.
       </p>
     </section>
 
@@ -3436,6 +3573,204 @@ function renderTrainingView() {
   `
 }
 
+const TEAM_ROLE_LABELS = {
+  owner: "Proprietário",
+  admin: "Administrador",
+  operator: "Operador",
+  viewer: "Visualizador",
+}
+
+function renderTeamRoleOptions(currentRole, requesterRole) {
+  const allowedRoles = requesterRole === "owner"
+    ? ["viewer", "operator", "admin", "owner"]
+    : ["viewer", "operator"]
+  return allowedRoles
+    .map(
+      (role) =>
+        `<option value="${role}" ${role === currentRole ? "selected" : ""}>${TEAM_ROLE_LABELS[role]}</option>`
+    )
+    .join("")
+}
+
+function renderTeamView() {
+  const membership = getCurrentIdentityMembership()
+  const requesterRole = membership?.role || ""
+  const selectedCompany = getSelectedCompany()
+  const canManage = canManageCurrentTeam()
+
+  if (state.session?.auth_mode !== "identity") {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Identity & Access</span>
+        <h2 class="hero-title">Gestão de equipe requer uma conta individual.</h2>
+        <p class="hero-copy">
+          Esta sessão usa o acesso administrativo legado. Entre com email e senha para administrar
+          membros, papéis e convites com rastreabilidade por usuário.
+        </p>
+        <div class="hero-actions">
+          <button class="button" id="team-open-session">Abrir sessão</button>
+        </div>
+      </section>
+    `
+  }
+
+  if (!selectedCompany || !state.config.companyId) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Identity & Access</span>
+        <h2 class="hero-title">Selecione uma empresa para administrar a equipe.</h2>
+        <p class="hero-copy">Os acessos são sempre isolados por tenant e nunca alterados em escopo global.</p>
+      </section>
+    `
+  }
+
+  if (!canManage) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Identity & Access</span>
+        <h2 class="hero-title">Seu acesso a ${escapeHtml(selectedCompany.name)} é ${escapeHtml(TEAM_ROLE_LABELS[requesterRole] || requesterRole)}.</h2>
+        <p class="hero-copy">
+          Apenas proprietários e administradores podem listar membros ou alterar permissões.
+          Solicite a um responsável da empresa quando precisar de uma mudança de acesso.
+        </p>
+      </section>
+    `
+  }
+
+  const activeMembers = state.teamMembers.filter((member) => member.active).length
+  const invitationUrl = state.teamInvitation?.action_token
+    ? `${window.location.origin}/platform?invitation_token=${encodeURIComponent(state.teamInvitation.action_token)}`
+    : ""
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">Identity & Access</span>
+      <h2 class="hero-title">Controle quem pode operar ${escapeHtml(selectedCompany.name)}.</h2>
+      <p class="hero-copy">
+        Convites expiram, sessões podem ser revogadas e cada alteração respeita o papel do usuário
+        dentro desta empresa.
+      </p>
+      <div class="hero-actions">
+        <button class="button-ghost" data-refresh-view>Atualizar equipe</button>
+      </div>
+    </section>
+
+    <section class="grid-three">
+      ${renderMetricCard("Membros", formatNumber(state.teamMembers.length), "Cadastros vinculados ao tenant.", "default", "contacts")}
+      ${renderMetricCard("Ativos", formatNumber(activeMembers), "Pessoas com acesso liberado.", "default", "check")}
+      ${renderMetricCard("Seu papel", TEAM_ROLE_LABELS[requesterRole] || requesterRole, "Permissão aplicada nesta empresa.", "warm", "handoff")}
+    </section>
+
+    <section class="grid-two team-layout">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Convidar colaborador</h3>
+            <p class="card-copy">O convite é enviado por email e só pode ser usado uma vez.</p>
+          </div>
+        </div>
+        <form id="team-invitation-form" class="form-grid">
+          <div class="field">
+            <label>Email</label>
+            <input name="email" type="email" required autocomplete="email" placeholder="pessoa@empresa.com" />
+          </div>
+          <div class="field">
+            <label>Papel inicial</label>
+            <select name="role" required>
+              <option value="operator">Operador — atua na operação</option>
+              <option value="viewer">Visualizador — somente leitura</option>
+              ${requesterRole === "owner" ? '<option value="admin">Administrador — gerencia operação e equipe</option>' : ""}
+            </select>
+            <small>O papel de proprietário só pode ser concedido depois que a pessoa aceitar o convite.</small>
+          </div>
+          <div class="toolbar-row">
+            <button class="button" type="submit">Enviar convite</button>
+          </div>
+        </form>
+        ${
+          invitationUrl
+            ? `
+              <div class="message-card team-development-token">
+                <strong>Link de desenvolvimento</strong>
+                <p>O provedor de email está desativado neste ambiente. Copie o link abaixo para concluir o teste.</p>
+                <div class="inline-actions">
+                  <input id="team-invitation-link" value="${escapeHtml(invitationUrl)}" readonly aria-label="Link do convite" />
+                  <button class="button-ghost" type="button" id="copy-team-invitation">Copiar</button>
+                </div>
+              </div>
+            `
+            : ""
+        }
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Política de acesso</h3>
+            <p class="card-copy">Privilégio mínimo por papel, isolado por empresa.</p>
+          </div>
+        </div>
+        <div class="team-role-guide">
+          <p><strong>Proprietário</strong><span>Controle total, inclusive promoção de outros proprietários.</span></p>
+          <p><strong>Administrador</strong><span>Gerencia operação e membros não administrativos.</span></p>
+          <p><strong>Operador</strong><span>Executa rotinas de operação permitidas.</span></p>
+          <p><strong>Visualizador</strong><span>Acesso de leitura aos dados autorizados.</span></p>
+        </div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Membros da empresa</h3>
+          <p class="card-copy">A plataforma impede a remoção do último proprietário ativo.</p>
+        </div>
+      </div>
+      <div class="team-member-list">
+        ${
+          state.teamMembers.length
+            ? state.teamMembers
+                .map((member) => {
+                  const isSelf = Number(member.user_id) === Number(state.session?.user_id)
+                  const canEditMember = requesterRole === "owner" || !["owner", "admin"].includes(member.role)
+                  return `
+                    <form class="team-member-row" data-team-member-form="${member.id}">
+                      <div class="contact-avatar">${escapeHtml((member.display_name || member.email || "?").slice(0, 2).toUpperCase())}</div>
+                      <div class="team-member-identity">
+                        <strong>${escapeHtml(member.display_name || member.email)}${isSelf ? " (você)" : ""}</strong>
+                        <span>${escapeHtml(member.email)}</span>
+                        <small>Desde ${escapeHtml(formatDateTime(member.created_at))}</small>
+                      </div>
+                      ${
+                        canEditMember
+                          ? `
+                            <div class="field">
+                              <label>Papel</label>
+                              <select name="role">${renderTeamRoleOptions(member.role, requesterRole)}</select>
+                            </div>
+                            <label class="team-active-toggle">
+                              <input name="active" type="checkbox" ${member.active ? "checked" : ""} />
+                              <span>Acesso ativo</span>
+                            </label>
+                            <button class="button-ghost" type="submit">Salvar</button>
+                          `
+                          : `
+                            <span class="tag">${escapeHtml(TEAM_ROLE_LABELS[member.role] || member.role)}</span>
+                            <span class="tag ${member.active ? "tag-success" : "tag-danger"}">${member.active ? "Ativo" : "Inativo"}</span>
+                            <span class="team-member-locked">Gerenciado por proprietário</span>
+                          `
+                      }
+                    </form>
+                  `
+                })
+                .join("")
+            : renderEmptyState("contacts", "Nenhum membro encontrado", "Convide a primeira pessoa para colaborar com este workspace.")
+        }
+      </div>
+    </section>
+  `
+}
+
 function renderCurrentView() {
   if (state.view === "dashboard") return renderDashboardView()
   if (state.view === "analytics") return renderAnalyticsView()
@@ -3444,52 +3779,182 @@ function renderCurrentView() {
   if (state.view === "agenda") return renderAgendaView()
   if (state.view === "contacts") return renderContactsView()
   if (state.view === "training") return renderTrainingView()
+  if (state.view === "team") return renderTeamView()
   if (state.view === "billing") return renderBillingView()
   if (state.view === "onboarding") return renderOnboardingView()
   return ""
 }
 
 function renderSettingsModal() {
+  if (state.authAction.invitationToken) {
+    return `
+      <div class="modal-backdrop">
+        <div class="modal">
+          <div class="section-header">
+            <div>
+              <h3 class="section-title">Aceitar convite</h3>
+              <p class="section-copy">Defina seu nome e uma senha forte para acessar a empresa.</p>
+            </div>
+          </div>
+          <form id="invitation-accept-form" class="form-grid">
+            <div class="field">
+              <label>Nome</label>
+              <input name="displayName" required autocomplete="name" />
+            </div>
+            <div class="field">
+              <label>Senha</label>
+              <input name="password" type="password" required minlength="12" autocomplete="new-password" />
+            </div>
+            <div class="field">
+              <label>Confirmar senha</label>
+              <input name="passwordConfirm" type="password" required minlength="12" autocomplete="new-password" />
+            </div>
+            <div class="toolbar-row">
+              <button class="button" type="submit">Aceitar e entrar</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `
+  }
+
+  if (state.authAction.passwordResetToken) {
+    return `
+      <div class="modal-backdrop">
+        <div class="modal">
+          <div class="section-header">
+            <div>
+              <h3 class="section-title">Criar nova senha</h3>
+              <p class="section-copy">Use pelo menos 12 caracteres e combine letras, números e símbolos.</p>
+            </div>
+          </div>
+          <form id="password-reset-confirm-form" class="form-grid">
+            <div class="field">
+              <label>Nova senha</label>
+              <input name="password" type="password" required minlength="12" autocomplete="new-password" />
+            </div>
+            <div class="field">
+              <label>Confirmar senha</label>
+              <input name="passwordConfirm" type="password" required minlength="12" autocomplete="new-password" />
+            </div>
+            <div class="toolbar-row">
+              <button class="button" type="submit">Atualizar senha</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `
+  }
+
+  if (!state.session && state.authMode === "register") {
+    return `
+      <div class="modal-backdrop">
+        <div class="modal">
+          <div class="section-header">
+            <div>
+              <h3 class="section-title">Criar conta</h3>
+              <p class="section-copy">Crie o primeiro usuário proprietário e o workspace da empresa.</p>
+            </div>
+          </div>
+          <form id="registration-form" class="form-grid">
+            <div class="field">
+              <label>Seu nome</label>
+              <input name="displayName" required autocomplete="name" />
+            </div>
+            <div class="field">
+              <label>Email</label>
+              <input name="email" type="email" required autocomplete="email" />
+            </div>
+            <div class="field">
+              <label>Nome da empresa</label>
+              <input name="companyName" required autocomplete="organization" />
+            </div>
+            <div class="field">
+              <label>Slug da empresa</label>
+              <input name="companySlug" required pattern="[a-z0-9][a-z0-9-]{1,61}[a-z0-9]" placeholder="minha-empresa" />
+            </div>
+            <div class="field">
+              <label>Senha</label>
+              <input name="password" type="password" required minlength="12" autocomplete="new-password" />
+            </div>
+            <div class="toolbar-row">
+              <button class="button" type="submit">Criar workspace</button>
+              <button class="button-ghost" type="button" id="show-login">Já tenho conta</button>
+            </div>
+          </form>
+        </div>
+      </div>
+    `
+  }
+
+  if (state.session) {
+    return `
+      <div class="modal-backdrop">
+        <div class="modal">
+          <div class="section-header">
+            <div>
+              <h3 class="section-title">Sessão ativa</h3>
+              <p class="section-copy">Seu acesso está protegido por cookie HTTP-only e pode ser encerrado a qualquer momento.</p>
+            </div>
+            <button class="button-ghost" id="close-settings">Fechar</button>
+          </div>
+          <div class="message-card">
+            <strong>${escapeHtml(state.session.email || state.session.actor)}</strong>
+            <p>Papel: ${escapeHtml(state.session.role)} · Expira em: ${escapeHtml(formatDateTime(state.session.expires_at * 1000))}</p>
+          </div>
+          <div class="toolbar-row">
+            <button class="button-danger" type="button" id="logout-session-modal">Encerrar sessão</button>
+          </div>
+        </div>
+      </div>
+    `
+  }
+
   return `
     <div class="modal-backdrop">
       <div class="modal">
         <div class="section-header">
           <div>
-            <h3 class="section-title">${state.session ? "Sessão ativa da plataforma" : "Entrar na plataforma"}</h3>
-            <p class="section-copy">
-              ${state.session
-                ? "A plataforma já está autenticada com cookie HTTP-only. Você pode trocar o ator da sessão ou encerrar o acesso."
-                : "O token administrativo é usado apenas para emitir uma sessão segura da plataforma. Depois disso, as chamadas usam cookie HTTP-only."}
-            </p>
+            <h3 class="section-title">Entrar na plataforma</h3>
+            <p class="section-copy">Use o email e a senha da sua conta. O acesso administrativo legado fica isolado nas opções avançadas.</p>
           </div>
           <button class="button-ghost" id="close-settings">Fechar</button>
         </div>
         <form id="settings-form" class="form-grid">
           <div class="field">
-            <label>Admin token</label>
-            <input name="adminToken" type="password" value="${escapeHtml(state.drafts.auth.adminToken)}" placeholder="Obrigatório quando ENABLE_ADMIN_AUTH=true" />
+            <label>Email</label>
+            <input name="email" type="email" autocomplete="email" value="${escapeHtml(state.drafts.auth.email)}" placeholder="voce@empresa.com" />
           </div>
           <div class="field">
-            <label>Admin actor</label>
-            <input name="adminActor" value="${escapeHtml(state.drafts.auth.adminActor || state.config.adminActor)}" />
+            <label>Senha</label>
+            <input name="password" type="password" autocomplete="current-password" value="" placeholder="Acesso SaaS por usuário" />
           </div>
-          <div class="field">
-            <label>Company slug preferido</label>
-            <input name="companySlug" value="${escapeHtml(state.config.companySlug)}" placeholder="Ex.: empresa-x" />
-          </div>
-          ${
-            state.session
-              ? `<div class="message-card"><strong>Sessão atual</strong><p>Papel: ${escapeHtml(state.session.role)} · Ator: ${escapeHtml(state.session.actor)} · Expira em: ${escapeHtml(formatDateTime(state.session.expires_at * 1000))}</p></div>`
-              : ""
-          }
+          <details class="auth-advanced">
+            <summary>Acesso administrativo de emergência</summary>
+            <div class="form-grid">
+              <div class="field">
+                <label>Admin token</label>
+                <input name="adminToken" type="password" value="${escapeHtml(state.drafts.auth.adminToken)}" placeholder="Credencial break-glass / legado" />
+              </div>
+              <div class="field">
+                <label>Admin actor</label>
+                <input name="adminActor" value="${escapeHtml(state.drafts.auth.adminActor || state.config.adminActor)}" />
+              </div>
+              <div class="field">
+                <label>Company slug preferido</label>
+                <input name="companySlug" value="${escapeHtml(state.config.companySlug)}" placeholder="Ex.: empresa-x" />
+              </div>
+            </div>
+          </details>
           ${
             state.errorMessage
               ? `<div class="message-card"><strong>Último erro</strong><p>${escapeHtml(state.errorMessage)}</p></div>`
               : ""
           }
           <div class="toolbar-row">
-            <button class="button" type="submit">${state.session ? "Renovar sessão" : "Entrar"}</button>
-            ${state.session ? '<button class="button-danger" type="button" id="logout-session-modal">Encerrar sessão</button>' : ""}
+            <button class="button" type="submit">Entrar</button>
+            ${state.authCapabilities.password_reset ? '<button class="button-ghost" type="button" id="request-password-reset">Esqueci a senha</button>' : ""}
+            ${state.authCapabilities.self_service_signup ? '<button class="button-ghost" type="button" id="show-registration">Criar conta</button>' : ""}
           </div>
         </form>
       </div>
@@ -3755,139 +4220,178 @@ function bindEvents() {
   }
 
   // ── Billing bindings ──
-  const billingStartTrial = document.getElementById("billing-start-trial")
-  if (billingStartTrial) {
-    billingStartTrial.addEventListener("click", async () => {
-      const companyId = state.config.companyId || 1
-      state.loading = true
-      state.loadingMessage = "Iniciando trial..."
+  const billingCycleSelect = document.getElementById("billing-cycle-select")
+  if (billingCycleSelect) {
+    billingCycleSelect.addEventListener("change", () => {
+      state.billingCycle = billingCycleSelect.value === "annual" ? "annual" : "monthly"
       renderApp()
-      try {
-        await apiRequest("/admin/billing/trial", { method: "POST", params: { company_id: companyId } })
-        pushToast("Trial de 7 dias iniciado com sucesso!")
-        await loadBillingData()
-      } catch (error) {
-        pushToast(summarizeError(error), "error")
-      } finally {
-        state.loading = false
-        state.loadingMessage = ""
-        renderApp()
-      }
     })
   }
 
-  const billingActivate = document.getElementById("billing-activate")
-  if (billingActivate) {
-    billingActivate.addEventListener("click", async () => {
-      const companyId = state.config.companyId || 1
-      const planKey = state.billingUsage?.subscription?.plan_key || "avancado"
+  document.querySelectorAll(".billing-portal-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const companyId = state.config.companyId
+      if (!companyId) {
+        pushToast("Selecione uma empresa antes de gerenciar a assinatura.", "error")
+        return
+      }
       state.loading = true
-      state.loadingMessage = "Ativando assinatura..."
+      state.loadingMessage = "Abrindo portal de cobrança..."
       renderApp()
       try {
-        await apiRequest("/admin/billing/activate", {
+        const result = await apiRequest("/admin/billing/portal", {
           method: "POST",
           params: { company_id: companyId },
-          body: { plan_key: planKey, billing_cycle: "monthly" },
+          headers: { "X-Idempotency-Key": window.crypto.randomUUID() },
         })
-        pushToast("Assinatura ativada com sucesso!")
-        await loadBillingData()
+        window.location.assign(result.portal_url)
       } catch (error) {
         pushToast(summarizeError(error), "error")
-      } finally {
         state.loading = false
         state.loadingMessage = ""
         renderApp()
       }
     })
-  }
+  })
 
-  const billingCancel = document.getElementById("billing-cancel")
-  if (billingCancel) {
-    billingCancel.addEventListener("click", async () => {
-      if (!confirm("Tem certeza que deseja cancelar sua assinatura? Você manterá acesso até o fim do período atual.")) return
-      const companyId = state.config.companyId || 1
-      state.loading = true
-      state.loadingMessage = "Cancelando assinatura..."
-      renderApp()
-      try {
-        await apiRequest("/admin/billing/cancel", {
-          method: "POST",
-          params: { company_id: companyId },
-          body: { reason: null },
-        })
-        pushToast("Assinatura cancelada. Acesso mantido até o fim do período.")
-        await loadBillingData()
-      } catch (error) {
-        pushToast(summarizeError(error), "error")
-      } finally {
-        state.loading = false
-        state.loadingMessage = ""
-        renderApp()
-      }
-    })
-  }
-
-  const billingReactivate = document.getElementById("billing-reactivate")
-  if (billingReactivate) {
-    billingReactivate.addEventListener("click", async () => {
-      if (!confirm("Deseja reativar sua assinatura?")) return
-      const companyId = state.config.companyId || 1
-      const planKey = state.billingUsage?.subscription?.plan_key || "avancado"
-      state.loading = true
-      state.loadingMessage = "Reativando assinatura..."
-      renderApp()
-      try {
-        await apiRequest("/admin/billing/reactivate", {
-          method: "POST",
-          params: { company_id: companyId },
-          body: { plan_key: planKey, billing_cycle: "monthly" },
-        })
-        pushToast("Assinatura reativada com sucesso!")
-        await loadBillingData()
-      } catch (error) {
-        pushToast(summarizeError(error), "error")
-      } finally {
-        state.loading = false
-        state.loadingMessage = ""
-        renderApp()
-      }
-    })
-  }
-
-  document.querySelectorAll(".billing-change-plan-btn").forEach((btn) => {
+  document.querySelectorAll(".billing-checkout-btn").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const planKey = btn.dataset.planKey
-      const companyId = state.config.companyId || 1
+      const companyId = state.config.companyId
+      if (!companyId) {
+        pushToast("Selecione uma empresa antes de escolher um plano.", "error")
+        return
+      }
       const hasSub = state.billingUsage?.has_subscription
-      const isCancelled = state.billingUsage?.subscription?.status === "cancelled"
-      const actionLabel = isCancelled ? 'reativar com' : (hasSub ? 'trocar para' : 'ativar')
-      if (!confirm(`Deseja ${actionLabel} o plano ${planKey}?`)) return
+      const subscription = state.billingUsage?.subscription || {}
+      const managedInPortal = (
+        hasSub
+        && subscription.gateway === "stripe"
+        && !["incomplete", "incomplete_expired", "cancelled"].includes(subscription.status)
+      )
+      if (!confirm(`Deseja continuar com o plano ${planKey}?`)) return
       state.loading = true
-      state.loadingMessage = "Atualizando plano..."
+      state.loadingMessage = managedInPortal
+        ? "Abrindo portal de cobrança..."
+        : "Criando checkout seguro..."
       renderApp()
       try {
-        if (isCancelled) {
-          await apiRequest("/admin/billing/reactivate", {
+        if (managedInPortal) {
+          const portal = await apiRequest("/admin/billing/portal", {
             method: "POST",
             params: { company_id: companyId },
-            body: { plan_key: planKey, billing_cycle: "monthly" },
+            headers: { "X-Idempotency-Key": window.crypto.randomUUID() },
           })
-        } else if (hasSub) {
-          await apiRequest("/admin/billing/change-plan", {
-            method: "POST",
-            params: { company_id: companyId },
-            body: { new_plan_key: planKey },
-          })
+          window.location.assign(portal.portal_url)
         } else {
-          await apiRequest("/admin/billing/activate", {
+          const checkout = await apiRequest("/admin/billing/checkout", {
             method: "POST",
             params: { company_id: companyId },
-            body: { plan_key: planKey, billing_cycle: "monthly" },
+            body: {
+              plan_key: planKey,
+              billing_cycle: state.billingCycle,
+            },
+            headers: { "X-Idempotency-Key": window.crypto.randomUUID() },
           })
+          window.location.assign(checkout.checkout_url)
         }
-        pushToast("Plano atualizado com sucesso!")
-        await loadBillingData()
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  })
+
+  const teamOpenSession = document.getElementById("team-open-session")
+  if (teamOpenSession) {
+    teamOpenSession.addEventListener("click", async () => {
+      state.loading = true
+      state.loadingMessage = "Preparando acesso individual..."
+      renderApp()
+      try {
+        await logoutPlatformSession()
+        state.settingsOpen = true
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const teamInvitationForm = document.getElementById("team-invitation-form")
+  if (teamInvitationForm) {
+    teamInvitationForm.addEventListener("submit", async (event) => {
+      event.preventDefault()
+      const formData = new FormData(teamInvitationForm)
+      state.loading = true
+      state.loadingMessage = "Criando e enviando convite..."
+      renderApp()
+      try {
+        const invitation = await apiRequest("/platform/identity/invitations", {
+          method: "POST",
+          admin: false,
+          body: {
+            company_id: Number(state.config.companyId),
+            email: String(formData.get("email") || "").trim(),
+            role: String(formData.get("role") || "operator"),
+          },
+        })
+        state.teamInvitation = invitation
+        pushToast(
+          invitation.delivery_status === "delivered"
+            ? `Convite enviado para ${invitation.email}.`
+            : "Convite criado com link de desenvolvimento."
+        )
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const copyTeamInvitation = document.getElementById("copy-team-invitation")
+  if (copyTeamInvitation) {
+    copyTeamInvitation.addEventListener("click", async () => {
+      const link = document.getElementById("team-invitation-link")?.value
+      if (!link) return
+      try {
+        await navigator.clipboard.writeText(link)
+        pushToast("Link do convite copiado.")
+      } catch {
+        pushToast("Não foi possível copiar automaticamente. Selecione o link manualmente.", "error")
+      }
+    })
+  }
+
+  document.querySelectorAll("[data-team-member-form]").forEach((form) => {
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault()
+      const membershipId = Number(form.dataset.teamMemberForm)
+      const formData = new FormData(form)
+      state.loading = true
+      state.loadingMessage = "Atualizando permissão..."
+      renderApp()
+      try {
+        const updated = await apiRequest(`/platform/identity/members/${membershipId}`, {
+          method: "PATCH",
+          admin: false,
+          params: { company_id: state.config.companyId },
+          body: {
+            role: String(formData.get("role") || ""),
+            active: formData.get("active") === "on",
+          },
+        })
+        await fetchPlatformSession()
+        await loadTeamData()
+        pushToast(`Acesso de ${updated.display_name || updated.email} atualizado.`)
       } catch (error) {
         pushToast(summarizeError(error), "error")
       } finally {
@@ -3914,6 +4418,169 @@ function bindEvents() {
     })
   }
 
+  const showRegistration = document.getElementById("show-registration")
+  if (showRegistration) {
+    showRegistration.addEventListener("click", () => {
+      state.authMode = "register"
+      renderApp()
+    })
+  }
+
+  const showLogin = document.getElementById("show-login")
+  if (showLogin) {
+    showLogin.addEventListener("click", () => {
+      state.authMode = "login"
+      renderApp()
+    })
+  }
+
+  const invitationAcceptForm = document.getElementById("invitation-accept-form")
+  if (invitationAcceptForm) {
+    invitationAcceptForm.addEventListener("submit", async (event) => {
+      event.preventDefault()
+      const formData = new FormData(invitationAcceptForm)
+      const password = String(formData.get("password") || "")
+      if (password !== String(formData.get("passwordConfirm") || "")) {
+        pushToast("As senhas não conferem.", "error")
+        return
+      }
+      state.loading = true
+      state.loadingMessage = "Aceitando convite..."
+      renderApp()
+      try {
+        const session = await apiRequest("/platform/auth/invitations/accept", {
+          method: "POST",
+          admin: false,
+          body: {
+            token: state.authAction.invitationToken,
+            password,
+            display_name: String(formData.get("displayName") || "").trim(),
+          },
+        })
+        state.session = session
+        state.connected = true
+        state.settingsOpen = false
+        const membership = session.memberships?.[0]
+        if (membership) {
+          state.config.companyId = membership.company_id
+          state.config.companySlug = membership.company_slug
+        }
+        clearAuthActionFromUrl()
+        persistConfig()
+        connectSSE()
+        await refreshCurrentView()
+        pushToast("Convite aceito com sucesso.")
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const passwordResetConfirmForm = document.getElementById("password-reset-confirm-form")
+  if (passwordResetConfirmForm) {
+    passwordResetConfirmForm.addEventListener("submit", async (event) => {
+      event.preventDefault()
+      const formData = new FormData(passwordResetConfirmForm)
+      const password = String(formData.get("password") || "")
+      if (password !== String(formData.get("passwordConfirm") || "")) {
+        pushToast("As senhas não conferem.", "error")
+        return
+      }
+      state.loading = true
+      state.loadingMessage = "Atualizando senha..."
+      renderApp()
+      try {
+        await apiRequest("/platform/auth/password-reset/confirm", {
+          method: "POST",
+          admin: false,
+          body: {
+            token: state.authAction.passwordResetToken,
+            password,
+          },
+        })
+        clearAuthActionFromUrl()
+        state.authMode = "login"
+        state.settingsOpen = true
+        pushToast("Senha atualizada. Entre novamente.")
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const registrationForm = document.getElementById("registration-form")
+  if (registrationForm) {
+    registrationForm.addEventListener("submit", async (event) => {
+      event.preventDefault()
+      const formData = new FormData(registrationForm)
+      state.loading = true
+      state.loadingMessage = "Criando workspace..."
+      renderApp()
+      try {
+        const session = await apiRequest("/platform/auth/register", {
+          method: "POST",
+          admin: false,
+          body: {
+            email: String(formData.get("email") || "").trim(),
+            password: String(formData.get("password") || ""),
+            display_name: String(formData.get("displayName") || "").trim(),
+            company_name: String(formData.get("companyName") || "").trim(),
+            company_slug: String(formData.get("companySlug") || "").trim().toLowerCase(),
+          },
+        })
+        state.session = session
+        state.connected = true
+        state.settingsOpen = false
+        state.authMode = "login"
+        const membership = session.memberships?.[0]
+        if (membership) {
+          state.config.companyId = membership.company_id
+          state.config.companySlug = membership.company_slug
+        }
+        persistConfig()
+        connectSSE()
+        await refreshCurrentView()
+        pushToast("Workspace criado com sucesso.")
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      } finally {
+        state.loading = false
+        state.loadingMessage = ""
+        renderApp()
+      }
+    })
+  }
+
+  const requestPasswordReset = document.getElementById("request-password-reset")
+  if (requestPasswordReset) {
+    requestPasswordReset.addEventListener("click", async () => {
+      const emailInput = document.querySelector('#settings-form input[name="email"]')
+      const email = String(emailInput?.value || "").trim()
+      if (!email) {
+        pushToast("Informe seu email primeiro.", "error")
+        return
+      }
+      try {
+        await apiRequest("/platform/auth/password-reset/request", {
+          method: "POST",
+          admin: false,
+          body: { email },
+        })
+        pushToast("Se a conta existir, enviaremos um link de redefinição.")
+      } catch (error) {
+        pushToast(summarizeError(error), "error")
+      }
+    })
+  }
+
   const settingsForm = document.getElementById("settings-form")
   if (settingsForm) {
     settingsForm.addEventListener("submit", async (event) => {
@@ -3921,6 +4588,8 @@ function bindEvents() {
       const formData = new FormData(settingsForm)
       state.drafts.auth.adminToken = String(formData.get("adminToken") || "").trim()
       state.drafts.auth.adminActor = String(formData.get("adminActor") || "").trim()
+      state.drafts.auth.email = String(formData.get("email") || "").trim()
+      state.drafts.auth.password = String(formData.get("password") || "")
       state.config.adminActor = state.drafts.auth.adminActor
       state.config.companySlug = String(formData.get("companySlug") || "").trim()
       persistConfig()
@@ -3931,6 +4600,7 @@ function bindEvents() {
         await loginPlatformSession()
         state.settingsOpen = false
         pushToast("Sessão da plataforma autenticada.")
+        connectSSE()
         await refreshCurrentView()
       } catch (error) {
         state.errorMessage = summarizeError(error)
@@ -4048,9 +4718,8 @@ function bindStudioEvents() {
       state.loadingMessage = "Enviando mensagem para o runtime..."
       renderApp()
       try {
-        const result = await apiRequest("/messages/incoming", {
+        const result = await apiRequest("/admin/simulator/messages", {
           method: "POST",
-          admin: false,
           params: getCompanyParams(),
           body: {
             contact_id: session.contact_id,
@@ -4895,6 +5564,7 @@ function bindAgendaEvents() {
       try {
         await apiRequest(`/admin/calendar/bookings/${bookingId}/reschedule`, {
           method: "POST",
+          params: getAdminCompanyParams(),
           body: {
             starts_at: normalizeDatetimeLocal(String(formData.get("starts_at") || "")),
             ends_at: normalizeDatetimeLocal(String(formData.get("ends_at") || "")),
@@ -4923,6 +5593,7 @@ function bindAgendaEvents() {
       try {
         await apiRequest(`/admin/calendar/bookings/${bookingId}/cancel`, {
           method: "POST",
+          params: getAdminCompanyParams(),
           body: {
             trigger_queue_recovery: true,
             reason: "Cancelado manualmente pela plataforma dedicada.",
@@ -5133,14 +5804,26 @@ root.addEventListener("click", async (e) => {
 // ── Real-time SSE connection ──────────────────────────────────────────
 
 let _eventSource = null
+let _sseRetryDelayMs = 5000
+const SSE_MAX_RETRY_DELAY_MS = 60000
 
+function disconnectSSE() {
+  if (!_eventSource) return
+  _eventSource.close()
+  _eventSource = null
+}
+
+// The stream requires an authenticated platform session; without one the server
+// answers 401, so reconnecting is pointless until the user logs in again.
 function connectSSE() {
   if (_eventSource) return
+  if (!state.session) return
   try {
     _eventSource = new EventSource("/platform/events")
 
     _eventSource.addEventListener("connected", () => {
       state.connected = true
+      _sseRetryDelayMs = 5000
     })
 
     _eventSource.onmessage = (ev) => {
@@ -5153,10 +5836,11 @@ function connectSSE() {
     }
 
     _eventSource.onerror = () => {
-      _eventSource?.close()
-      _eventSource = null
-      // Reconnect after 5 seconds
-      setTimeout(connectSSE, 5000)
+      disconnectSSE()
+      if (!state.session) return
+      const retryDelayMs = _sseRetryDelayMs
+      _sseRetryDelayMs = Math.min(_sseRetryDelayMs * 2, SSE_MAX_RETRY_DELAY_MS)
+      setTimeout(connectSSE, retryDelayMs)
     }
   } catch {
     // SSE not supported or connection failed
@@ -5205,12 +5889,20 @@ function handleRealtimeEvent(event) {
 async function bootstrap() {
   renderApp()
   try {
+    await fetchAuthCapabilities()
     await fetchPlatformSession()
     await refreshCurrentView()
-    state.settingsOpen = false
+    state.settingsOpen = Boolean(
+      state.authAction.invitationToken || state.authAction.passwordResetToken
+    )
     connectSSE()
     renderApp()
   } catch {
+    try {
+      await fetchAuthCapabilities()
+    } catch {
+      // Keep conservative defaults when capability discovery is unavailable.
+    }
     state.settingsOpen = true
     renderApp()
   }

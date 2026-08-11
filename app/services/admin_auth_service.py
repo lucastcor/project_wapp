@@ -1,3 +1,4 @@
+import hmac
 from typing import Any
 
 
@@ -46,6 +47,13 @@ def get_role_token_map(settings_obj: Any) -> dict[str, str]:
     return role_token_map
 
 
+def secrets_match(provided: str | None, configured: str | None) -> bool:
+    """Constant-time secret comparison that tolerates non-ASCII values."""
+    if not provided or not configured:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), configured.encode("utf-8"))
+
+
 def resolve_admin_role_from_token(
     provided_token: str | None,
     *,
@@ -54,7 +62,9 @@ def resolve_admin_role_from_token(
     if not provided_token:
         return None
 
+    resolved_role: str | None = None
+    # Every configured token is compared so the response time does not reveal which role matched.
     for role, configured_token in get_role_token_map(settings_obj).items():
-        if provided_token == configured_token:
-            return role
-    return None
+        if secrets_match(provided_token, configured_token) and resolved_role is None:
+            resolved_role = role
+    return resolved_role

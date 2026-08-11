@@ -2,12 +2,19 @@
 title: Endpoints Admin
 type: api
 tags: [api, admin, rbac]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Endpoints Admin
 
-Prefixo `/admin`. Auth obrigatório quando `ENABLE_ADMIN_AUTH=true`. Implementação em `app/api/admin_routes.py`. Detalhe RBAC em [[30-API/05-RBAC e Papéis]].
+Prefixo `/admin`. Auth obrigatório quando `ENABLE_ADMIN_AUTH=true`.
+Implementação em `app/api/admin_routes.py`; a política de papel por rota vive em
+`app/api/admin_permissions.py` e é verificada por
+`tests/test_admin_rbac_matrix.py`. Detalhe em [[30-API/05-RBAC e Papéis]].
+
+> Autenticar **não** autoriza mutação. Toda rota `POST`/`PUT`/`PATCH`/`DELETE`
+> carrega explicitamente `Depends(require_admin_role(...))`; o papel `viewer`
+> recebe `403` em qualquer uma delas.
 
 ## Padrão de auth
 
@@ -55,9 +62,15 @@ Body POST:
 ### Company context
 
 | GET | `/admin/company-context?company_slug=` | viewer |
+| GET | `/admin/company-context/record?company_slug=` | viewer |
 | PUT | `/admin/company-context` | superadmin |
 
-Body PUT: `{"data": {...JSON completo do contexto...}}`.
+Body PUT: `{"data": {...contexto completo...}, "expected_revision": 3}`.
+`expected_revision` é opcional; quando enviado e desatualizado, a resposta é `409`
+e nada é gravado. `GET .../record` devolve `revision`, `schema_version`, `source`,
+`company_id`, `updated_at`, `updated_by` e `data` — use para obter a revisão atual.
+
+Persistência e concorrência em [[40-Data/05-Company Context]].
 
 ### Pending questions
 
@@ -164,14 +177,51 @@ Detalhe em [[10-Architecture/06-Fluxo Agenda]].
 ### Billing
 
 | GET | `/admin/billing/plans` | viewer |
-| POST | `/admin/billing/trial` | operator |
-| POST | `/admin/billing/activate` | operator |
-| POST | `/admin/billing/cancel` | operator |
-| POST | `/admin/billing/reactivate` | operator |
-| POST | `/admin/billing/change-plan` | operator |
+| POST | `/admin/billing/trial` | superadmin |
+| POST | `/admin/billing/activate` | superadmin |
+| POST | `/admin/billing/cancel` | superadmin |
+| POST | `/admin/billing/reactivate` | superadmin |
+| POST | `/admin/billing/change-plan` | superadmin |
 | GET | `/admin/billing/usage?company_id=` | viewer |
-| POST | `/admin/billing/usage/record` | operator |
+| POST | `/admin/billing/usage/record` | superadmin |
 | GET | `/admin/billing/check-limit?company_id=&metric=` | viewer |
+
+Toda administração de billing exige `superadmin` até existir billing por dono de
+tenant. `POST /admin/billing/usage/record` grava `audit_events`
+(`action=record_usage`, `resource_type=billing_usage`), com `status=skipped`
+quando não há assinatura ativa.
+
+### Vínculos de canal WhatsApp
+
+| GET | `/admin/whatsapp/bindings?company_id=&active_only=` | viewer |
+| PUT | `/admin/whatsapp/bindings` | superadmin |
+| POST | `/admin/whatsapp/bindings/{binding_id}/state` | superadmin |
+
+Body `PUT`: `{"company_id": 1, "phone_number_id": "<id do Meta>", "display_phone_number": "5511...", "active": true}`.
+Body `POST .../state`: `{"active": false}`.
+
+- `409` quando o `phone_number_id` já está ativamente vinculado a **outra** empresa —
+  tanto no `PUT` quanto ao reativar um vínculo histórico via `POST .../state`.
+  A decisão é do índice único do banco, então requisições concorrentes também
+  resultam em exatamente um dono ativo.
+- `404` quando a empresa (no `PUT`) ou o vínculo (no `POST .../state`) não existe.
+- Respostas e auditoria carregam apenas identificadores — nunca token de acesso
+  ou app secret.
+- Criação, atualização, ativação e desativação geram `audit_events`
+  (`resource_type=whatsapp_channel_binding`).
+
+Detalhe do uso em [[30-API/03-Webhook WhatsApp]].
+
+### Simulador
+
+| POST | `/admin/simulator/messages?company_id=&company_slug=` | operator |
+
+Body: `{"contact_id":"5511999999999","contact_name":"Cliente","message":"oi"}`.
+
+Processa a mensagem pelo runtime real. Substitui a chamada anônima que o Bot Studio
+fazia a `POST /messages/incoming`. A empresa é resolvida no servidor e precisa
+existir (`400` se `company_id`/`company_slug` não resolver). Registra
+`audit_events` com `action=simulate_message` e `contact_id` mascarado.
 
 ## Códigos de erro padrão
 
@@ -179,6 +229,7 @@ Detalhe em [[10-Architecture/06-Fluxo Agenda]].
 - 401 — credencial admin inválida.
 - 403 — papel insuficiente, ou HMAC webhook inválido.
 - 404 — não encontrado.
+- 409 — conflito de revisão do company context.
 - 422 — payload inválido (Pydantic).
 - 429 — rate limit.
 - 500 — erro inesperado (com `request_id`).

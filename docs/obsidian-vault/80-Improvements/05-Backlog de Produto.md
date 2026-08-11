@@ -2,7 +2,7 @@
 title: Backlog de Produto
 type: improvement
 tags: [melhorias, backlog, produto]
-updated: 2026-04-28
+updated: 2026-07-26
 ---
 
 # Backlog de Produto
@@ -52,7 +52,8 @@ Funcionalidades que aumentam **valor entregue ao cliente final**, organizadas po
 ## Operação
 
 ### B-010 — Identidade humana centralizada
-- OIDC. Ver [[80-Improvements/03-Melhorias de Segurança]] S-001.
+- **Concluído para identidade própria**: usuários, memberships, convite, reset
+  e sessão revogável. Evolução opcional: OIDC/MFA.
 
 ### B-011 — Hardening WhatsApp produtivo
 - Retries, métricas, dashboard de delivery rate.
@@ -85,10 +86,11 @@ Funcionalidades que aumentam **valor entregue ao cliente final**, organizadas po
 ## Billing
 
 ### B-019 — Enforcement automático de limites
-- Hoje `check_limit` é lookup; falta gate no caminho real (mensagem, booking, finetuning).
+- **Concluído no Release 1C**: gates/reservas em booking, campanha e
+  fine-tuning; soft meter em mensagem/handoff.
 
 ### B-020 — Integração com gateway de pagamento
-- Stripe ou similar para cobrar planos automaticamente.
+- **Implementado com Stripe**; falta ativar/testar a conta sandbox do ambiente.
 
 ### B-021 — Dashboard financeiro
 - Receita por tenant, churn, MRR.

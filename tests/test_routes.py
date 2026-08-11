@@ -11,6 +11,14 @@ from app.services.rate_limit_service import reset_rate_limit_state
 
 client = TestClient(app)
 
+NORMALIZED_INGRESS_SECRET = "test-internal-ingress-secret"
+NORMALIZED_INGRESS_HEADERS = {"X-Internal-Ingress-Secret": NORMALIZED_INGRESS_SECRET}
+
+
+def enable_normalized_ingress(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "enable_normalized_whatsapp_ingress", True)
+    monkeypatch.setattr(settings, "internal_ingress_secret", NORMALIZED_INGRESS_SECRET)
+
 
 def test_healthcheck() -> None:
     response = client.get("/health", headers={"X-Request-ID": "req-health-123"})
@@ -185,6 +193,7 @@ def test_incoming_message_rate_limited(monkeypatch) -> None:
     monkeypatch.setattr(settings, "rate_limit_window_seconds", 60)
     monkeypatch.setattr(settings, "rate_limit_incoming_requests", 1)
     monkeypatch.setattr(settings, "rate_limit_exempt_localhost", False)
+    monkeypatch.setattr(settings, "trust_proxy_headers", True)
     monkeypatch.setattr(routes, "process_incoming_message", lambda **kwargs: {
         "contact_id": kwargs["contact_id"],
         "classification": "lead_novo",
@@ -242,6 +251,7 @@ def test_whatsapp_webhook(monkeypatch) -> None:
             return 123
 
     fake_repository = FakeRepository()
+    enable_normalized_ingress(monkeypatch)
     monkeypatch.setattr(routes, "repository", fake_repository)
     monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None, company_id=None: {
         "outbound_message_id": outbound_message_id,
@@ -276,7 +286,7 @@ def test_whatsapp_webhook(monkeypatch) -> None:
         "text": "Olá",
         "provider_message_id": "wamid.normalized.123",
     }
-    response = client.post("/webhooks/whatsapp", json=payload)
+    response = client.post("/webhooks/whatsapp", json=payload, headers=NORMALIZED_INGRESS_HEADERS)
 
     assert response.status_code == 200
     data = response.json()
@@ -317,6 +327,17 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
             self.created_messages.append(kwargs)
             return 321
 
+        def get_whatsapp_binding_by_phone_number_id(self, phone_number_id, *, active_only=True):
+            if phone_number_id != "111222333444555":
+                return None
+            return {
+                "id": 1,
+                "company_id": 1,
+                "company_slug": "default",
+                "company_active": 1,
+                "phone_number_id": phone_number_id,
+            }
+
     fake_repository = FakeRepository()
     monkeypatch.setattr(routes, "repository", fake_repository)
     monkeypatch.setattr(settings, "whatsapp_app_secret", "meta-app-secret")
@@ -347,7 +368,7 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     })
 
     raw_payload = (
-        '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
+        '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"metadata":{"display_phone_number":"5511888887777","phone_number_id":"111222333444555"},"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
     ).encode("utf-8")
     signature = hmac.new(
         b"meta-app-secret",
@@ -371,13 +392,16 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     assert fake_repository.created_messages[0]["source"] == "whatsapp_auto_reply"
     assert fake_repository.created_messages[0]["contact_id"] == "5511999999999"
     assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.inbound.123"
+    # The tenant resolved from the signed payload's phone_number_id binding must
+    # flow into the idempotency receipt, not stay unscoped.
     assert fake_repository.completed_receipts == [
         {
             "provider": "whatsapp",
             "provider_message_id": "wamid.inbound.123",
-            "company_id": None,
+            "company_id": 1,
         }
     ]
+    assert fake_repository.receipts_started[0]["company_id"] == 1
 
 
 def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> None:
@@ -399,6 +423,7 @@ def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> 
             raise AssertionError("Duplicate payload should not enqueue outbound messages.")
 
     fake_repository = FakeRepository()
+    enable_normalized_ingress(monkeypatch)
     monkeypatch.setattr(routes, "repository", fake_repository)
     monkeypatch.setattr(
         routes,
@@ -413,7 +438,7 @@ def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> 
         "text": "Olá",
         "provider_message_id": "wamid.normalized.duplicate",
     }
-    response = client.post("/webhooks/whatsapp", json=payload)
+    response = client.post("/webhooks/whatsapp", json=payload, headers=NORMALIZED_INGRESS_HEADERS)
 
     assert response.status_code == 200
     assert response.json() == {
@@ -426,30 +451,37 @@ def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> 
     assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.normalized.duplicate"
 
 
-def test_whatsapp_webhook_ignores_non_message_meta_events() -> None:
-    payload = {
-        "object": "whatsapp_business_account",
-        "entry": [
-            {
-                "changes": [
-                    {
-                        "value": {
-                            "statuses": [
-                                {
-                                    "id": "wamid.status.1",
-                                    "status": "delivered",
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }
-        ],
-    }
-    response = client.post("/webhooks/whatsapp", json=payload)
+def test_whatsapp_webhook_ignores_non_message_meta_events(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "whatsapp_app_secret", "meta-app-secret")
+    raw_payload = (
+        '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"statuses":'
+        '[{"id":"wamid.status.1","status":"delivered"}]}}]}]}'
+    ).encode("utf-8")
+    signature = hmac.new(b"meta-app-secret", msg=raw_payload, digestmod=hashlib.sha256).hexdigest()
+
+    response = client.post(
+        "/webhooks/whatsapp",
+        content=raw_payload,
+        headers={
+            "Content-Type": "application/json",
+            "X-Hub-Signature-256": f"sha256={signature}",
+        },
+    )
 
     assert response.status_code == 200
     assert response.json()["processed"] is False
+
+
+def test_whatsapp_webhook_rejects_unsigned_meta_status_event(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "whatsapp_app_secret", "meta-app-secret")
+    payload = {
+        "object": "whatsapp_business_account",
+        "entry": [{"changes": [{"value": {"statuses": [{"id": "wamid.status.1", "status": "delivered"}]}}]}],
+    }
+
+    response = client.post("/webhooks/whatsapp", json=payload)
+
+    assert response.status_code == 403
 
 
 def test_whatsapp_webhook_rejects_invalid_meta_signature(monkeypatch) -> None:

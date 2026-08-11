@@ -2,7 +2,7 @@
 title: API Pública
 type: module
 tags: [módulo, api, público]
-updated: 2026-04-28
+updated: 2026-07-25
 ---
 
 # Módulo: API Pública
@@ -15,13 +15,14 @@ updated: 2026-04-28
 |--------|------|--------|
 | GET | `/health` | Healthcheck simples. Retorna `{status:"ok"}`. |
 | GET | `/health/ready` | Readiness com probe de banco + readiness checks. 503 se degradado. |
-| POST | `/messages/incoming` | Entrada genérica (não-Meta). Resposta = contrato `IncomingMessageResponse`. |
+| POST | `/messages/incoming` | Entrada genérica (não-Meta). Exige `INTERNAL_INGRESS_SECRET` em produção. Resposta = contrato `IncomingMessageResponse`. |
 | GET | `/webhooks/whatsapp` | Handshake do Meta. Retorna `hub.challenge` se token confere. |
-| POST | `/webhooks/whatsapp` | Webhook real do Meta com HMAC + idempotência. |
+| POST | `/webhooks/whatsapp` | Webhook real do Meta com HMAC + idempotência. Modo normalizado interno é opt-in e autenticado. |
 | GET | `/platform` | Shell HTML da SPA. |
 | POST | `/platform/auth/session` | Login → cookie HTTP-only. |
 | GET | `/platform/auth/session` | Inspeciona sessão atual. |
 | DELETE | `/platform/auth/session` | Logout. |
+| GET | `/platform/events` | Stream SSE. Exige sessão de plataforma; escopo de tenant vem da sessão. |
 
 `/platform*` está em `app/api/platform_routes.py` (separado).
 

@@ -7,6 +7,11 @@ from zoneinfo import ZoneInfo
 
 from app.core.company_context import get_company_context
 from app.core.config import is_missing_or_placeholder, settings
+from app.services.billing_service import (
+    BillingLimitError,
+    refund_usage_reservation,
+    require_usage_capacity,
+)
 from app.services.reminder_service import schedule_booking_customer_reminders
 from app.storage.repository import RuntimeRepository
 
@@ -143,10 +148,10 @@ def _normalize_string_list(values: Any) -> list[str]:
 
 def _parse_workday_windows(value: Any) -> list[tuple[time, time]]:
     if isinstance(value, list):
-        windows: list[tuple[time, time]] = []
+        nested_windows: list[tuple[time, time]] = []
         for item in value:
-            windows.extend(_parse_workday_windows(item))
-        return windows
+            nested_windows.extend(_parse_workday_windows(item))
+        return nested_windows
 
     normalized = _normalize_lookup_key(value)
     if not normalized:
@@ -1255,47 +1260,64 @@ def create_calendar_booking(
         if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in provider_conflicts):
             raise CalendarProviderError("O horário solicitado conflita com um evento já existente no calendário externo.")
 
-    external_event_id = provider.create_external_event(
-        title=title,
-        starts_at=starts_at_dt,
-        ends_at=ends_at_dt,
-        timezone_name=timezone_value,
-        description=description,
-    )
-    booking_id = repository.create_appointment_booking(
-        company_id=company_id,
-        contact_id=contact_id,
-        integration_id=integration.get("integration_id"),
-        provider=str(integration["provider"]),
-        external_event_id=external_event_id,
-        scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
-        customer_profile=customer_profile,
-        title=title,
-        description=description,
-        starts_at=_to_utc_iso(starts_at_dt),
-        ends_at=_to_utc_iso(ends_at_dt),
-        timezone=timezone_value,
-        status="confirmed",
-    )
-    booking = next(
-        (
-            item
-            for item in repository.get_appointment_bookings(company_id=company_id)
-            if int(item["id"]) == booking_id
-        ),
-        None,
-    )
-    if not booking:
-        raise CalendarProviderError("Booking não encontrado após criação.")
+    billing_decision: dict[str, Any] | None = None
+    if company_id is not None:
+        try:
+            billing_decision = require_usage_capacity(
+                company_id=int(company_id),
+                metric="bookings",
+            )
+        except BillingLimitError as exc:
+            raise CalendarProviderError(str(exc)) from exc
 
-    scheduled_reminders = schedule_booking_customer_reminders(booking)
+    try:
+        external_event_id = provider.create_external_event(
+            title=title,
+            starts_at=starts_at_dt,
+            ends_at=ends_at_dt,
+            timezone_name=timezone_value,
+            description=description,
+        )
+        booking_id = repository.create_appointment_booking(
+            company_id=company_id,
+            contact_id=contact_id,
+            integration_id=integration.get("integration_id"),
+            provider=str(integration["provider"]),
+            external_event_id=external_event_id,
+            scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
+            customer_profile=customer_profile,
+            title=title,
+            description=description,
+            starts_at=_to_utc_iso(starts_at_dt),
+            ends_at=_to_utc_iso(ends_at_dt),
+            timezone=timezone_value,
+            status="confirmed",
+        )
+        booking = next(
+            (
+                item
+                for item in repository.get_appointment_bookings(company_id=company_id)
+                if int(item["id"]) == booking_id
+            ),
+            None,
+        )
+        if not booking:
+            raise CalendarProviderError("Booking não encontrado após criação.")
 
-    return {
-        **booking,
-        "provider_readiness": readiness,
-        "scheduled_reminders": scheduled_reminders,
-        "scheduling_profile": scheduling_profile,
-    }
+        scheduled_reminders = schedule_booking_customer_reminders(booking)
+        return {
+            **booking,
+            "provider_readiness": readiness,
+            "scheduled_reminders": scheduled_reminders,
+            "scheduling_profile": scheduling_profile,
+        }
+    except Exception:
+        if company_id is not None and billing_decision is not None:
+            refund_usage_reservation(
+                company_id=int(company_id),
+                decision=billing_decision,
+            )
+        raise
 
 
 def _sync_booking_cancellation(

@@ -5,10 +5,18 @@ from typing import Any, TypedDict
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
+from pydantic import ValidationError
 
+from app.api.ingress_security import (
+    INTERNAL_INGRESS_HEADER,
+    authenticate_internal_ingress,
+    authorize_normalized_whatsapp_ingress,
+    internal_ingress_enforced,
+)
 from app.api.schemas import (
     IncomingMessageRequest,
     IncomingMessageResponse,
+    NormalizedWhatsAppPayload,
 )
 from app.core.config import settings
 from app.core.orchestrator import (
@@ -16,8 +24,9 @@ from app.core.orchestrator import (
     process_whatsapp_webhook,
 )
 from app.core.logging import get_logger, log_event
+from app.services.admin_auth_service import secrets_match
 from app.services.outbound_dispatch_service import OutboundDispatchError, dispatch_outbound_message
-from app.services.realtime_service import broadcast_event
+from app.services.realtime_service import publish_incoming_message_event
 from app.storage.repository import RuntimeRepository
 
 router = APIRouter(tags=["chat"])
@@ -36,20 +45,43 @@ def _resolve_request_company(
     x_company_id: str | None = None,
     x_company_slug: str | None = None,
 ) -> RequestCompanyScope:
-    resolved_company_id = company_id
-    if resolved_company_id is None and x_company_id:
-        try:
-            resolved_company_id = int(x_company_id.strip())
-        except ValueError:
-            resolved_company_id = None
+    """Resolve the requested tenant against persisted companies.
 
-    resolved_company_slug = company_slug or x_company_slug
-    if isinstance(resolved_company_slug, str):
-        resolved_company_slug = resolved_company_slug.strip() or None
+    A caller-supplied company must exist; the request is rejected instead of
+    silently falling back to the default company, which would let an arbitrary
+    caller write into another tenant's scope.
+    """
+    requested_company_id = company_id
+    if requested_company_id is None and x_company_id:
+        normalized_header = x_company_id.strip()
+        if normalized_header:
+            try:
+                requested_company_id = int(normalized_header)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="X-Company-Id must be an integer.",
+                ) from exc
+
+    requested_company_slug = company_slug or x_company_slug
+    if isinstance(requested_company_slug, str):
+        requested_company_slug = requested_company_slug.strip() or None
+
+    if requested_company_id is None and not requested_company_slug:
+        return {"company_id": None, "company_slug": None}
+
+    company = None
+    if requested_company_id is not None:
+        company = repository.get_company(requested_company_id)
+    elif requested_company_slug:
+        company = repository.get_company_by_slug(requested_company_slug)
+
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found.")
 
     return {
-        "company_id": resolved_company_id,
-        "company_slug": resolved_company_slug,
+        "company_id": int(company["id"]),
+        "company_slug": str(company["slug"]),
     }
 
 
@@ -79,6 +111,15 @@ def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | 
             if not isinstance(messages, list) or not messages:
                 continue
 
+            # phone_number_id is the provider's stable identifier for the
+            # receiving business number and is the only trusted tenant selector
+            # in a signed payload. display_phone_number is presentation data and
+            # is deliberately not used for identity.
+            metadata = value.get("metadata")
+            phone_number_id = None
+            if isinstance(metadata, dict):
+                phone_number_id = str(metadata.get("phone_number_id") or "").strip() or None
+
             contact_name = None
             contact_wa_id = None
             if isinstance(contacts, list) and contacts:
@@ -107,33 +148,99 @@ def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | 
                     "from_name": str(contact_name or "").strip() or None,
                     "text": body,
                     "provider_message_id": str(message.get("id") or "").strip() or None,
+                    "phone_number_id": phone_number_id,
                 }
 
     return None
 
 
-def _extract_whatsapp_message_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    if all(key in payload for key in {"event", "from_number", "text"}):
-        normalized_text = str(payload.get("text") or "").strip()
-        normalized_number = str(payload.get("from_number") or "").strip()
-        if not normalized_text or not normalized_number:
-            raise HTTPException(status_code=400, detail="text and from_number must not be blank.")
-        return (
+def _is_normalized_whatsapp_payload(payload: dict[str, Any]) -> bool:
+    return all(key in payload for key in {"event", "from_number", "text"})
+
+
+def _parse_normalized_whatsapp_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_text = str(payload.get("text") or "").strip()
+    normalized_number = str(payload.get("from_number") or "").strip()
+    if not normalized_text or not normalized_number:
+        raise HTTPException(status_code=400, detail="text and from_number must not be blank.")
+
+    try:
+        validated = NormalizedWhatsAppPayload(
+            event=str(payload.get("event") or "message.received"),
+            from_number=normalized_number,
+            from_name=str(payload.get("from_name") or "").strip() or None,
+            text=normalized_text,
+            provider_message_id=str(payload.get("provider_message_id") or "").strip() or None,
+        )
+    except ValidationError as exc:
+        # Report which field failed and why, never the offending value itself.
+        detail = [
             {
-                "event": str(payload.get("event") or "message.received"),
-                "from_number": normalized_number,
-                "from_name": str(payload.get("from_name") or "").strip() or None,
-                "text": normalized_text,
-                "provider_message_id": str(payload.get("provider_message_id") or "").strip() or None,
-            },
-            "normalized",
+                "field": ".".join(str(part) for part in error.get("loc", ())),
+                "error": str(error.get("type")),
+            }
+            for error in exc.errors(include_url=False)
+        ]
+        raise HTTPException(status_code=422, detail=detail) from exc
+
+    return validated.model_dump()
+
+
+def _resolve_meta_company(phone_number_id: str | None) -> RequestCompanyScope:
+    """Resolve the tenant of a signed Meta event from its phone_number_id only.
+
+    A valid signature proves the payload came from Meta; it does not authorize a
+    tenant. The company therefore comes exclusively from the server-controlled
+    `whatsapp_channel_bindings` table, and caller-supplied company selectors are
+    ignored in Meta mode. Unknown, ambiguous, inactive or missing bindings fail
+    closed — the default company is never used as a fallback.
+    """
+    normalized_phone_number_id = str(phone_number_id or "").strip()
+    if not normalized_phone_number_id:
+        _log_meta_binding_denied("missing_phone_number_id")
+        raise HTTPException(
+            status_code=403,
+            detail="WhatsApp payload does not identify a bound business number.",
         )
 
-    meta_message = _extract_meta_whatsapp_message(payload)
-    if meta_message:
-        return meta_message, "meta"
+    binding = repository.get_whatsapp_binding_by_phone_number_id(normalized_phone_number_id)
+    if not binding:
+        # Covers unknown, inactive and ambiguous (multiple active) bindings.
+        _log_meta_binding_denied("unbound_phone_number_id")
+        raise HTTPException(
+            status_code=403,
+            detail="WhatsApp business number is not bound to an active company.",
+        )
 
-    return None, "ignored"
+    if not int(binding.get("company_active") or 0):
+        _log_meta_binding_denied("inactive_company")
+        raise HTTPException(
+            status_code=403,
+            detail="WhatsApp business number is not bound to an active company.",
+        )
+
+    return {
+        "company_id": int(binding["company_id"]),
+        "company_slug": str(binding["company_slug"]),
+    }
+
+
+def _log_meta_binding_denied(reason: str) -> None:
+    log_event(
+        logger,
+        logging.WARNING,
+        "api.whatsapp.webhook.tenant_binding_denied",
+        denial_reason=reason,
+    )
+
+
+def _detect_whatsapp_payload_mode(payload: dict[str, Any]) -> str:
+    """Classify the payload shape before any authentication decision is made."""
+    if _is_normalized_whatsapp_payload(payload):
+        return "normalized"
+    if payload.get("object") == "whatsapp_business_account":
+        return "meta"
+    return "ignored"
 
 
 def _validate_meta_signature(raw_body: bytes, signature_header: str | None) -> None:
@@ -242,7 +349,16 @@ def incoming_message(
     company_slug: str | None = Query(default=None),
     x_company_id: str | None = Header(default=None, alias="X-Company-Id"),
     x_company_slug: str | None = Header(default=None, alias="X-Company-Slug"),
+    x_internal_ingress_secret: str | None = Header(default=None, alias=INTERNAL_INGRESS_HEADER),
+    authorization: str | None = Header(default=None),
 ) -> IncomingMessageResponse:
+    ingress_auth_mode = authenticate_internal_ingress(
+        header_secret=x_internal_ingress_secret,
+        authorization=authorization,
+        require_credentials=internal_ingress_enforced(),
+        surface="messages_incoming",
+    )
+
     normalized_message = payload.message.strip()
     if not normalized_message:
         raise HTTPException(status_code=400, detail="message must not be blank.")
@@ -261,6 +377,7 @@ def incoming_message(
         "api.messages.incoming.received",
         company_id=resolved_company_id,
         company_slug=resolved_company_slug,
+        ingress_auth_mode=ingress_auth_mode,
         has_contact_name=bool(payload.contact_name),
     )
     result: dict[str, Any] = process_incoming_message(
@@ -280,11 +397,7 @@ def incoming_message(
         auto_reply=result.get("auto_reply"),
         handoff_required=result.get("handoff_required"),
     )
-    broadcast_event("new_message", {
-        "contact_id": payload.contact_id,
-        "classification": result.get("classification"),
-        "handoff_required": result.get("handoff_required"),
-    })
+    publish_incoming_message_event(result, contact_id=payload.contact_id)
     return IncomingMessageResponse(**result)
 
 
@@ -301,7 +414,7 @@ def verify_whatsapp_webhook(
     if not configured_token:
         raise HTTPException(status_code=503, detail="WhatsApp webhook verification token is not configured.")
 
-    if hub_verify_token != configured_token:
+    if not secrets_match(hub_verify_token, configured_token):
         raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook verify token.")
 
     log_event(
@@ -320,6 +433,8 @@ async def whatsapp_webhook(
     x_company_id: str | None = Header(default=None, alias="X-Company-Id"),
     x_company_slug: str | None = Header(default=None, alias="X-Company-Slug"),
     x_hub_signature_256: str | None = Header(default=None, alias="X-Hub-Signature-256"),
+    x_internal_ingress_secret: str | None = Header(default=None, alias=INTERNAL_INGRESS_HEADER),
+    authorization: str | None = Header(default=None),
 ) -> Any:
     try:
         raw_body = await request.body()
@@ -329,7 +444,29 @@ async def whatsapp_webhook(
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="Webhook payload must be a JSON object.")
 
-    normalized_payload, payload_mode = _extract_whatsapp_message_payload(payload)
+    payload_mode = _detect_whatsapp_payload_mode(payload)
+
+    # Authenticate before any parsing, persistence or orchestration side effect.
+    if payload_mode == "meta":
+        _validate_meta_signature(raw_body, x_hub_signature_256)
+    elif payload_mode == "normalized":
+        authorize_normalized_whatsapp_ingress(
+            header_secret=x_internal_ingress_secret,
+            authorization=authorization,
+        )
+
+    normalized_payload: dict[str, Any] | None = None
+    # Kept out of the validated message model: it is Meta-only tenant metadata,
+    # never a field a normalized-ingress caller can supply.
+    meta_phone_number_id: str | None = None
+    if payload_mode == "normalized":
+        normalized_payload = _parse_normalized_whatsapp_payload(payload)
+    elif payload_mode == "meta":
+        meta_message = _extract_meta_whatsapp_message(payload)
+        if meta_message:
+            meta_phone_number_id = meta_message.get("phone_number_id")
+            normalized_payload = _parse_normalized_whatsapp_payload(meta_message)
+
     if not normalized_payload:
         log_event(
             logger,
@@ -344,14 +481,19 @@ async def whatsapp_webhook(
         }
 
     if payload_mode == "meta":
-        _validate_meta_signature(raw_body, x_hub_signature_256)
-
-    request_company = _resolve_request_company(
-        company_id=company_id,
-        company_slug=company_slug,
-        x_company_id=x_company_id,
-        x_company_slug=x_company_slug,
-    )
+        # Meta mode ignores caller-supplied company selectors entirely: the
+        # tenant comes from the signed payload's phone_number_id binding.
+        request_company = _resolve_meta_company(meta_phone_number_id)
+    else:
+        # Normalized mode is authenticated by the internal ingress secret, whose
+        # holder is a trusted internal component, so it may select a tenant
+        # explicitly. The company must still exist (404 otherwise).
+        request_company = _resolve_request_company(
+            company_id=company_id,
+            company_slug=company_slug,
+            x_company_id=x_company_id,
+            x_company_slug=x_company_slug,
+        )
     resolved_company_id = request_company["company_id"]
     resolved_company_slug = request_company["company_slug"]
     log_event(
@@ -362,6 +504,7 @@ async def whatsapp_webhook(
         company_id=resolved_company_id,
         company_slug=resolved_company_slug,
         payload_mode=payload_mode,
+        tenant_source="channel_binding" if payload_mode == "meta" else "request_scope",
         has_from_name=bool(normalized_payload.get("from_name")),
     )
     should_process, duplicate_response = _begin_whatsapp_idempotent_processing(
