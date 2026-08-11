@@ -1,7 +1,6 @@
-from typing import Any
-
 import json
 from datetime import date, datetime, timedelta
+from typing import Any
 
 import streamlit as st
 
@@ -149,8 +148,10 @@ def render_calendar_page(page_context: dict[str, Any]) -> None:
                     st.caption(
                         f"Contato: {booking.get('contact_id') or '—'} | Company ID: {booking.get('company_id') or '—'} | TZ: {booking.get('timezone')}"
                     )
-                    with st.expander("Operar reserva"):
-                        with st.form(f"calendar_booking_ops_{booking.get('id')}"):
+                    with (
+                        st.expander("Operar reserva"),
+                        st.form(f"calendar_booking_ops_{booking.get('id')}"),
+                    ):
                             new_starts_at = st.text_input("Novo início ISO8601", value=str(booking.get("starts_at") or ""))
                             new_ends_at = st.text_input("Novo fim ISO8601", value=str(booking.get("ends_at") or ""))
                             reschedule_reason = st.text_input("Observação", value=str(booking.get("description") or ""))

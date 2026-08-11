@@ -332,14 +332,57 @@ Arquivos centrais desse fluxo:
 - Fallbacks locais quando OpenAI nao esta configurado.
 - Handoff explicito para casos de baixa confianca ou regra de negocio sensivel.
 - Dataset de fine-tuning derivado apenas de exemplos aprovados e curados.
+- Fato mutavel resolvido por company context publicado, RAG ou servico
+  deterministico; o modelo nao e fonte de verdade factual.
+- Isolamento por empresa aplicado dentro das queries, nao como filtragem
+  posterior em memoria.
+
+A arquitetura multiempresa completa (resolucao de tenant, company context
+versionado, taxonomia canonica, RAG tenant-safe, importacao governada, ciclo
+de dataset, avaliacao e registro de modelo por empresa) esta em
+[multitenant_platform.md](multitenant_platform.md).
+
+### Automation Studio
+
+O modulo de automacoes visuais introduz uma separacao propria entre **control
+plane** (workflow, rascunho, versao imutavel, deployment) e **data plane**
+(evento, outbox, execucao, step, job, efeito, portao humano). O dominio puro
+vive em `app/automations/` e nao faz I/O: ele define o grafo, o catalogo de
+nos, a validacao autoritativa e a **semantica unica** que simulacao e motor
+compartilham.
+
+Tres garantias sustentam o modulo:
+
+1. **Outbox transacional.** O evento `message.processed` e gravado no mesmo
+   commit da mensagem, dentro de um SAVEPOINT: nao ha janela em que a mensagem
+   existe e o fato foi perdido, e uma falha na automacao nao derruba o
+   atendimento.
+2. **Version pinning.** Uma execucao carrega `version_id` e o motor carrega a
+   versao *da execucao*, nunca a do deployment corrente. Republicar nao muda o
+   comportamento de quem ja esta em espera.
+3. **Ledger de efeitos.** Todo efeito externo reserva uma linha antes da
+   chamada; um retry que recalcule a mesma chave encontra o efeito concluido e
+   nao repete a acao.
+
+O detalhamento esta em [automation_studio.md](automation_studio.md).
 
 ### Limites atuais conhecidos
 
 - As migracoes continuam sendo gerenciadas internamente, sem Alembic; isso funciona para o produto atual, mas uma futura etapa de governanca pode migrar o ciclo de schema para uma ferramenta dedicada.
 - O RBAC atual e baseado em token estatico por papel; para ambientes maiores, o ideal e evoluir para identidade centralizada.
 - A promocao automatica de conhecimento para `company_context` ainda nao esta implementada como fluxo completo.
+- A busca vetorial existe como contrato e adapter, mas o caminho padrao e
+  lexical; embeddings reais e pgvector continuam opt-in.
+- O backend compartilhado de rate limit e SSE tem adapter Redis implementado,
+  porem nao exercitado pela suite padrao, que roda offline.
 - Ainda nao ha tracing distribuido nem exportacao direta para stacks externas de observabilidade.
 - O provider de WhatsApp esta preparado, mas ainda precisa endurecimento operacional para uso produtivo.
+- O Automation Studio nao executa codigo arbitrario, loops, fan-out nem HTTP
+  generico; `trigger.schedule` valida mas ainda nao tem agendador emitindo o
+  evento. Ver a secao 12 de [automation_studio.md](automation_studio.md).
+- O claim concorrente de jobs foi exercitado em SQLite pela suite; o caminho
+  `FOR UPDATE SKIP LOCKED` do Postgres esta implementado mas ainda nao foi
+  validado contra um Postgres real.
 
 ### Proximos passos recomendados
 

@@ -1,6 +1,5 @@
 from typing import Any
 
-
 ADMIN_ROLE_HIERARCHY = {
     "viewer": 1,
     "operator": 2,

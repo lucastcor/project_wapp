@@ -1,6 +1,5 @@
 from app.services import conversation_workflow_service as workflow_service
 
-
 COMPANY_CONTEXT = {
     "enabled_modules": {
         "scheduling": True,

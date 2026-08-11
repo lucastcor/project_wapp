@@ -169,3 +169,54 @@ Este arquivo serve como mapa rápido para manutenção. A ideia é responder dua
 - `app/tools/__init__`, `app/tools/registry.py` e `tests/conftest_py` parecem artefatos legados ou placeholders; estão documentados para não passarem despercebidos.
 - Quando o comportamento envolve agenda, normalmente o fluxo cruza `conversation_workflow_service.py`, `calendar_service.py` e `appointment_queue_service.py`.
 - Quando o comportamento envolve UI da plataforma, normalmente o fluxo cruza `app/platform/assets/app.js`, `app/api/platform_routes.py` e `app/api/admin_routes.py`.
+
+---
+
+## Automation Studio
+
+### `app/automations/` — domínio puro, sem I/O
+
+| Arquivo | Responsabilidade |
+|---|---|
+| `domain.py` | grafo tipado, estados, forma canônica, `effect_key`, `enrollment_key` |
+| `catalog.py` | catálogo de nós v1; fonte única do validador, do motor e do inspector |
+| `validation.py` | validação autoritativa: ciclos, alcance, alças, capacidades, segredos, conflito com o legado |
+| `semantics.py` | `evaluate_node` — a única interpretação das regras |
+| `simulation.py` | percurso sem efeito, usando a mesma semântica |
+| `events.py` | eventos canônicos, redigidos por allowlist |
+| `effects.py` | adapters de efeito externo, delegando aos serviços existentes |
+| `engine.py` | motor durável: um passo por job, com lease e ledger |
+| `exceptions.py` | erros do domínio, separando permanente de retryable |
+
+### Serviços e persistência
+
+| Arquivo | Responsabilidade |
+|---|---|
+| `app/services/automation_workflow_service.py` | control plane: rascunho, validação, simulação, publicação, estado |
+| `app/services/automation_event_service.py` | emissão e dispatch do outbox |
+| `app/services/automation_execution_service.py` | inspeção, retry, cancelamento, reconciliador |
+| `app/services/automation_approval_service.py` | portões humanos |
+| `app/services/automation_trigger_service.py` | construção dos eventos a partir dos fatos do runtime |
+| `app/storage/automation_repository.py` | persistência tenant-scoped e claim concorrente |
+| `app/storage/migrations_automation.py` | migrations 048–053 |
+| `app/storage/migrations_hardening.py` | migrations 045–047 |
+| `app/api/automation_routes.py` | 20 rotas tenant-scoped |
+| `app/tools/automation_worker.py` | worker: reconcilia, despacha, executa |
+
+### `frontend/automation-studio/`
+
+React 18 + TypeScript strict + `@xyflow/react`, build Vite para
+`app/platform/automations`. Ver `docs/automation_studio.md` §13.
+
+### Testes de automação
+
+| Arquivo | Cobre |
+|---|---|
+| `tests/test_automation_domain.py` | catálogo, forma canônica, validação, segredos |
+| `tests/test_automation_conformance.py` | simulação e runtime escolhem o mesmo caminho |
+| `tests/test_automation_engine.py` | idempotência, concorrência, lease, retry, pausa, version pinning, portões |
+| `tests/test_automation_api.py` | isolamento por tenant, RBAC, 409, publicação |
+| `tests/test_automation_e2e.py` | ciclo completo e integração com o orquestrador |
+| `tests/test_automation_studio_bundle.py` | o frontend não carrega segredo nem executa fluxo |
+| `tests/test_phase_zero_blockers.py` | os seis bloqueadores de autorização |
+| `tests/test_checked_modules.py` | nenhum módulo sensível fora do mypy/Bandit do CI |

@@ -14,12 +14,12 @@ class FakeRepository:
         return len(self.created_examples)
 
 
-def test_import_training_records_csv_dry_run(monkeypatch) -> None:
+def test_import_training_records_csv_dry_run(monkeypatch, company_factory) -> None:
     fake_repository = FakeRepository()
     monkeypatch.setattr(training_import_service, "repository", fake_repository)
 
     result = training_import_service.import_training_records(
-        company_id=7,
+        company_id=company_factory("import-dry"),
         fmt="csv",
         raw_text=(
             "contact_id,contact_name,customer_profile,profile_name,scenario_type,customer_message,approved_reply,quality_score\n"
@@ -42,13 +42,21 @@ def test_import_training_records_csv_dry_run(monkeypatch) -> None:
     assert fake_repository.saved_contacts == []
     assert fake_repository.created_examples == []
 
+    # Aliases livres do arquivo são normalizados para a taxonomia canônica.
+    first_row = result["preview"][0]
+    assert first_row["scenario_type"] == "scheduling"
+    assert first_row["customer_profile"] == "returning_customer"
+    # `retorno` não é um profile_name canônico: cai no default documentado.
+    assert first_row["profile_name"] == "default"
+    assert "profile_name" in first_row["taxonomy_fallbacks"]
 
-def test_import_training_records_json_persists_contacts_and_examples(monkeypatch) -> None:
+
+def test_import_training_records_json_persists_contacts_and_examples(monkeypatch, company_factory) -> None:
     fake_repository = FakeRepository()
     monkeypatch.setattr(training_import_service, "repository", fake_repository)
 
     result = training_import_service.import_training_records(
-        company_id=4,
+        company_id=company_factory("import-json"),
         fmt="json",
         raw_text=None,
         records=[
@@ -74,5 +82,11 @@ def test_import_training_records_json_persists_contacts_and_examples(monkeypatch
     assert result["message_examples_to_create"] == 1
     assert fake_repository.saved_contacts[0]["contact_id"] == "5511777777777"
     assert fake_repository.saved_contacts[0]["customer_profile"] == "vip"
-    assert fake_repository.created_examples[0]["profile_name"] == "vip"
-    assert fake_repository.created_examples[0]["used_for_training"] is True
+    # `vip` é alias canônico de `premium` na dimensão profile_name.
+    assert fake_repository.created_examples[0]["profile_name"] == "premium"
+    assert fake_repository.created_examples[0]["customer_profile"] == "vip"
+    # Conteúdo importado nunca é liberado automaticamente para treino.
+    assert fake_repository.created_examples[0]["used_for_training"] is False
+    assert fake_repository.created_examples[0]["approval_status"] == "pending"
+    assert fake_repository.created_examples[0]["pii_scrubbed"] is True
+    assert result["review_required"] is True

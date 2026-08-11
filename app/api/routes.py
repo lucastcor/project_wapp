@@ -1,6 +1,6 @@
-import logging
 import hashlib
 import hmac
+import logging
 from typing import Any, TypedDict
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -10,14 +10,27 @@ from app.api.schemas import (
     IncomingMessageRequest,
     IncomingMessageResponse,
 )
-from app.core.config import settings
+from app.core.config import is_production_like, settings
+from app.core.credentials import extract_bearer_token
+from app.core.logging import get_logger, log_event
 from app.core.orchestrator import (
     process_incoming_message,
     process_whatsapp_webhook,
 )
-from app.core.logging import get_logger, log_event
 from app.services.outbound_dispatch_service import OutboundDispatchError, dispatch_outbound_message
 from app.services.realtime_service import broadcast_event
+from app.services.tenant_credential_service import (
+    SCOPE_MESSAGES_WRITE,
+    TenantCredential,
+    TenantCredentialError,
+    authenticate_tenant_credential,
+)
+from app.services.tenant_resolution_service import (
+    TenantResolution,
+    TenantResolutionError,
+    resolve_api_tenant,
+    resolve_channel_tenant,
+)
 from app.storage.repository import RuntimeRepository
 
 router = APIRouter(tags=["chat"])
@@ -79,6 +92,11 @@ def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | 
             if not isinstance(messages, list) or not messages:
                 continue
 
+            metadata = value.get("metadata")
+            channel_external_id = ""
+            if isinstance(metadata, dict):
+                channel_external_id = str(metadata.get("phone_number_id") or "").strip()
+
             contact_name = None
             contact_wa_id = None
             if isinstance(contacts, list) and contacts:
@@ -107,13 +125,14 @@ def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | 
                     "from_name": str(contact_name or "").strip() or None,
                     "text": body,
                     "provider_message_id": str(message.get("id") or "").strip() or None,
+                    "channel_external_id": channel_external_id or None,
                 }
 
     return None
 
 
 def _extract_whatsapp_message_payload(payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
-    if all(key in payload for key in {"event", "from_number", "text"}):
+    if all(key in payload for key in ("event", "from_number", "text")):
         normalized_text = str(payload.get("text") or "").strip()
         normalized_number = str(payload.get("from_number") or "").strip()
         if not normalized_text or not normalized_number:
@@ -125,6 +144,7 @@ def _extract_whatsapp_message_payload(payload: dict[str, Any]) -> tuple[dict[str
                 "from_name": str(payload.get("from_name") or "").strip() or None,
                 "text": normalized_text,
                 "provider_message_id": str(payload.get("provider_message_id") or "").strip() or None,
+                "channel_external_id": str(payload.get("channel_external_id") or "").strip() or None,
             },
             "normalized",
         )
@@ -154,6 +174,35 @@ def _validate_meta_signature(raw_body: bytes, signature_header: str | None) -> N
 
     if not hmac.compare_digest(expected_signature, received_signature):
         raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook signature.")
+
+
+def _authorize_webhook_payload(payload_mode: str, raw_body: bytes, signature_header: str | None) -> None:
+    """Todo payload aceito precisa de origem autenticada.
+
+    O payload normalizado interno não carrega assinatura do Meta. Ele é
+    bloqueado em produção e, fora dela, exige HMAC sempre que houver
+    `WHATSAPP_APP_SECRET` configurado.
+    """
+    if payload_mode == "meta":
+        _validate_meta_signature(raw_body, signature_header)
+        return
+
+    if payload_mode != "normalized":
+        return
+
+    if is_production_like() or not settings.allow_normalized_whatsapp_webhook:
+        log_event(
+            logger,
+            logging.WARNING,
+            "api.whatsapp.webhook.normalized_payload_blocked",
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Normalized webhook payload is disabled. Send the provider payload instead.",
+        )
+
+    if (settings.whatsapp_app_secret or "").strip():
+        _validate_meta_signature(raw_body, signature_header)
 
 
 def _dispatch_whatsapp_auto_reply(result: dict[str, Any]) -> dict[str, Any] | None:
@@ -235,6 +284,82 @@ def _begin_whatsapp_idempotent_processing(
     }
 
 
+def _authenticate_ingest(
+    *,
+    authorization: str | None,
+    x_tenant_token: str | None,
+    requested_company_id: int | None,
+    requested_company_slug: str | None,
+) -> TenantResolution:
+    """Resolve o tenant da ingestão a partir da credencial apresentada.
+
+    O `company_id`/`company_slug` do chamador nunca escolhe empresa: ele só
+    pode confirmar a empresa da credencial. Divergência é 403.
+    """
+    token = x_tenant_token or extract_bearer_token(authorization)
+
+    if not token:
+        if is_production_like() or not settings.allow_unauthenticated_ingest:
+            raise HTTPException(
+                status_code=401,
+                detail="Tenant API credential is required for message ingestion.",
+            )
+        # Ergonomia de desenvolvimento, explicitamente habilitada. Mesmo aqui o
+        # chamador não escolhe empresa: cai na empresa padrão.
+        log_event(
+            logger,
+            logging.WARNING,
+            "api.messages.incoming.unauthenticated",
+        )
+        return resolve_api_tenant()
+
+    try:
+        credential = authenticate_tenant_credential(token, required_scope=SCOPE_MESSAGES_WRITE)
+    except TenantCredentialError as exc:
+        # Falha fechada e sem distinguir inexistente de revogado.
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    if requested_company_id is not None and int(requested_company_id) != credential.company_id:
+        log_event(
+            logger,
+            logging.WARNING,
+            "api.messages.incoming.company_mismatch",
+            credential_company_id=credential.company_id,
+            requested_company_id=requested_company_id,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Requested company does not match the authenticated credential.",
+        )
+
+    resolution = _resolution_for_credential(credential)
+
+    if requested_company_slug and requested_company_slug != resolution.company_slug:
+        log_event(
+            logger,
+            logging.WARNING,
+            "api.messages.incoming.company_mismatch",
+            credential_company_id=credential.company_id,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Requested company does not match the authenticated credential.",
+        )
+
+    return resolution
+
+
+def _resolution_for_credential(credential: TenantCredential) -> TenantResolution:
+    company = repository.get_company(credential.company_id)
+    if not company or not int(company.get("active") or 0):
+        raise HTTPException(status_code=403, detail="Credential company is not active.")
+    return TenantResolution(
+        company_id=int(company["id"]),
+        company_slug=str(company.get("slug") or "") or None,
+        source="tenant_credential",
+    )
+
+
 @router.post("/messages/incoming", response_model=IncomingMessageResponse)
 def incoming_message(
     payload: IncomingMessageRequest,
@@ -242,6 +367,8 @@ def incoming_message(
     company_slug: str | None = Query(default=None),
     x_company_id: str | None = Header(default=None, alias="X-Company-Id"),
     x_company_slug: str | None = Header(default=None, alias="X-Company-Slug"),
+    x_tenant_token: str | None = Header(default=None, alias="X-Tenant-Token"),
+    authorization: str | None = Header(default=None),
 ) -> IncomingMessageResponse:
     normalized_message = payload.message.strip()
     if not normalized_message:
@@ -253,14 +380,25 @@ def incoming_message(
         x_company_id=x_company_id,
         x_company_slug=x_company_slug,
     )
-    resolved_company_id = request_company["company_id"]
-    resolved_company_slug = request_company["company_slug"]
+    try:
+        tenant = _authenticate_ingest(
+            authorization=authorization,
+            x_tenant_token=x_tenant_token,
+            requested_company_id=request_company["company_id"],
+            requested_company_slug=request_company["company_slug"],
+        )
+    except TenantResolutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    resolved_company_id = tenant.company_id
+    resolved_company_slug = tenant.company_slug
     log_event(
         logger,
         logging.INFO,
         "api.messages.incoming.received",
         company_id=resolved_company_id,
         company_slug=resolved_company_slug,
+        tenant_source=tenant.source,
         has_contact_name=bool(payload.contact_name),
     )
     result: dict[str, Any] = process_incoming_message(
@@ -280,11 +418,15 @@ def incoming_message(
         auto_reply=result.get("auto_reply"),
         handoff_required=result.get("handoff_required"),
     )
-    broadcast_event("new_message", {
-        "contact_id": payload.contact_id,
-        "classification": result.get("classification"),
-        "handoff_required": result.get("handoff_required"),
-    })
+    broadcast_event(
+        "new_message",
+        {
+            "contact_id": payload.contact_id,
+            "classification": result.get("classification"),
+            "handoff_required": result.get("handoff_required"),
+        },
+        company_id=result.get("company_id"),
+    )
     return IncomingMessageResponse(**result)
 
 
@@ -343,8 +485,7 @@ async def whatsapp_webhook(
             "payload_mode": payload_mode,
         }
 
-    if payload_mode == "meta":
-        _validate_meta_signature(raw_body, x_hub_signature_256)
+    _authorize_webhook_payload(payload_mode, raw_body, x_hub_signature_256)
 
     request_company = _resolve_request_company(
         company_id=company_id,
@@ -352,8 +493,23 @@ async def whatsapp_webhook(
         x_company_id=x_company_id,
         x_company_slug=x_company_slug,
     )
-    resolved_company_id = request_company["company_id"]
-    resolved_company_slug = request_company["company_slug"]
+    try:
+        tenant = resolve_channel_tenant(
+            provider="whatsapp",
+            external_id=normalized_payload.get("channel_external_id")
+            or settings.whatsapp_phone_number_id,
+            requested_company_id=request_company["company_id"],
+            requested_company_slug=request_company["company_slug"],
+        )
+    except TenantResolutionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    resolved_company_id = tenant.company_id
+    resolved_company_slug = tenant.company_slug
+    request_company = {
+        "company_id": resolved_company_id,
+        "company_slug": resolved_company_slug,
+    }
     log_event(
         logger,
         logging.INFO,
@@ -361,6 +517,7 @@ async def whatsapp_webhook(
         whatsapp_event=normalized_payload["event"],
         company_id=resolved_company_id,
         company_slug=resolved_company_slug,
+        tenant_source=tenant.source,
         payload_mode=payload_mode,
         has_from_name=bool(normalized_payload.get("from_name")),
     )

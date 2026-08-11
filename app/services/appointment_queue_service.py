@@ -4,6 +4,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
+from app.core.exceptions import TenantResourceNotFoundError
 from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
 from app.services.outbound_dispatch_service import (
@@ -11,7 +12,6 @@ from app.services.outbound_dispatch_service import (
     dispatch_outbound_message,
 )
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 VALID_PRIORITY_TIERS = {"vip", "high", "normal", "low"}
@@ -145,7 +145,14 @@ def _slot_period(slot_start: datetime) -> str:
     return "evening"
 
 
-def _priority_weight(entry: dict[str, Any]) -> tuple[int, int, int, str, int]:
+def _priority_weight(entry: dict[str, Any]) -> tuple[int, int, int]:
+    """Chave de ordenação da fila: score, tier e se é remanejamento.
+
+    A anotação anterior prometia cinco dimensões e o corpo sempre devolveu
+    três. Como esta função é usada só como `key` de `sort`, a divergência não
+    quebrava em runtime — e por isso sobreviveu: o módulo estava fora do mypy
+    do CI.
+    """
     tier_weight = {
         "vip": 4,
         "high": 3,
@@ -227,10 +234,7 @@ def _matches_queue_entry(
         return False
 
     hours_until_slot = (slot_start.astimezone(UTC) - datetime.now(UTC)).total_seconds() / 3600
-    if hours_until_slot < SHORT_NOTICE_THRESHOLD_HOURS and not bool(entry.get("accepts_short_notice")):
-        return False
-
-    return True
+    return not (hours_until_slot < SHORT_NOTICE_THRESHOLD_HOURS and not bool(entry.get("accepts_short_notice")))
 
 
 def _is_queue_waiting_message(message: str) -> bool:
@@ -596,7 +600,7 @@ def offer_released_booking_slot(
 ) -> dict[str, Any]:
     booking = repository.get_appointment_booking(released_booking_id, company_id=company_id)
     if not booking:
-        raise AppointmentQueueError("Released booking not found.")
+        raise TenantResourceNotFoundError("Released booking not found.")
 
     company_id = booking.get("company_id")
     timezone_name = str(booking.get("timezone") or "UTC")
@@ -689,6 +693,22 @@ def release_booking_slot(
     }
 
 
+def _require_dispatchable_contact(*, contact_id: str, company_id: Any) -> None:
+    """Recusa antes de escrever quando não há para quem enviar.
+
+    O contato precisa existir porque `outbound_messages.contact_id` referencia
+    `contacts`. Sem esta checagem a falha só aparece depois das mutações.
+    """
+    if not contact_id.strip():
+        raise AppointmentQueueError("This queue entry has no contact to notify.")
+
+    contact = repository.get_contact(contact_id, company_id=company_id)
+    if not contact:
+        raise AppointmentQueueError(
+            "This queue entry points to a contact that no longer exists."
+        )
+
+
 def respond_to_queue_offer(
     *,
     offer_id: int,
@@ -709,7 +729,7 @@ def respond_to_queue_offer(
 
     offer = repository.get_appointment_queue_offer(offer_id, company_id=company_id)
     if not offer:
-        raise AppointmentQueueError("Queue offer not found.")
+        raise TenantResourceNotFoundError("Queue offer not found.")
     if str(offer.get("status") or "") not in {"pending", "waiting"}:
         raise AppointmentQueueError("Only pending or waiting offers can be updated.")
 
@@ -720,6 +740,23 @@ def respond_to_queue_offer(
     )
     if not entry:
         raise AppointmentQueueError("Queue entry not found for offer.")
+
+    # E-01 (segunda metade): o envio de acompanhamento acontece DEPOIS de a
+    # oferta e a entrada já terem mudado de estado, e ele pode falhar —
+    # `outbound_messages.contact_id` é chave estrangeira, e `enqueue` não exige
+    # que o contato exista. O resultado era 500 sobre duas mutações comitadas.
+    #
+    # No ramo `declined` era pior: `offer_released_booking_slot()` nunca rodava,
+    # então o horário ficava marcado como liberado e nunca era reofertado — a
+    # fila travava sem ninguém perceber.
+    #
+    # Validar aqui, antes de qualquer escrita, é o que torna a operação
+    # tudo-ou-nada do ponto de vista de quem chama.
+    if send_customer_followup:
+        _require_dispatchable_contact(
+            contact_id=str(entry["contact_id"]),
+            company_id=entry.get("company_id"),
+        )
 
     responded_at = _to_utc_iso(datetime.now(UTC))
 
@@ -751,6 +788,26 @@ def respond_to_queue_offer(
         }
 
     if normalized_response == "declined":
+        # E-01: TODA pré-condição é verificada antes da PRIMEIRA escrita.
+        #
+        # A ordem anterior comitava a recusa da oferta e a mudança da entrada e
+        # só então convertia `released_booking_id` e procurava o booking. Com o
+        # campo nulo saía `TypeError` (HTTP 500); com o booking fora do escopo,
+        # 404. Nos dois casos a resposta dizia "falhou" sobre duas mutações já
+        # aplicadas, e o operador repetia a ação sobre um estado que já mudara.
+        released_booking_id = offer.get("released_booking_id")
+        if released_booking_id is None:
+            raise AppointmentQueueError(
+                "This offer has no released slot to reassign."
+            )
+        released_booking = repository.get_appointment_booking(
+            int(released_booking_id), company_id=offer_company_id
+        )
+        if released_booking is None:
+            raise AppointmentQueueError(
+                "The released slot for this offer is no longer available."
+            )
+
         repository.update_appointment_queue_offer(
             offer_id,
             status="declined",
@@ -792,7 +849,7 @@ def respond_to_queue_offer(
                 source="appointment_queue_keep_waiting",
             )
         next_offer = offer_released_booking_slot(
-            released_booking_id=int(offer["released_booking_id"]),
+            released_booking_id=int(released_booking_id),
             company_id=offer_company_id,
         )
         return {

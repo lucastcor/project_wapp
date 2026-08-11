@@ -1,3 +1,6 @@
+import pytest
+
+from app.core.exceptions import TenantResourceNotFoundError
 from app.services import analytics_service
 from app.services.analytics_service import (
     AnalyticsError,
@@ -26,10 +29,10 @@ class FakeRepository:
             "ends_at": kwargs.get("ends_at", "2026-04-10T11:00:00+00:00"),
             "timezone": "America/Sao_Paulo",
             "status": kwargs.get("status", "confirmed"),
-            "booking_outcome": kwargs.get("booking_outcome", None),
+            "booking_outcome": kwargs.get("booking_outcome"),
             "booking_outcome_at": None,
             "booking_outcome_notes": None,
-            "cancellation_reason": kwargs.get("cancellation_reason", None),
+            "cancellation_reason": kwargs.get("cancellation_reason"),
             "created_at": "2026-04-09T08:00:00+00:00",
             "updated_at": "2026-04-09T08:00:00+00:00",
         }
@@ -188,11 +191,10 @@ def test_record_booking_outcome_invalid_raises(monkeypatch):
 
 def test_record_booking_outcome_not_found_raises(monkeypatch):
     _patch_repo(monkeypatch)
-    try:
+    # Recurso fora do escopo é 404, não erro de validação: "não existe" e
+    # "é de outro tenant" precisam ser indistinguíveis.
+    with pytest.raises(TenantResourceNotFoundError, match="not found"):
         record_booking_outcome(999, "attended")
-        assert False, "Should have raised AnalyticsError"
-    except AnalyticsError as exc:
-        assert "not found" in str(exc)
 
 
 def test_record_cancellation_reason(monkeypatch):
@@ -204,11 +206,8 @@ def test_record_cancellation_reason(monkeypatch):
 
 def test_record_cancellation_reason_not_found(monkeypatch):
     _patch_repo(monkeypatch)
-    try:
+    with pytest.raises(TenantResourceNotFoundError, match="not found"):
         record_cancellation_reason(999, "motivo")
-        assert False, "Should have raised AnalyticsError"
-    except AnalyticsError as exc:
-        assert "not found" in str(exc)
 
 
 def test_get_no_show_dashboard_returns_all_sections(monkeypatch):

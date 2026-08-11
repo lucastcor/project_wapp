@@ -1,6 +1,5 @@
 from typing import Any
 
-
 VALID_KNOWLEDGE_TYPES = {
     "discount_policy",
     "business_rule",
@@ -27,10 +26,7 @@ def should_store_resolution_as_knowledge(resolution: dict[str, Any]) -> bool:
     if knowledge_action == "promote_to_company_context":
         return True
 
-    if knowledge_action == "store_as_knowledge" and (applies_globally or resolution_type == "global_rule"):
-        return True
-
-    return False
+    return bool(knowledge_action == "store_as_knowledge" and (applies_globally or resolution_type == "global_rule"))
 
 
 def build_knowledge_entry_from_resolution(

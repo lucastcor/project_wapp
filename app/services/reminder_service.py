@@ -3,11 +3,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.core.company_context import get_company_context
+from app.core.company_context import get_seed_company_context
 from app.core.config import settings
 from app.services.outbound_dispatch_service import dispatch_outbound_message
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 
@@ -17,13 +16,19 @@ class ReminderServiceError(Exception):
 
 
 def _resolve_company_context(company_id: int | None) -> dict[str, Any]:
+    """Contexto publicado da empresa, com queda para o template só sem tenant."""
     if company_id is None:
-        return get_company_context()
+        return get_seed_company_context(None)
 
-    get_company = getattr(repository, "get_company", None)
-    company = get_company(company_id) if callable(get_company) else None
-    company_slug = company.get("slug") if company else None
-    return get_company_context(company_slug=company_slug)
+    from app.services.company_config_service import (
+        CompanyConfigError,
+        get_company_config,
+    )
+
+    try:
+        return get_company_config(int(company_id)).context
+    except CompanyConfigError:
+        return get_seed_company_context(None)
 
 
 def _get_timezone(company_context: dict[str, Any]) -> ZoneInfo:

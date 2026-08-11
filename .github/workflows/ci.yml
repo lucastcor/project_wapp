@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  backend:
     runs-on: ubuntu-latest
 
     steps:
@@ -25,52 +25,104 @@ jobs:
           python -m pip install -r requirements.txt
           python -m pip install -r requirements-dev.txt
 
+      - name: Check working tree
+        run: git diff --check
+
+      # A seleção vem de ruff.toml, versionado. Antes o CI passava
+      # `--select F821,F822,F823,E9` na linha de comando: quatro regras de erro
+      # fatal, o que é um compilador, não um gate de lint.
       - name: Run lint
-        run: ruff check app tests --select F821,F822,F823,E9
+        run: ruff check app tests
+
+      # A lista de módulos vem de checked_modules.txt, não do YAML.
+      # `tests/test_checked_modules.py` prova que nenhuma superfície sensível
+      # ficou de fora — antes, um módulo novo simplesmente não era verificado.
+      # Expandir a lista via variável escalar dependia de word splitting do
+      # shell — funciona no bash daqui e falha no zsh de quem roda o mesmo
+      # comando localmente, onde a lista inteira vira UM nome de arquivo.
+      # `xargs -0` separa os argumentos ele mesmo, igual nos dois shells.
+      - name: Collect checked modules
+        run: |
+          grep -v '^[[:space:]]*#' checked_modules.txt | grep -v '^[[:space:]]*$' > /tmp/checked_modules.list
+          echo "Módulos verificados: $(wc -l < /tmp/checked_modules.list)"
 
       - name: Run targeted type checks
         run: |
-          mypy \
+          tr '\n' '\0' < /tmp/checked_modules.list | xargs -0 mypy \
             --ignore-missing-imports \
             --follow-imports=silent \
-            --disable-error-code=import-untyped \
-            app/api/admin_security.py \
-            app/api/routes.py \
-            app/services/finetuning_service.py \
-            app/services/rate_limit_service.py \
-            app/services/system_readiness_service.py \
-            app/tools/cleanup_operational_data.py \
-            app/tools/export_runtime_backup.py \
-            app/tools/preflight_check.py \
-            app/tools/reminder_worker.py
+            --disable-error-code=import-untyped
 
+      # B608 (SQL por f-string) é pulado deliberadamente: o Bandit não
+      # distingue nome de coluna de valor. A garantia equivalente, e mais
+      # forte, é estática e testada em tests/test_sql_interpolation_guard.py,
+      # que prova a origem de cada interpolação e falha se surgir uma nova.
       - name: Run targeted SAST
-        run: |
-          bandit -q \
-            app/api/admin_security.py \
-            app/api/routes.py \
-            app/services/finetuning_service.py \
-            app/services/rate_limit_service.py \
-            app/services/system_readiness_service.py \
-            app/tools/cleanup_operational_data.py \
-            app/tools/export_runtime_backup.py \
-            app/tools/preflight_check.py \
-            app/tools/reminder_worker.py
+        run: tr '\n' '\0' < /tmp/checked_modules.list | xargs -0 bandit -q -s B608
 
       - name: Audit dependencies
         run: pip-audit -r requirements.txt
 
+      - name: Run migrations on a clean database
+        run: |
+          rm -f ci-migrations.db
+          DATABASE_URL=sqlite:///ci-migrations.db python -c "from app.storage.db import init_db; init_db()"
+          DATABASE_URL=sqlite:///ci-migrations.db python -c "from app.storage.db import init_db; init_db()"
+
+      - name: Import smoke
+        run: |
+          python -m compileall -q app
+          python -c "import app.main, app.tools.automation_worker, app.tools.reminder_worker"
+
       - name: Run tests
-        run: pytest tests/ -x -q --tb=short
+        run: pytest tests/ -q --tb=short
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend/automation-studio
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/automation-studio/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: TypeScript strict
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit and component tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      # Achados são reportados, não corrigidos automaticamente: `audit fix`
+      # muda versões sem revisão e é exatamente o que não se quer num CI.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
 
   docker:
-    needs: test
+    needs: [backend, frontend]
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
     steps:
       - uses: actions/checkout@v4
 
+      # A imagem constrói o bundle do Automation Studio no primeiro estágio,
+      # então este build também prova que o frontend compila na imagem.
       - name: Build Docker image
         run: docker build -t wapp-api:${{ github.sha }} .
 
@@ -82,4 +134,6 @@ jobs:
             wapp-api:${{ github.sha }}
           sleep 5
           curl -sf http://localhost:8000/health || exit 1
+          # O bundle do Studio precisa estar sendo servido pela imagem.
+          curl -sf http://localhost:8000/platform/automations | grep -q automation-root
           docker stop wapp-smoke

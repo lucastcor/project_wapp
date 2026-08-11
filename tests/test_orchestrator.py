@@ -60,7 +60,7 @@ class FakeRepository:
             "contact_id": contact_id,
             "company_id": company_id,
         }
-        return None
+        return
 
     def save_message(self, **kwargs) -> None:
         self.saved_messages.append(kwargs)
@@ -75,11 +75,12 @@ class FakeRepository:
         self.updated_contact_memory = kwargs
 
 
-def test_process_incoming_message_propagates_company_scope(monkeypatch) -> None:
+def test_process_incoming_message_propagates_company_scope(monkeypatch, stub_company_config) -> None:
     fake_repository = FakeRepository()
     captured_reply_kwargs: dict = {}
 
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    stub_company_config(orchestrator, company_id=7, company_slug="empresa-teste", company_name="Empresa Teste")
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",

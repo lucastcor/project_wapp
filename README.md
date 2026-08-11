@@ -36,6 +36,17 @@ A arquitetura foi organizada para manter separação clara entre:
 - Autenticacao propria de sessao para a plataforma dedicada com cookie HTTP-only
 - Canvas visual persistido de pipelines conversacionais no `company_context`
 - Timeline/calendario visual de agenda com layout semanal baseado em endpoint proprio do backend
+- Isolamento multiempresa com `company_id` obrigatório em dado privado
+- Company context versionado no banco, com histórico e rollback
+- Capabilities e policies por empresa a partir de pacotes de domínio
+- Taxonomia canônica com aliases para classificação, cenário e perfil
+- Camada RAG tenant-safe com busca lexical e extensão vetorial opcional
+- Importação governada de conversas brutas com anonimização e revisão
+- Dataset versionado, congelável e reproduzível, com split agrupado
+- Avaliação offline comparando base, base+RAG e fine-tuned
+- Seleção e rollback de modelo por empresa
+- Automation Studio: editor visual de fluxos multi-tenant com execução durável,
+  efeitos idempotentes, espera que sobrevive a reinício e portão humano
 - Testes automatizados para fluxos críticos
 
 ## Stack principal
@@ -158,6 +169,14 @@ O runtime agora suporta SQLite e Postgres, com foco operacional em Postgres. As 
 - `appointment_queue_offers`
 - `conversation_flows`
 - `customer_reminders`
+- `company_channel_bindings`
+- `company_context_versions`
+- `knowledge_documents`, `knowledge_document_versions`, `knowledge_chunks`
+- `conversation_import_batches`, `imported_conversations`, `imported_messages`
+- `training_candidates`
+- `dataset_versions`, `dataset_version_items`
+- `evaluation_cases`, `evaluation_runs`, `evaluation_results`
+- `company_models`
 
 O projeto também já possui:
 - configuração explícita via `DATABASE_URL`;
@@ -269,7 +288,7 @@ ENVIRONMENT=production
 DEBUG=false
 STRICT_RUNTIME_VALIDATION=true
 OPENAI_API_KEY=
-OPENAI_MODEL=gpt-5-mini
+OPENAI_MODEL=gpt-4o-mini
 OPENAI_FINETUNING_BASE_MODEL=gpt-4o-mini-2024-07-18
 OPENAI_FINETUNING_SUFFIX=project-wapp-style
 ENABLE_FINETUNING_PIPELINE=false
@@ -525,7 +544,7 @@ Execução real com backup automático:
 python3 -m app.tools.cleanup_operational_data --execute --stale-after-days 30
 ```
 
-O runbook completo de produção, backup, limpeza e incidente está em [docs/production_runbook.md](/Users/lucasteixeira/Documents/project_wapp/docs/production_runbook.md).
+O runbook completo de produção, backup, limpeza e incidente está em [docs/production_runbook.md](docs/production_runbook.md).
 
 ### 9.3. Ativacao do webhook do Meta
 O endpoint de verificacao e recepcao e:
@@ -544,9 +563,25 @@ Passos recomendados:
 7. Confirmar que o Meta envia `X-Hub-Signature-256` e que o app secret configurado e o mesmo do app no Meta.
 8. Enviar uma mensagem real de teste e confirmar que o `POST /webhooks/whatsapp` cria e despacha o auto-reply outbound.
 
-O webhook agora aceita tanto payload normalizado interno quanto payload bruto de mensagem de texto do Meta. Eventos sem mensagem de texto, como status de entrega, sao reconhecidos e ignorados com `200`.
+O webhook aceita o payload bruto do Meta, sempre validado por HMAC. O payload
+normalizado interno é bloqueado em producao e, fora dela, exige HMAC quando
+`WHATSAPP_APP_SECRET` estiver definido. Eventos sem mensagem de texto, como
+status de entrega, sao reconhecidos e ignorados com `200`.
+
+A empresa e resolvida pelo `phone_number_id` do payload, via
+`company_channel_bindings`. Registre o vinculo antes do go-live:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/admin/channel-bindings?company_slug=SUA-EMPRESA" \
+  -H "X-Admin-Token: $ADMIN_SUPERADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"whatsapp","external_id":"<PHONE_NUMBER_ID>"}'
+```
 
 ## Documentação complementar
+- `docs/automation_studio.md`
+- `docs/multitenant_platform.md`
+- `docs/migration_and_rollback.md`
 - `docs/architecture.md`
 - `docs/api_spec.md`
 - `docs/platform_frontend_guide.md`
@@ -573,31 +608,51 @@ O webhook agora aceita tanto payload normalizado interno quanto payload bruto de
 - inspeção de migrações em `GET /admin/system/migrations`
 
 ## Dados, regras e fine-tuning
-- respostas usam `company_context`, regras de negocio, knowledge base incremental, memoria do contato, estagio de pipeline e exemplos aprovados de estilo
-- o dataset de fine-tuning atual nasce de `message_examples` aprovados, nao de conversas brutas automaticamente
-- `knowledge_entries` alimentam o prompt de runtime, mas nao entram automaticamente no dataset de fine-tuning
-- historico bruto de conversas deve passar por curadoria antes de virar `message_examples`
-- o exportador filtra exemplos por qualidade minima, remove duplicados e barra alguns marcadores sensiveis simples como `cpf`, `cnpj`, `senha`, `token`, `boleto` e `fatura`
-- a redacao atual de sensiveis e basica; para operacao com dados reais, o ideal e adicionar uma etapa dedicada de sanitizacao/anonimizacao antes de usar conversas historicas em treino
+
+A arquitetura completa está em [docs/multitenant_platform.md](docs/multitenant_platform.md).
+
+Separação central:
+
+- **fato mutável** (catálogo, preço, horário, política, disponibilidade) vem do
+  `company_context` publicado, da camada RAG ou de serviço determinístico;
+- **estilo e comportamento** vêm de exemplos aprovados e do fine-tuning;
+- **ação com efeito externo** (reserva, cancelamento, envio) só acontece por
+  serviço verificável — o modelo não pode simular sucesso.
+
+Pontos operacionais:
+
+- a resposta recupera conhecimento pela **mensagem atual** do cliente, filtrado
+  por `company_id` na query antes de qualquer ranking;
+- sem fonte relevante, a resposta pede esclarecimento ou encaminha para humano
+  em vez de afirmar;
+- fonte recuperada é dado, nunca instrução: tentativa de prompt injection é
+  neutralizada antes de entrar no prompt;
+- PII é detectada **por valor** (e-mail, telefone, CPF/CNPJ com dígito
+  verificador, CEP, cartão com Luhn, endereço), não por menção à palavra;
+- nada de conteúdo importado vira treino sem aprovação humana explícita;
+- o dataset é versionado, congelável e reproduzível, com split agrupado por
+  conversa e deduplicação exata e near-duplicate;
+- a criação do job de fine-tuning é **bloqueada** pelo readiness.
 
 ### Como receber dados para treino
-Se voce fornecer uma base historica, o caminho correto e:
 
-1. importar as conversas para um staging separado;
-2. segmentar pares ou trechos uteis de atendimento;
-3. remover ou anonimizar dados sensiveis;
-4. classificar por empresa, perfil e tipo de cenario;
-5. promover apenas exemplos aprovados para `message_examples`;
-6. revisar o report em `GET /admin/training-dataset/review`;
-7. so depois exportar `train/validation` e iniciar o fine-tuning.
+Fluxo governado, em `POST /admin/conversation-import`:
 
-O projeto agora possui uma camada inicial de importacao em `POST /admin/training-import`, com suporte a CSV ou JSON para:
-- atualizar contatos com `customer_profile`;
-- criar `message_examples` a partir de pares curados de pergunta/resposta;
-- rodar em `dry_run` para revisar o preview antes de persistir;
-- promover automaticamente exemplos elegiveis para treino quando fizer sentido.
+1. **dry-run** do lote — o pipeline inteiro roda sem escrever nada;
+2. parse (CSV, JSON ou export TXT do WhatsApp) com tolerância a encoding,
+   multilinha e linhas inválidas;
+3. anonimização de PII **antes** do staging;
+4. segmentação por contato e janela de inatividade;
+5. extração de candidatos multi-turno preservando ordem, papéis e contexto;
+6. revisão humana em `POST /admin/training-candidates/{id}/review`;
+7. promoção para `message_examples` com lineage até a conversa de origem;
+8. geração e congelamento de uma `dataset_version`;
+9. avaliação comparando base, base+RAG e fine-tuned;
+10. criação do job apenas se o readiness aprovar.
 
-Esse importador ja resolve a entrada inicial por CRM/planilha/export simples, mas ainda nao substitui um ETL dedicado para bases complexas, anexos, multi-turno longo ou exports legados muito sujos.
+O importador de pares curados (`POST /admin/training-import`) continua
+funcionando para CRM e planilha, agora com taxonomia normalizada, PII
+anonimizada e revisão obrigatória antes do treino.
 
 ## Escalabilidade e Onboarding
 - perfil de implantação em `GET /admin/system/profile`
@@ -659,19 +714,65 @@ Esse importador ja resolve a entrada inicial por CRM/planilha/export simples, ma
 - `POST /admin/reminders/dispatch-due`
 - `POST /admin/training-import`
 
+### Plataforma multiempresa
+- `GET /admin/taxonomy`
+- `GET /admin/vertical-packs`
+- `GET|POST /admin/channel-bindings`
+- `DELETE /admin/channel-bindings/{binding_id}`
+- `GET /admin/company-config`
+- `GET|POST /admin/company-config/versions`
+- `POST /admin/company-config/publish`
+- `POST /admin/company-config/bootstrap`
+- `GET|POST /admin/knowledge/documents`
+- `POST /admin/knowledge/documents/{document_id}/approve`
+- `POST /admin/knowledge/documents/{document_id}/archive`
+- `POST /admin/knowledge/import-legacy`
+- `POST /admin/knowledge/search`
+- `POST /admin/conversation-import`
+- `GET /admin/conversation-import/batches`
+- `GET /admin/conversation-import/batches/{batch_id}/conversations`
+- `GET /admin/conversation-import/conversations/{conversation_id}`
+- `GET /admin/training-candidates`
+- `POST /admin/training-candidates/{candidate_id}/review`
+- `GET|POST /admin/dataset-versions`
+- `GET /admin/dataset-versions/{id}`
+- `POST /admin/dataset-versions/{id}/rebuild`
+- `POST /admin/dataset-versions/{id}/freeze`
+- `GET /admin/dataset-versions/{id}/leakage`
+- `GET /admin/dataset-versions/{id}/readiness`
+- `GET|POST /admin/evaluation/cases`
+- `GET|POST /admin/evaluation/runs`
+- `POST /admin/evaluation/compare`
+- `GET /admin/evaluation/promotion-gate`
+- `GET|POST /admin/models`
+- `POST /admin/models/{model_id}/activate`
+- `POST /admin/models/rollback`
+- `POST /admin/finetuning/preflight`
+
 ## Testes
-Para rodar a suíte completa:
+
+### Backend
+
 ```bash
-pytest
+pytest                                   # suíte completa
+pytest tests/test_automation_engine.py   # execução durável
+pytest tests/test_automation_conformance.py  # simulação == runtime
+pytest tests/test_phase_zero_blockers.py     # regressões de autorização
+pytest tests/test_sql_interpolation_guard.py # garantia estática de SQL
 ```
 
-Para rodar testes específicos:
+### Frontend (Automation Studio)
+
 ```bash
-pytest tests/test_reply_service.py
-pytest tests/test_training_export_service.py
-pytest tests/test_finetuning_service.py
-pytest tests/test_outbound_dispatch_service.py
+cd frontend/automation-studio
+npm ci
+npm run typecheck   # TypeScript strict
+npm run lint        # ESLint, zero warnings
+npm test            # Vitest
+npm run build       # bundle em app/platform/automations
 ```
+
+O bundle não é versionado: a imagem Docker o constrói no primeiro estágio.
 
 ## Estado atual do produto
 O backend já está em um estágio avançado de base de produto. Os pontos mais importantes já implementados são:
@@ -690,6 +791,8 @@ O backend já está em um estágio avançado de base de produto. Os pontos mais 
 - conectar credenciais reais de Google Calendar ou CalDAV/iCloud
 - automatizar o disparo recorrente de lembretes vencidos
 - endurecer identidade centralizada e RBAC com usuário real
+- habilitar `SHARED_STATE_BACKEND=redis` antes de escalar workers
+- avaliar embeddings reais (`EMBEDDINGS_PROVIDER=openai`) e pgvector
 
 ## Boas práticas
 - nunca versionar `.env` com segredos reais

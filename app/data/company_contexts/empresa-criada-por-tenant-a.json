@@ -1,0 +1,164 @@
+{
+  "company_name": "Empresa Criada Por Tenant A",
+  "brand_tone": {
+    "style": "profissional, cordial e objetiva",
+    "language": "pt-BR",
+    "formality_level": "media",
+    "response_length": "curta a moderada",
+    "emoji_policy": "usar com moderacao apenas se fizer sentido para a marca"
+  },
+  "enabled_modules": {
+    "catalog": true,
+    "services": true,
+    "products": false,
+    "scheduling": true,
+    "staff_selection": true,
+    "rentals": false,
+    "inventory": false,
+    "delivery": false,
+    "pickup": false,
+    "subscriptions": false,
+    "custom_orders": false,
+    "quotes": false,
+    "support": true,
+    "financial_handoff": true,
+    "reminders": true
+  },
+  "business_identity": {
+    "business_type": "clinica",
+    "business_model": [
+      "services",
+      "scheduling"
+    ],
+    "segment": "Saude e bem-estar",
+    "company_description": "Empresa Criada Por Tenant A — atendimento via WhatsApp.",
+    "service_area": "Atendimento conforme abrangencia do negocio",
+    "has_physical_store": true,
+    "store_type": "atendimento presencial",
+    "attends_online": true,
+    "attends_in_person": true,
+    "onsite_service_available": false,
+    "works_with_scheduling": true,
+    "works_with_rentals": false,
+    "works_with_custom_orders": false,
+    "works_with_subscription": false,
+    "works_with_sales": false,
+    "works_with_after_sales": true
+  },
+  "contact_channels": {
+    "primary_channel": "whatsapp",
+    "secondary_channels": [],
+    "phone": "",
+    "email": "",
+    "instagram": "",
+    "website": ""
+  },
+  "business_hours": {
+    "timezone": "America/Sao_Paulo",
+    "weekdays": "08:00-18:00",
+    "saturday": "fechado",
+    "sunday": "fechado",
+    "holiday_policy": "Atendimento sujeito a confirmacao em feriados.",
+    "after_hours_intake_allowed": true,
+    "scheduling_window": "Agendamentos com antecedencia minima de 120 minutos."
+  },
+  "response_policy": {
+    "response_time": "Ate 2 horas em horario comercial",
+    "after_hours_behavior": "Registrar a mensagem e informar que o retorno ocorrera no proximo periodo de atendimento.",
+    "auto_reply_allowed_for": [
+      "lead_novo",
+      "cliente_existente",
+      "suporte"
+    ],
+    "handoff_required_for": [
+      "financeiro",
+      "fornecedor"
+    ],
+    "human_review_required_for": []
+  },
+  "commercial_policy": {
+    "currency": "BRL",
+    "budget_policy": "Os valores finais dependem do servico e disponibilidade.",
+    "payment_methods": [
+      "pix",
+      "cartao_credito"
+    ],
+    "installments_available": false,
+    "minimum_order_value": null,
+    "proposal_required_for_custom_cases": true,
+    "discount_policy": "Descontos mediante analise.",
+    "cancellation_policy": "Cancelamentos devem ser feitos com antecedencia.",
+    "refund_policy": "Reembolso sujeito a politica vigente.",
+    "quote_validity": "Orcamentos validos por 7 dias."
+  },
+  "catalog": {
+    "categories": [
+      {
+        "name": "consultas",
+        "type": "service"
+      },
+      {
+        "name": "exames",
+        "type": "service"
+      },
+      {
+        "name": "procedimentos",
+        "type": "service"
+      }
+    ],
+    "items": []
+  },
+  "customer_intake": {
+    "scheduling": {
+      "required_fields": [
+        "nome",
+        "data desejada",
+        "horario desejado",
+        "servico"
+      ]
+    },
+    "support": {
+      "required_fields": [
+        "nome",
+        "descricao do problema"
+      ]
+    }
+  },
+  "scheduling_policy": {
+    "enabled": true,
+    "natural_booking_enabled": true,
+    "minimum_notice_minutes": 120,
+    "default_slot_duration_minutes": 60,
+    "max_suggestions": 3,
+    "require_service_selection": true,
+    "confirmation_required": true,
+    "allow_customer_notes": true
+  },
+  "reminder_policy": {
+    "enabled": true,
+    "internal_manual_reminders_enabled": true,
+    "appointment_customer_reminders_enabled": true,
+    "customer_reminder_offsets_days": [
+      2,
+      1
+    ],
+    "default_channel": "whatsapp",
+    "customer_default_channel": "whatsapp",
+    "internal_default_channel": "whatsapp"
+  },
+  "business_rules": [
+    "Nao inventar precos ou disponibilidade.",
+    "Quando faltar contexto, perguntar antes de confirmar."
+  ],
+  "llm_guidelines": {
+    "must_not_do": [
+      "inventar estoque",
+      "inventar disponibilidade",
+      "inventar precos"
+    ],
+    "should_do": [
+      "responder com objetividade",
+      "usar o contexto da empresa"
+    ]
+  }
+}

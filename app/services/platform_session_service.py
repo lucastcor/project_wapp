@@ -74,20 +74,46 @@ def issue_platform_session(
     *,
     role: str,
     actor: str,
+    principal_id: int | None = None,
+    token_id: int | None = None,
+    auth_epoch: int | None = None,
 ) -> dict[str, Any]:
+    """Emite o cookie de sessão.
+
+    Quando a sessão nasce de um principal, ela carrega a credencial que a
+    originou e a época de autenticação vigente. Ambas são reconferidas no
+    banco a cada requisição: revogar o token ou mover a época derruba a
+    sessão na hora, sem esperar o TTL.
+    """
     now = int(time.time())
     max_age = max(300, int(settings.platform_session_ttl_seconds))
     expires_at = now + max_age
-    payload = {
+    payload: dict[str, Any] = {
         "role": role,
         "actor": actor,
         "iat": now,
         "exp": expires_at,
     }
+    if principal_id is not None:
+        # O escopo de empresas não vai no cookie: é recarregado do banco a
+        # cada requisição para que revogações valham imediatamente.
+        payload["principal_id"] = int(principal_id)
+        if token_id is not None:
+            payload["token_id"] = int(token_id)
+        payload["auth_epoch"] = int(
+            auth_epoch if auth_epoch is not None else _current_auth_epoch(int(principal_id))
+        )
     payload["token"] = _encode(payload)
     payload["max_age"] = max_age
     payload["expires_at"] = expires_at
     return payload
+
+
+def _current_auth_epoch(principal_id: int) -> int:
+    from app.storage import identity_repository
+
+    record = identity_repository.get_principal(principal_id)
+    return int((record or {}).get("auth_epoch") or 1)
 
 
 def read_platform_session(token: str | None) -> dict[str, Any]:
@@ -107,6 +133,9 @@ def read_platform_session(token: str | None) -> dict[str, Any]:
         "actor": actor,
         "expires_at": exp,
         "issued_at": int(payload.get("iat") or 0),
+        "principal_id": payload.get("principal_id"),
+        "token_id": payload.get("token_id"),
+        "auth_epoch": payload.get("auth_epoch"),
     }
 
 
@@ -131,6 +160,29 @@ def authenticate_platform_login(
     role_token_map = get_role_token_map(settings)
     if not role_token_map:
         raise PlatformSessionError("Admin authentication is enabled but no admin tokens are configured.")
+
+    # Credencial de principal tem precedência sobre o token legado por papel.
+    from app.services.admin_principal_service import (
+        authenticate_principal_token,
+    )
+
+    principal = authenticate_principal_token(admin_token)
+    if principal is not None:
+        session_payload = issue_platform_session(
+            role=principal.global_role,
+            actor=principal.actor,
+            principal_id=principal.principal_id,
+            token_id=principal.token_id,
+            auth_epoch=principal.auth_epoch,
+        )
+        return {
+            "role": principal.global_role,
+            "actor": principal.actor,
+            "auth_mode": "session",
+            "token": session_payload["token"],
+            "max_age": session_payload["max_age"],
+            "expires_at": session_payload["expires_at"],
+        }
 
     resolved_role = resolve_admin_role_from_token(admin_token, settings_obj=settings)
     if not resolved_role:

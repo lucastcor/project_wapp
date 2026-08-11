@@ -67,9 +67,10 @@ class FakeRepository:
         self.updated_memory = kwargs
 
 
-def test_process_contact_message_full_flow(monkeypatch) -> None:
+def test_process_contact_message_full_flow(monkeypatch, stub_company_config) -> None:
     fake_repository = FakeRepository()
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    stub_company_config(orchestrator, company_id=1, company_slug="default", company_name="Default Company")
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",
@@ -140,9 +141,10 @@ def test_process_contact_message_full_flow(monkeypatch) -> None:
     assert fake_repository.updated_memory is not None
 
 
-def test_process_contact_message_uses_workflow_when_handled(monkeypatch) -> None:
+def test_process_contact_message_uses_workflow_when_handled(monkeypatch, stub_company_config) -> None:
     fake_repository = FakeRepository()
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    stub_company_config(orchestrator, company_id=1, company_slug="default", company_name="Default Company")
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",

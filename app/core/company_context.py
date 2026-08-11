@@ -1,8 +1,17 @@
+"""Camada de template/seed do company context.
+
+Os arquivos JSON deste diretório deixaram de ser a fonte mutável de verdade:
+eles são seeds de bootstrap importados para `company_context_versions`. A
+fonte operacional é `app.services.company_config_service`.
+
+Este módulo mantém somente leitura de seed, validação de schema e escrita de
+template — nunca leitura de runtime com fallback silencioso entre empresas.
+"""
+
 import json
+import re
 from pathlib import Path
 from typing import Any
-import re
-
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 COMPANY_CONTEXT_PATH = DATA_DIR / "company_context.json"
@@ -145,11 +154,33 @@ def _validate_company_context(data: dict[str, Any]) -> None:
                     )
 
 
-def get_company_context(company_slug: str | None = None) -> dict[str, Any]:
+def validate_company_context(data: dict[str, Any]) -> None:
+    """Valida o schema do company context. Público para a camada de serviço."""
+    _validate_company_context(data)
+
+
+def has_seed_company_context(company_slug: str | None) -> bool:
+    """True quando existe um seed JSON específico para esse slug."""
+    if not company_slug:
+        return COMPANY_CONTEXT_PATH.exists()
+    try:
+        return _get_company_context_path(company_slug).exists()
+    except CompanyContextError:
+        return False
+
+
+def get_seed_company_context(company_slug: str | None = None) -> dict[str, Any]:
+    """Lê um seed JSON. Sem slug, devolve o template global.
+
+    Não há fallback entre empresas: pedir o seed de um slug inexistente é erro,
+    porque responder com a identidade de outra empresa seria pior que falhar.
+    """
     context_path = _get_company_context_path(company_slug)
 
-    if not context_path.exists() and company_slug:
-        context_path = COMPANY_CONTEXT_PATH
+    if not context_path.exists():
+        raise CompanyContextError(
+            f"Company context seed not found: {context_path.name}"
+        )
 
     with context_path.open("r", encoding="utf-8") as file:
         data = json.load(file)
@@ -158,33 +189,35 @@ def get_company_context(company_slug: str | None = None) -> dict[str, Any]:
     return data
 
 
+def get_company_context(company_slug: str | None = None) -> dict[str, Any]:
+    """Compatibilidade: leitura de seed por slug.
+
+    Mantido para ferramentas e testes que operam sobre os templates. Código de
+    runtime deve usar `app.services.company_config_service.get_company_config`.
+    """
+    return get_seed_company_context(company_slug)
+
+
 def get_company_context_status(company_slug: str | None = None) -> dict[str, Any]:
     requested_path = _get_company_context_path(company_slug)
-    fallback_used = False
-    resolved_path = requested_path
-
-    if company_slug and not requested_path.exists():
-        resolved_path = COMPANY_CONTEXT_PATH
-        fallback_used = True
-
-    context_exists = resolved_path.exists()
+    context_exists = requested_path.exists()
     status = {
         "company_slug": company_slug,
         "requested_path": str(requested_path),
-        "resolved_path": str(resolved_path),
+        "resolved_path": str(requested_path),
         "exists": context_exists,
-        "fallback_used": fallback_used,
+        "fallback_used": False,
         "is_valid": False,
         "top_level_keys": [],
         "error": None,
     }
 
     if not context_exists:
-        status["error"] = "Company context file does not exist."
+        status["error"] = "Company context seed does not exist."
         return status
 
     try:
-        context = get_company_context(company_slug=company_slug)
+        context = get_seed_company_context(company_slug=company_slug)
     except (CompanyContextError, json.JSONDecodeError, FileNotFoundError) as exc:
         status["error"] = str(exc)
         return status
@@ -194,10 +227,15 @@ def get_company_context_status(company_slug: str | None = None) -> dict[str, Any
     return status
 
 
-def save_company_context(
+def save_seed_company_context(
     data: dict[str, Any],
     company_slug: str | None = None,
 ) -> dict[str, Any]:
+    """Grava um seed/template JSON.
+
+    Usado por bootstrap e onboarding. Não é o caminho de escrita operacional:
+    mudanças de runtime criam versões em `company_context_versions`.
+    """
     _validate_company_context(data)
 
     context_path = _get_company_context_path(company_slug)
@@ -208,3 +246,7 @@ def save_company_context(
         file.write("\n")
 
     return data
+
+
+# Alias de compatibilidade para chamadores existentes.
+save_company_context = save_seed_company_context

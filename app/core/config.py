@@ -91,5 +91,117 @@ class Settings:
     whatsapp_webhook_verify_token: str | None = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
     whatsapp_app_secret: str | None = os.getenv("WHATSAPP_APP_SECRET")
 
+    # --- Multiempresa: resolução de tenant e superfícies públicas ---
+    # Aceitar company_id/company_slug informados pelo chamador só é seguro fora
+    # de produção. Em produção o tenant vem do binding do canal.
+    allow_untrusted_tenant_hints: bool = os.getenv("ALLOW_UNTRUSTED_TENANT_HINTS", "true").lower() == "true"
+    # Payload normalizado do webhook não tem assinatura do Meta.
+    allow_normalized_whatsapp_webhook: bool = os.getenv(
+        "ALLOW_NORMALIZED_WHATSAPP_WEBHOOK",
+        "true",
+    ).lower() == "true"
+
+    # --- Knowledge / RAG ---
+    knowledge_retrieval_enabled: bool = os.getenv("KNOWLEDGE_RETRIEVAL_ENABLED", "true").lower() == "true"
+    knowledge_max_chunks: int = int(os.getenv("KNOWLEDGE_MAX_CHUNKS", "6"))
+    knowledge_min_score: float = float(os.getenv("KNOWLEDGE_MIN_SCORE", "0.05"))
+    # `none` mantém a recuperação lexical determinística; `openai` habilita embeddings.
+    embeddings_provider: str = os.getenv("EMBEDDINGS_PROVIDER", "none")
+    embeddings_model: str = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small")
+    enable_vector_search: bool = os.getenv("ENABLE_VECTOR_SEARCH", "false").lower() == "true"
+
+    # --- Importação e governança de dataset ---
+    import_max_bytes: int = int(os.getenv("IMPORT_MAX_BYTES", "5242880"))
+    import_max_messages_per_batch: int = int(os.getenv("IMPORT_MAX_MESSAGES_PER_BATCH", "20000"))
+    import_session_gap_minutes: int = int(os.getenv("IMPORT_SESSION_GAP_MINUTES", "360"))
+
+    # --- Fine-tuning readiness ---
+    finetuning_min_examples: int = int(os.getenv("FINETUNING_MIN_EXAMPLES", "50"))
+    finetuning_min_scenarios: int = int(os.getenv("FINETUNING_MIN_SCENARIOS", "3"))
+    finetuning_min_examples_per_scenario: int = int(os.getenv("FINETUNING_MIN_EXAMPLES_PER_SCENARIO", "5"))
+    finetuning_min_eval_pass_rate: float = float(os.getenv("FINETUNING_MIN_EVAL_PASS_RATE", "0.7"))
+
+    # --- Estado compartilhado entre workers ---
+    # `memory` é local ao processo e só é adequado para desenvolvimento/testes.
+    shared_state_backend: str = os.getenv("SHARED_STATE_BACKEND", "memory")
+    redis_url: str | None = os.getenv("REDIS_URL")
+
+    # --- Identidade e autorização por tenant ---
+    # Ingestão sem credencial só é aceitável em desenvolvimento local, e mesmo
+    # assim o tenant nunca vem do chamador: cai na empresa padrão.
+    allow_unauthenticated_ingest: bool = os.getenv(
+        "ALLOW_UNAUTHENTICATED_INGEST",
+        "false",
+    ).lower() == "true"
+    # Tokens administrativos legados por papel são globais por natureza.
+    # Só o de superadmin permanece global; `viewer` e `operator` legados ficam
+    # sem empresa até receberem membership explícita. Ambientes de
+    # desenvolvimento podem reabrir isso de forma consciente.
+    allow_legacy_global_admin_tokens: bool = os.getenv(
+        "ALLOW_LEGACY_GLOBAL_ADMIN_TOKENS",
+        "false",
+    ).lower() == "true"
+
+    # --- Pseudonimização ---
+    pii_pseudonymization_key: str | None = os.getenv("PII_PSEUDONYMIZATION_KEY")
+    pii_pseudonymization_key_version: str = os.getenv("PII_PSEUDONYMIZATION_KEY_VERSION", "v1")
+
+    # --- Contexto multi-turno ---
+    import_max_context_turns: int = int(os.getenv("IMPORT_MAX_CONTEXT_TURNS", "6"))
+    import_max_context_chars: int = int(os.getenv("IMPORT_MAX_CONTEXT_CHARS", "2000"))
+
+    # --- Deduplicação ---
+    # Distância de Hamming máxima entre SimHashes de 64 bits para considerar
+    # dois pares como near-duplicates.
+    near_duplicate_max_distance: int = int(os.getenv("NEAR_DUPLICATE_MAX_DISTANCE", "4"))
+
+    # --- Avaliação ---
+    # Avaliação model-backed executa o modelo real e é a única que pode
+    # liberar promoção. Desabilitada por padrão: CI nunca chama provider.
+    enable_real_model_evaluation: bool = os.getenv(
+        "ENABLE_REAL_MODEL_EVALUATION",
+        "false",
+    ).lower() == "true"
+    # Override emergencial do gate de promoção. Desabilitado por padrão.
+    allow_promotion_gate_override: bool = os.getenv(
+        "ALLOW_PROMOTION_GATE_OVERRIDE",
+        "false",
+    ).lower() == "true"
+
+    # --- Automation Studio ---
+    # Desligado por padrão, nos dois planos. Nenhuma empresa existente passa a
+    # executar automação por causa de um deploy: habilitar é decisão explícita
+    # e, mesmo habilitado, cada workflow ainda precisa ser ativado.
+    automation_engine_enabled: bool = os.getenv(
+        "AUTOMATION_ENGINE_ENABLED",
+        "false",
+    ).lower() == "true"
+    automation_worker_enabled: bool = os.getenv(
+        "AUTOMATION_WORKER_ENABLED",
+        "false",
+    ).lower() == "true"
+    # Teto de passos por execução: um grafo acíclico já termina, mas o limite
+    # protege contra grafo grande e contra bug de avanço.
+    automation_max_steps_per_execution: int = int(
+        os.getenv("AUTOMATION_MAX_STEPS_PER_EXECUTION", "50")
+    )
+    automation_max_attempts: int = int(os.getenv("AUTOMATION_MAX_ATTEMPTS", "5"))
+    automation_job_lease_seconds: int = int(os.getenv("AUTOMATION_JOB_LEASE_SECONDS", "60"))
+    automation_gate_lease_seconds: int = int(os.getenv("AUTOMATION_GATE_LEASE_SECONDS", "300"))
+    automation_execution_retention_days: int = int(
+        os.getenv("AUTOMATION_EXECUTION_RETENTION_DAYS", "90")
+    )
+    automation_max_event_bytes: int = int(os.getenv("AUTOMATION_MAX_EVENT_BYTES", "16000"))
+    automation_worker_poll_seconds: float = float(
+        os.getenv("AUTOMATION_WORKER_POLL_SECONDS", "2.0")
+    )
+    automation_retry_base_seconds: int = int(os.getenv("AUTOMATION_RETRY_BASE_SECONDS", "10"))
+    automation_retry_max_seconds: int = int(os.getenv("AUTOMATION_RETRY_MAX_SECONDS", "3600"))
+
 
 settings = Settings()
+
+
+def is_production_like() -> bool:
+    """Ambiente onde fallbacks permissivos são proibidos."""
+    return settings.environment.strip().lower() == "production" or settings.strict_runtime_validation

@@ -1,10 +1,10 @@
 import argparse
 import sqlite3
 from collections.abc import Sequence
+from contextlib import closing
 
 from app.core.config import settings
 from app.storage.db import init_db
-
 
 TABLE_COLUMNS: list[tuple[str, list[str], str | None]] = [
     (
@@ -421,12 +421,16 @@ def migrate(sqlite_path: str, postgres_url: str, truncate_first: bool = True) ->
     settings.postgres_database_url = postgres_url
     init_db()
 
-    sqlite_connection = sqlite3.connect(sqlite_path)
-    sqlite_connection.row_factory = sqlite3.Row
-
     import psycopg  # type: ignore
 
-    with psycopg.connect(postgres_url) as postgres_connection:
+    # D-13: `sqlite3.connect` ficava fora de qualquer `finally`. Uma falha
+    # dentro do bloco do psycopg — tabela ausente, erro de conversão — deixava
+    # o handle SQLite aberto com transação de leitura. É o padrão do I-01
+    # verbatim; aqui o processo é de um disparo só, mas o formato é o mesmo.
+    with closing(sqlite3.connect(sqlite_path)) as sqlite_connection, psycopg.connect(
+        postgres_url
+    ) as postgres_connection:
+        sqlite_connection.row_factory = sqlite3.Row
         with postgres_connection.cursor() as postgres_cursor:
             source_has_contact_profiles = _sqlite_table_exists(sqlite_connection, "contact_company_profiles")
             if truncate_first:
@@ -485,8 +489,6 @@ def migrate(sqlite_path: str, postgres_url: str, truncate_first: bool = True) ->
                 )
 
         postgres_connection.commit()
-
-    sqlite_connection.close()
 
 
 def main() -> None:

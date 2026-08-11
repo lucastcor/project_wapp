@@ -1,12 +1,12 @@
 from app.services import onboarding_service
 from app.services.onboarding_service import (
+    BUSINESS_TYPE_PRESETS,
     OnboardingError,
-    get_onboarding_presets,
-    setup_company,
-    get_setup_status,
     _build_company_context,
     _slugify,
-    BUSINESS_TYPE_PRESETS,
+    get_onboarding_presets,
+    get_setup_status,
+    setup_company,
 )
 
 
@@ -79,7 +79,7 @@ def test_get_onboarding_presets():
     assert "business_types" in presets
     assert "timezones" in presets
     assert len(presets["business_types"]) == len(BUSINESS_TYPE_PRESETS)
-    for key, info in presets["business_types"].items():
+    for info in presets["business_types"].values():
         assert "label" in info
         assert "key" in info
 

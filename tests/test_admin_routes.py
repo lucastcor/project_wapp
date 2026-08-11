@@ -1,9 +1,8 @@
 from fastapi.testclient import TestClient
 
-from app.main import app
 from app.api import admin_routes
 from app.core.config import settings
-
+from app.main import app
 
 client = TestClient(app)
 
@@ -203,7 +202,7 @@ def test_create_finetuning_job_requires_resolved_company(monkeypatch) -> None:
 
     monkeypatch.setattr(admin_routes, "repository", FakeRepository())
 
-    response = client.post("/admin/finetuning/jobs")
+    response = client.post("/admin/finetuning/jobs", json={"dataset_version_id": 1})
 
     assert response.status_code == 400
     assert "company_id or company_slug" in response.json()["detail"]
@@ -222,18 +221,31 @@ def test_create_finetuning_job_passes_resolved_company_scope(monkeypatch) -> Non
             return 1
 
     class FakeFineTuningService:
-        def create_finetuning_job(self, *, company_id: int | None):
+        def create_finetuning_job(
+            self,
+            *,
+            company_id: int | None,
+            dataset_version_id: int,
+            require_evaluation: bool = True,
+            requested_by: str | None = None,
+        ):
             assert company_id == 5
+            assert dataset_version_id == 11
             return {
                 "job_id": "ftjob-empresa-a",
                 "status": "validating_files",
                 "base_model": "gpt-4o-mini-2024-07-18",
+                "dataset_version_id": dataset_version_id,
             }
 
     monkeypatch.setattr(admin_routes, "repository", FakeRepository())
     monkeypatch.setattr(admin_routes, "_get_finetuning_service", lambda: FakeFineTuningService())
 
-    response = client.post("/admin/finetuning/jobs", params={"company_slug": "empresa-a"})
+    response = client.post(
+        "/admin/finetuning/jobs",
+        params={"company_slug": "empresa-a"},
+        json={"dataset_version_id": 11},
+    )
 
     assert response.status_code == 200
     assert response.json()["job_id"] == "ftjob-empresa-a"
@@ -274,7 +286,7 @@ def test_list_finetuning_jobs_uses_company_scope(monkeypatch) -> None:
     assert response.json()[0]["job_id"] == "ftjob-empresa-8"
 
 
-def test_read_system_onboarding(monkeypatch) -> None:
+def test_read_system_onboarding(monkeypatch, company_factory) -> None:
     monkeypatch.setattr(
         admin_routes,
         "get_onboarding_status",
@@ -303,11 +315,14 @@ def test_read_system_onboarding(monkeypatch) -> None:
         },
     )
 
-    response = client.get("/admin/system/onboarding", params={"company_slug": "empresa-z"})
+    company_id = company_factory("onboarding-scope")
+    response = client.get("/admin/system/onboarding", params={"company_id": company_id})
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["scope"]["company_slug"] == "empresa-z"
+    # A rota não recebe mais `company_slug`: a empresa vem do escopo já
+    # autorizado, e o slug foi resolvido e autorizado lá.
+    assert payload["scope"]["company_id"] == company_id
     assert payload["overall_status"] == "ready"
     assert payload["checklist"][0]["code"] == "company_context"
 
@@ -368,7 +383,7 @@ def test_read_calendar_timeline(monkeypatch) -> None:
     assert payload["days"][0]["segments"][0]["booking_id"] == 22
 
 
-def test_query_calendar_availability_endpoint(monkeypatch) -> None:
+def test_query_calendar_availability_endpoint(monkeypatch, company_factory) -> None:
     monkeypatch.setattr(
         admin_routes,
         "query_calendar_availability",
@@ -388,6 +403,7 @@ def test_query_calendar_availability_endpoint(monkeypatch) -> None:
 
     response = client.post(
         "/admin/calendar/availability/query",
+        params={"company_id": company_factory("calendar-availability")},
         json={
             "start_date": "2026-04-07",
             "end_date": "2026-04-08",
@@ -420,6 +436,7 @@ def test_create_calendar_booking_endpoint(monkeypatch) -> None:
 
     response = client.post(
         "/admin/calendar/bookings",
+        params={"company_id": 1},
         json={
             "contact_id": "contato-1",
             "title": "Atendimento comercial",
@@ -474,6 +491,7 @@ def test_create_calendar_booking_endpoint_requests_bot_confirmation(monkeypatch)
 
     response = client.post(
         "/admin/calendar/bookings",
+        params={"company_id": 1},
         json={
             "contact_id": "contato-55",
             "title": "Sessão premium",
@@ -525,6 +543,7 @@ def test_create_appointment_queue_entry_endpoint(monkeypatch) -> None:
 
     response = client.post(
         "/admin/calendar/queue",
+        params={"company_id": 1},
         json={
             "contact_id": "5511999999999",
             "desired_title": "Consulta inicial",
@@ -586,7 +605,7 @@ def test_cancel_calendar_booking_endpoint_triggers_queue_recovery(monkeypatch) -
     monkeypatch.setattr(
         admin_routes,
         "release_booking_slot",
-        lambda booking_id: {
+        lambda booking_id, company_id=None: {
             "booking": {
                 "id": booking_id,
                 "company_id": 1,
@@ -603,6 +622,9 @@ def test_cancel_calendar_booking_endpoint_triggers_queue_recovery(monkeypatch) -
 
     response = client.post(
         "/admin/calendar/bookings/22/cancel",
+        # Mutação por ID exige empresa nomeada: sem ela, o handler não sabe
+        # em qual tenant procurar o recurso (T-03).
+        params={"company_id": 1},
         json={
             "trigger_queue_recovery": True,
             "reason": "Cliente cancelou",
@@ -636,6 +658,9 @@ def test_reschedule_calendar_booking_endpoint(monkeypatch) -> None:
 
     response = client.post(
         "/admin/calendar/bookings/22/reschedule",
+        # Mutação por ID exige empresa nomeada: sem ela, o handler não sabe
+        # em qual tenant procurar o recurso (T-03).
+        params={"company_id": 1},
         json={
             "starts_at": "2026-04-09T10:00:00-03:00",
             "ends_at": "2026-04-09T11:00:00-03:00",
@@ -675,6 +700,9 @@ def test_respond_to_appointment_queue_offer_endpoint(monkeypatch) -> None:
 
     response = client.post(
         "/admin/calendar/queue-offers/9/respond",
+        # Mutação por ID exige empresa nomeada: sem ela, o handler não sabe
+        # em qual tenant procurar o recurso (T-03).
+        params={"company_id": 1},
         json={
             "response_status": "accepted",
             "response_notes": "Cliente aceitou.",
@@ -724,6 +752,7 @@ def test_create_internal_reminder_endpoint(monkeypatch) -> None:
 
     response = client.post(
         "/admin/reminders",
+        params={"company_id": 1},
         json={
             "owner_contact_id": "funcionario-1",
             "message_text": "Me lembra amanhã às 9h de ligar para o cliente João",
@@ -833,7 +862,13 @@ def test_viewer_role_cannot_create_company(monkeypatch) -> None:
     )
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Insufficient admin privileges."
+    # Criar empresa é operação de plataforma: a política central recusa antes
+    # mesmo da checagem de papel. Qualquer uma das duas razões é uma negação
+    # correta; `test_phase_zero_blockers.py` separa os dois caminhos.
+    assert response.json()["detail"] in {
+        "Insufficient admin privileges.",
+        "This operation requires a global superadmin principal.",
+    }
 
 
 def test_superadmin_role_can_create_company(monkeypatch) -> None:

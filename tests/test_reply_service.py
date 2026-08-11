@@ -1,6 +1,26 @@
+import pytest
+
 from app.core.config import settings
-from app.services.reply_services import generate_business_reply
+from app.core.tenancy import TenantScopeError
 from app.services import reply_services
+from app.services.reply_services import generate_business_reply
+from tests.conftest import build_stub_company_config
+
+
+@pytest.fixture(autouse=True)
+def _stub_company_config(monkeypatch):
+    config = build_stub_company_config(company_id=1, company_slug="default")
+    monkeypatch.setattr(reply_services, "get_company_config", lambda company_id: config)
+    return config
+
+
+def test_reply_service_requires_company_id() -> None:
+    with pytest.raises(TenantScopeError):
+        generate_business_reply(
+            classification="lead_novo",
+            message="Quero saber mais sobre o serviço.",
+            company_id=None,
+        )
 
 
 def test_reply_service_fallback_for_lead(monkeypatch) -> None:
@@ -13,6 +33,7 @@ def test_reply_service_fallback_for_lead(monkeypatch) -> None:
         conversation_summary="Contato iniciou conversa.",
         last_classification="lead_novo",
         pipeline_stage="novo_lead",
+        company_id=1,
     )
 
     assert result["source"] == "template"
@@ -29,6 +50,7 @@ def test_reply_service_fallback_for_non_auto_reply_case(monkeypatch) -> None:
         conversation_summary="Contato mencionou nota fiscal.",
         last_classification="financeiro",
         pipeline_stage="encerrado",
+        company_id=1,
     )
 
     assert result["source"] == "none"
@@ -54,6 +76,7 @@ def test_reply_service_returns_openai_source_when_finetuned_flag_is_disabled(mon
         last_classification="lead_novo",
         pipeline_stage="novo_lead",
         contact_id="5511999991111",
+        company_id=1,
     )
 
     assert result["source"] == "openai"
@@ -79,7 +102,27 @@ def test_reply_service_returns_openai_finetuned_source_when_enabled(monkeypatch)
         last_classification="lead_novo",
         pipeline_stage="novo_lead",
         contact_id="5511999992222",
+        company_id=1,
     )
 
     assert result["source"] == "openai_finetuned"
     assert result["reply"] == "Resposta comercial fine-tunada"
+
+
+def test_reply_service_reports_retrieval_trace_without_source_content(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "classification_provider", "mock")
+
+    result = generate_business_reply(
+        classification="lead_novo",
+        message="Qual o valor do serviço?",
+        contact_name="Ana",
+        company_id=1,
+        customer_profile="novo",
+    )
+
+    trace = result["retrieval"]
+    assert trace["scenario_type"] == "lead"
+    assert trace["customer_profile"] == "new_customer"
+    assert trace["has_relevant_source"] is False
+    assert trace["sources"] == []
+    assert "content" not in str(trace)

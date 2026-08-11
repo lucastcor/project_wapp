@@ -5,6 +5,8 @@ from urllib.parse import urlparse
 from app.core.company_context import get_company_context_status
 from app.core.config import is_missing_or_placeholder, settings
 from app.services.calendar_service import get_calendar_profile
+from app.services.pii_service import pseudonymization_key_is_configured
+from app.services.shared_state import shared_state_is_process_local
 from app.services.training_export_service import get_finetuning_readiness_report
 from app.storage.db import (
     check_postgres_target_connection,
@@ -14,7 +16,6 @@ from app.storage.db import (
     get_runtime_database_summary,
 )
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 
@@ -123,6 +124,21 @@ def _configured_reminder_worker_audiences() -> list[str]:
     return normalized or ["customer", "internal"]
 
 
+def _count_active_channel_bindings() -> int | None:
+    """Vínculos de canal ativos, ou None quando não for possível consultar.
+
+    A leitura passa pelo repository para respeitar o mesmo ponto de injeção
+    usado pelo restante do readiness.
+    """
+    counter = getattr(repository, "count_active_channel_bindings", None)
+    if not callable(counter):
+        return None
+    try:
+        return int(counter())
+    except Exception:
+        return None
+
+
 def get_system_profile() -> dict[str, Any]:
     runtime_database = get_runtime_database_summary()
     postgres_target = get_postgres_target_summary()
@@ -191,6 +207,176 @@ def get_system_profile() -> dict[str, Any]:
             "data_hygiene": repository.get_operational_hygiene_summary(),
         },
     }
+
+
+def _automation_checks(*, production_guard_enabled: bool) -> list[dict[str, str | None]]:
+    """Verificações do Automation Studio.
+
+    Com o motor desligado nada disso é bloqueante — é o estado padrão e
+    correto. Ligado, cada item vira uma condição real de operação: sem worker,
+    execuções ficam paradas; sem Postgres, várias réplicas disputam o SQLite;
+    sem shared state, o rate limit não é compartilhado.
+    """
+    checks: list[dict[str, str | None]] = []
+
+    if not settings.automation_engine_enabled:
+        checks.append(
+            _make_check(
+                code="automation_engine",
+                title="Motor de automações",
+                status="pass",
+                severity="warning",
+                detail="AUTOMATION_ENGINE_ENABLED=false: nenhum fluxo é executado.",
+                recommendation=None,
+            )
+        )
+        return checks
+
+    checks.append(
+        _make_check(
+            code="automation_engine",
+            title="Motor de automações",
+            status="pass",
+            severity="warning",
+            detail="Motor habilitado. Cada fluxo ainda precisa ser ativado individualmente.",
+        )
+    )
+
+    worker_ready = settings.automation_worker_enabled
+    checks.append(
+        _make_check(
+            code="automation_worker",
+            title="Worker de automações",
+            status="pass" if worker_ready else "fail",
+            severity="blocker",
+            detail=(
+                "Worker habilitado."
+                if worker_ready
+                else "Motor ligado sem worker: eventos são gravados e nunca processados."
+            ),
+            recommendation=(
+                None
+                if worker_ready
+                else "Definir AUTOMATION_WORKER_ENABLED=true e subir app.tools.automation_worker."
+            ),
+        )
+    )
+
+    backend = get_database_backend()
+    postgres_ready = backend == "postgres"
+    checks.append(
+        _make_check(
+            code="automation_runtime_database",
+            title="Banco do runtime de automações",
+            status="pass" if postgres_ready else ("fail" if production_guard_enabled else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Postgres é a fonte de verdade do runtime; o claim usa FOR UPDATE SKIP LOCKED."
+                if postgres_ready
+                else f"Backend atual: {backend}. SQLite serializa a fila e não escala com réplicas."
+            ),
+            recommendation=(
+                None
+                if postgres_ready
+                else "Apontar DATABASE_URL para Postgres antes de operar automações com várias réplicas."
+            ),
+        )
+    )
+
+    lease_seconds = int(settings.automation_job_lease_seconds)
+    max_attempts = int(settings.automation_max_attempts)
+    max_steps = int(settings.automation_max_steps_per_execution)
+    limits_valid = (
+        lease_seconds >= 10
+        and 1 <= max_attempts <= 20
+        and 1 <= max_steps <= 500
+        and settings.automation_retry_base_seconds >= 0
+        and settings.automation_retry_max_seconds >= settings.automation_retry_base_seconds
+    )
+    checks.append(
+        _make_check(
+            code="automation_limits",
+            title="Limites de lease e retry",
+            status="pass" if limits_valid else "fail",
+            severity="blocker",
+            detail=(
+                f"lease={lease_seconds}s, max_attempts={max_attempts}, max_steps={max_steps}."
+                if limits_valid
+                else "Configuração de lease/retry inválida: um lease curto demais reprocessa passo em voo."
+            ),
+            recommendation=(
+                None
+                if limits_valid
+                else "Revisar AUTOMATION_JOB_LEASE_SECONDS, AUTOMATION_MAX_ATTEMPTS e AUTOMATION_RETRY_*."
+            ),
+        )
+    )
+
+    invalid_deployments = _count_invalid_active_deployments()
+    checks.append(
+        _make_check(
+            code="automation_active_versions",
+            title="Versões ativas válidas",
+            status="pass" if invalid_deployments == 0 else "fail",
+            severity="blocker",
+            detail=(
+                "Nenhuma versão ativa inválida."
+                if invalid_deployments == 0
+                else f"{invalid_deployments} deployment(s) ativo(s) apontam para versão inexistente."
+            ),
+            recommendation=(
+                None
+                if invalid_deployments == 0
+                else "Pausar os fluxos afetados e republicar antes de reativar."
+            ),
+        )
+    )
+
+    shared_state_ready = settings.shared_state_backend != "memory"
+    checks.append(
+        _make_check(
+            code="automation_shared_state",
+            title="Estado compartilhado",
+            status="pass" if shared_state_ready else ("fail" if production_guard_enabled else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                f"Backend compartilhado: {settings.shared_state_backend}."
+                if shared_state_ready
+                else "SHARED_STATE_BACKEND=memory: rate limit e wake-up não são compartilhados entre réplicas."
+            ),
+            recommendation=(
+                None
+                if shared_state_ready
+                else "Configurar SHARED_STATE_BACKEND=redis ao operar com mais de uma réplica."
+            ),
+        )
+    )
+
+    return checks
+
+
+def _count_invalid_active_deployments() -> int:
+    """Deployments ativos cuja versão não existe mais.
+
+    Falha fechada em zero se a tabela ainda não existir: um readiness que
+    quebra por causa de uma migration pendente esconde os outros problemas.
+    """
+    try:
+        from app.storage.sql_support import fetch_one
+
+        row = fetch_one(
+            """
+            SELECT COUNT(*) AS total
+            FROM automation_deployments d
+            LEFT JOIN automation_workflow_versions v
+                ON v.id = d.version_id AND v.company_id = d.company_id
+            WHERE d.state = 'active'
+              AND v.id IS NULL
+            """
+        )
+        return int((row or {}).get("total") or 0)
+    except Exception:
+        return 0
 
 
 def get_system_readiness() -> dict[str, Any]:
@@ -514,6 +700,159 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
+    # --- configuração insegura da plataforma multiempresa ---
+    pseudonymization_ok = pseudonymization_key_is_configured()
+    checks.append(
+        _make_check(
+            code="pii_pseudonymization_key",
+            title="Chave de pseudonimização",
+            status="pass" if pseudonymization_ok else ("fail" if production_guard_enabled else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "PII_PSEUDONYMIZATION_KEY configurada."
+                if pseudonymization_ok
+                else "PII_PSEUDONYMIZATION_KEY ausente: pseudônimos ficam reversíveis por enumeração."
+            ),
+            recommendation="Definir PII_PSEUDONYMIZATION_KEY com segredo forte antes de importar base real."
+            if not pseudonymization_ok
+            else None,
+        )
+    )
+
+    ingest_open = settings.allow_unauthenticated_ingest
+    checks.append(
+        _make_check(
+            code="ingest_authentication",
+            title="Autenticação da ingestão",
+            status="fail" if (ingest_open and production_guard_enabled) else ("pass" if not ingest_open else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "ALLOW_UNAUTHENTICATED_INGEST=true aceita mensagens sem credencial de tenant."
+                if ingest_open
+                else "Ingestão exige credencial de tenant."
+            ),
+            recommendation="Definir ALLOW_UNAUTHENTICATED_INGEST=false e emitir credenciais por empresa."
+            if ingest_open
+            else None,
+        )
+    )
+
+    legacy_tokens_global = settings.allow_legacy_global_admin_tokens
+    checks.append(
+        _make_check(
+            code="legacy_admin_token_scope",
+            title="Escopo dos tokens administrativos legados",
+            status="fail" if (legacy_tokens_global and production_guard_enabled) else ("pass" if not legacy_tokens_global else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "ALLOW_LEGACY_GLOBAL_ADMIN_TOKENS=true dá acesso global a viewer/operator legados."
+                if legacy_tokens_global
+                else "Somente superadmin legado permanece global."
+            ),
+            recommendation="Definir ALLOW_LEGACY_GLOBAL_ADMIN_TOKENS=false e criar principals com membership."
+            if legacy_tokens_global
+            else None,
+        )
+    )
+
+    override_open = settings.allow_promotion_gate_override
+    checks.append(
+        _make_check(
+            code="promotion_gate_override",
+            title="Override do gate de promoção",
+            status="warn" if override_open else "pass",
+            severity="warning",
+            detail=(
+                "ALLOW_PROMOTION_GATE_OVERRIDE=true permite ativar modelo sem avaliação aprovada."
+                if override_open
+                else "Override do gate de promoção desabilitado."
+            ),
+            recommendation="Manter ALLOW_PROMOTION_GATE_OVERRIDE=false fora de incidente."
+            if override_open
+            else None,
+        )
+    )
+
+
+    shared_state_is_local = shared_state_is_process_local()
+    checks.append(
+        _make_check(
+            code="shared_state_backend",
+            title="Backend de estado compartilhado",
+            status="fail" if (shared_state_is_local and production_guard_enabled) else ("pass" if not shared_state_is_local else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                f"SHARED_STATE_BACKEND={settings.shared_state_backend}. "
+                + (
+                    "Rate limit e eventos SSE ficam locais ao processo e não valem entre workers."
+                    if shared_state_is_local
+                    else "Estado compartilhado entre réplicas."
+                )
+            ),
+            recommendation="Definir SHARED_STATE_BACKEND=redis e REDIS_URL antes de rodar múltiplos workers."
+            if shared_state_is_local
+            else None,
+        )
+    )
+
+    normalized_webhook_open = settings.allow_normalized_whatsapp_webhook and not (
+        settings.whatsapp_app_secret or ""
+    ).strip()
+    checks.append(
+        _make_check(
+            code="webhook_payload_hardening",
+            title="Endurecimento do webhook",
+            status="fail" if (normalized_webhook_open and production_guard_enabled) else ("pass" if not normalized_webhook_open else "warn"),
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "Payload normalizado aceito sem assinatura HMAC."
+                if normalized_webhook_open
+                else "Payload normalizado bloqueado ou protegido por HMAC."
+            ),
+            recommendation="Definir WHATSAPP_APP_SECRET e ALLOW_NORMALIZED_WHATSAPP_WEBHOOK=false em produção."
+            if normalized_webhook_open
+            else None,
+        )
+    )
+
+    tenant_hints_open = settings.allow_untrusted_tenant_hints and production_guard_enabled
+    checks.append(
+        _make_check(
+            code="tenant_resolution_hardening",
+            title="Resolução de tenant",
+            status="fail" if tenant_hints_open else "pass",
+            severity="blocker" if production_guard_enabled else "warning",
+            detail=(
+                "ALLOW_UNTRUSTED_TENANT_HINTS=true aceita company_id informado pelo chamador."
+                if tenant_hints_open
+                else "Tenant resolvido por vínculo verificável de canal."
+            ),
+            recommendation="Definir ALLOW_UNTRUSTED_TENANT_HINTS=false e cadastrar os channel bindings da empresa."
+            if tenant_hints_open
+            else None,
+        )
+    )
+
+    # O bloqueio real de tráfego sem binding acontece em
+    # `tenant_resolution_service`; aqui o readiness apenas expõe o estado.
+    channel_binding_count = _count_active_channel_bindings() if runtime_probe["ok"] else None
+    checks.append(
+        _make_check(
+            code="channel_bindings",
+            title="Vínculo de canal por empresa",
+            status="pass" if (channel_binding_count or 0) > 0 else "warn",
+            severity="warning",
+            detail=(
+                f"{channel_binding_count} vínculo(s) de canal ativo(s)."
+                if channel_binding_count is not None
+                else "Não foi possível consultar os vínculos de canal."
+            ),
+            recommendation="Cadastrar POST /admin/channel-bindings para cada número do provider antes de receber tráfego real."
+            if (channel_binding_count or 0) == 0
+            else None,
+        )
+    )
+
     retention_status = "pass" if settings.audit_retention_days > 0 else "fail"
     checks.append(
         _make_check(
@@ -550,6 +889,8 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+
+    checks.extend(_automation_checks(production_guard_enabled=production_guard_enabled))
 
     has_blockers = any(check["status"] == "fail" and check["severity"] == "blocker" for check in checks)
     has_warnings = any(check["status"] == "warn" for check in checks)

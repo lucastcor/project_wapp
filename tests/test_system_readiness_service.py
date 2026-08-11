@@ -1,5 +1,5 @@
-from app.services import system_readiness_service
 from app.core.config import settings
+from app.services import system_readiness_service
 
 
 def test_get_system_profile_exposes_runtime_and_target_database(monkeypatch) -> None:

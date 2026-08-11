@@ -755,7 +755,122 @@ Papeis atuais:
 - `operator`: acoes operacionais como responder pending questions, criar exemplos e fazer dispatch;
 - `superadmin`: configuracao estrutural, company context, empresas e cleanup administrativo.
 
+## Superficies da plataforma multiempresa
+
+Todas as rotas abaixo exigem `company_id` ou `company_slug` resolvido e
+respondem `400` quando a empresa nao existe. O catalogo completo e a semantica
+de cada fluxo estao em [multitenant_platform.md](multitenant_platform.md).
+
+| Grupo | Prefixo | Papel minimo de mutacao |
+| --- | --- | --- |
+| Taxonomia e pacotes de dominio | `/admin/taxonomy`, `/admin/vertical-packs` | leitura |
+| Vinculo de canal | `/admin/channel-bindings` | `superadmin` |
+| Configuracao da empresa | `/admin/company-config` | `superadmin` |
+| Knowledge | `/admin/knowledge/*` | `operator` (import legado: `superadmin`) |
+| Importacao de conversas | `/admin/conversation-import`, `/admin/training-candidates` | `operator` |
+| Dataset | `/admin/dataset-versions/*` | `operator` |
+| Avaliacao | `/admin/evaluation/*` | `operator` |
+| Modelos | `/admin/models/*` | `superadmin` |
+| Fine-tuning | `/admin/finetuning/*` | `operator` |
+
+### Contratos alterados
+
+- `POST /admin/finetuning/jobs` passa a exigir o corpo
+  `{"dataset_version_id": N, "require_evaluation": true}` e recusa a criacao
+  quando o readiness falha ou a versao nao esta congelada;
+- `PUT /admin/company-context` com empresa resolvida cria uma nova versao e
+  devolve a versao criada, em vez de sobrescrever o JSON;
+- `GET /platform/events` exige sessao autenticada e escopo de empresa;
+- `POST /webhooks/whatsapp` resolve o tenant pelo `phone_number_id` via
+  `company_channel_bindings` e bloqueia payload normalizado em producao.
+
 ## Observacoes de evolucao
 
 - O contrato administrativo ja suporta autenticacao, RBAC e auditoria basica.
 - Para ambientes maiores, vale evoluir para identidade centralizada e controles mais granulares por recurso.
+
+---
+
+## Automation Studio
+
+Todas as rotas são tenant-scoped e usam o escopo já autorizado por
+`require_company_scope`. Nenhum handler resolve empresa por conta própria.
+
+### Catálogo e fluxos
+
+| Método | Rota | Papel | Observação |
+|---|---|---|---|
+| `GET` | `/admin/automations/catalog` | `viewer` | fonte única de nós, campos e limites |
+| `GET` | `/admin/automations/workflows` | `viewer` | busca e `include_archived` |
+| `POST` | `/admin/automations/workflows` | `superadmin` | `workflow_key` único por empresa |
+| `GET` | `/admin/automations/workflows/{id}` | `viewer` | inclui rascunho, deployment e versão publicada |
+| `PATCH` | `/admin/automations/workflows/{id}` | `superadmin` | nome, descrição, arquivamento |
+
+### Rascunho, validação e simulação
+
+| Método | Rota | Papel | Observação |
+|---|---|---|---|
+| `PUT` | `/admin/automations/workflows/{id}/draft` | `superadmin` | exige `expected_revision`; **409** quando desatualizada |
+| `POST` | `/admin/automations/workflows/validate` | `viewer` | validação autoritativa; devolve todos os problemas |
+| `POST` | `/admin/automations/workflows/simulate` | `viewer` | percorre sem efeito; `produced_no_effects: true` |
+| `GET` | `/admin/automations/workflows/{id}/diff` | `viewer` | compara comportamento, ignora posição |
+
+`409` no rascunho devolve:
+
+```json
+{"detail": {"message": "...", "expected_revision": 3, "current_revision": 5}}
+```
+
+### Publicação e estado
+
+| Método | Rota | Papel | Observação |
+|---|---|---|---|
+| `POST` | `/admin/automations/workflows/{id}/publish` | `superadmin` | cria versão **pausada**; **422** com `issues` se inválido |
+| `GET` | `/admin/automations/workflows/{id}/versions` | `viewer` | histórico imutável |
+| `POST` | `/admin/automations/workflows/{id}/state` | `superadmin` | `{"state": "active" \| "paused"}` |
+| `POST` | `/admin/automations/workflows/{id}/trigger` | `operator` | exige `idempotency_key` |
+
+Publicar **nunca** ativa. São duas chamadas, de propósito.
+
+`422` na publicação devolve:
+
+```json
+{"detail": {"message": "...", "issues": [{"code": "...", "message": "...", "severity": "error", "node_id": "..."}]}}
+```
+
+### Execuções
+
+| Método | Rota | Papel | Observação |
+|---|---|---|---|
+| `GET` | `/admin/automations/executions` | `viewer` | contexto redigido |
+| `GET` | `/admin/automations/executions/{id}` | `viewer` | passos, jobs e efeitos |
+| `POST` | `/admin/automations/executions/{id}/retry` | `operator` | efeito concluído não repete |
+| `POST` | `/admin/automations/executions/{id}/cancel` | `operator` | cooperativo |
+| `GET` | `/admin/automations/dead-letter` | `viewer` | fila consultável |
+
+### Aprovações
+
+| Método | Rota | Papel | Observação |
+|---|---|---|---|
+| `GET` | `/admin/automations/approvals` | `viewer` | fila da empresa |
+| `POST` | `/admin/automations/approvals/{id}/claim` | `operator` | atômico; **409** se já reservado |
+| `POST` | `/admin/automations/approvals/{id}/decide` | `operator` | idempotente; auditado com o principal real |
+
+### Plataforma
+
+| Método | Rota | Papel | Observação |
+|---|---|---|---|
+| `POST` | `/admin/automations/worker/run-once` | superadmin **global** | operação de plataforma |
+| `GET` | `/admin/access/scope` | qualquer | escopo resolvido para a credencial |
+
+## Endurecimento de autorização
+
+- **Deny-by-default por política declarada.** `app/api/company_scope.py`
+  declara `unscoped`, `platform_global` ou `tenant` para cada grupo de rotas.
+  `tests/test_phase_zero_blockers.py` enumera as rotas mutáveis e exige
+  declaração explícita.
+- **Administração de identidade exige superadmin global.**
+  `/admin/principals/*` recusa um superadmin de tenant.
+- **Sessão morre com a credencial.** O cookie carrega `token_id` e
+  `auth_epoch`; revogar o token, desativar o principal ou mover a época
+  responde **401**, nunca rebaixa para principal legado.

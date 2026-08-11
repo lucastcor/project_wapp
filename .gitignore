@@ -30,3 +30,8 @@ backups/
 !.env.example
 __pycache__/
 *.pyc
+
+# Automation Studio: bundle gerado por `npm run build`.
+# Fica fora do versionamento — a imagem Docker o constrói.
+/app/platform/automations/
+/frontend/automation-studio/node_modules/

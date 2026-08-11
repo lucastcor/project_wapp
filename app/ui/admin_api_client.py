@@ -499,8 +499,28 @@ class AdminApiClient:
             params["company_id"] = company_id
         return self._request("GET", "/admin/finetuning/jobs", params=params)
 
-    def create_finetuning_job(self, company_id: int) -> dict[str, Any]:
-        return self._request("POST", "/admin/finetuning/jobs", params={"company_id": company_id})
+    def get_dataset_versions(self, company_id: int) -> list[dict[str, Any]]:
+        return self._request("GET", "/admin/dataset-versions", params={"company_id": company_id})
+
+    def create_finetuning_job(
+        self,
+        company_id: int,
+        dataset_version_id: int,
+        require_evaluation: bool = True,
+    ) -> dict[str, Any]:
+        """Cria o job a partir de uma dataset_version congelada.
+
+        O backend bloqueia a criação quando o readiness falha.
+        """
+        return self._request(
+            "POST",
+            "/admin/finetuning/jobs",
+            params={"company_id": company_id},
+            json_body={
+                "dataset_version_id": dataset_version_id,
+                "require_evaluation": require_evaluation,
+            },
+        )
 
     def get_finetuning_train_jsonl(
         self,

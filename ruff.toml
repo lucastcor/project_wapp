@@ -1,0 +1,131 @@
+# Configuração de lint do Project WAPP.
+#
+# Antes deste arquivo não havia configuração nenhuma. O CI rodava
+# `ruff check app tests --select F821,F822,F823,E9` — quatro regras, todas de
+# erro fatal de sintaxe ou nome indefinido. Isso não é um gate de lint; é um
+# compilador. Com a seleção padrão do Ruff, o mesmo código acusava 260 achados,
+# incluindo 58 diretivas `noqa` que já não suprimiam nada e continuavam ali
+# dando a impressão de que algo tinha sido analisado e dispensado.
+#
+# A seleção abaixo é explícita e versionada. Cada família está aqui porque
+# pega uma classe de defeito real neste repositório, não por completude.
+# Não há `ignore` global: uma regra ou é aplicada em todo lugar, ou não é
+# selecionada — e a decisão de não selecionar fica escrita, não escondida.
+
+target-version = "py313"
+line-length = 120
+
+[lint]
+select = [
+    "F",      # pyflakes: nome indefinido, import morto, f-string sem placeholder
+    "E",      # pycodestyle (erros)
+    "W",      # pycodestyle (avisos): espaço em branco à direita, fim de arquivo
+    "I",      # isort: ordem de import estável evita conflito de merge inútil
+    "UP",     # pyupgrade: sintaxe obsoleta para a versão-alvo
+    "B",      # bugbear: default mutável, comparação suspeita, laço com closure
+    "C4",     # comprehensions desnecessárias
+    "DTZ",    # datetime ingênuo — o produto agenda horário em fuso do cliente
+    "ISC",    # concatenação implícita de string, quase sempre vírgula esquecida
+    "PIE",    # simplificações que escondem intenção
+    "PERF",   # laços que deveriam ser comprehension
+    "PLC",    # pylint (convenção)
+    "PLE",    # pylint (erro)
+    "PT",     # estilo pytest: assert nu, fixture mal declarada
+    "RET",    # return redundante/inconsistente
+    "RSE",    # raise com parênteses supérfluos
+    "RUF",    # regras do próprio Ruff — inclui RUF100, `noqa` que não suprime nada
+    "S",      # bandit via ruff: a mesma superfície do SAST, no editor
+    "SIM",    # simplificações verificáveis
+    "T20",    # print() esquecido em código de produção
+    "TID",    # import relativo fora do padrão do projeto
+    "TRY004", # TypeError onde o certo é outra exceção
+]
+
+# Três códigos ficam fora, cada um com o motivo escrito. Isto não é
+# blanket-ignore: são códigos nomeados, não famílias, e a razão está aqui onde
+# dá para discutir — em vez de espalhada em dezenas de `# noqa` que ninguém
+# revisita.
+ignore = ["S608", "PLC0415", "BLE001", "E501", "B008", "RUF001", "RUF002", "PERF401"]
+#
+#   S608  SQL montado por f-string. O Ruff, como o Bandit, não distingue nome de
+#         coluna de valor. A garantia equivalente — e mais forte — é
+#         `tests/test_sql_interpolation_guard.py`, que prova a origem de cada
+#         interpolação e falha se surgir uma nova. Ligar S608 aqui trocaria uma
+#         prova por 95 supressões.
+#   PERF401  laço que "deveria" ser comprehension. São 9 laços com condição no
+#         meio, em serviço de domínio. A reescrita não corrige defeito nenhum e
+#         mexe em fluxo de dados durante uma onda de segurança — troca ruim.
+#   B008  chamada em default de parâmetro. É a assinatura do FastAPI:
+#         `Depends(...)`, `Query(...)` e `Body(...)` são avaliados na definição
+#         de propósito. A regra foi escrita para `def f(x=[])`, não para isto,
+#         e ligá-la aqui marcaria a fronteira de autorização inteira.
+#   RUF001/RUF002  caracteres "ambíguos" em string e docstring. O produto é
+#         escrito em português: travessão, aspas tipográficas e espaço estreito
+#         são texto correto, não homoglifo de ataque.
+#   PLC0415  import fora do topo. O projeto usa import tardio de propósito, para
+#         quebrar ciclo entre serviço e repositório e para não pagar import de
+#         provider externo em processo que não o usa.
+#   E501  comprimento de linha. É a única regra da lista que pertence a um
+#         formatador, não a um linter. O projeto ainda não adotou `ruff format`;
+#         adotá-lo dentro desta onda reformataria 92 linhas em arquivos que o
+#         usuário está editando agora, e trocaria risco de merge por zero
+#         defeito corrigido. `line-length` continua declarado abaixo para quando
+#         o formatador entrar. Registrado como pendência, não como regra morta.
+#   BLE001  `except Exception` nu. São 52 ocorrências, a maioria em fronteira de
+#         processo (worker, provider, broadcast) onde capturar amplo e
+#         **registrar** é a decisão certa. Selecioná-la nesta rodada forçaria ou
+#         52 supressões ou 52 mudanças de comportamento dentro de uma onda de
+#         segurança. Está no closure-plan como revisão caso a caso.
+#
+# `E501` em `tests/**` e as regras de estilo do pytest ficam em
+# `per-file-ignores` abaixo, pelo mesmo critério.
+
+
+[lint.per-file-ignores]
+# Testes exercem caminhos que o lint de produção proíbe por bons motivos.
+"tests/**/*.py" = [
+    "S101",   # `assert` é o vocabulário do pytest
+    "E501",   # docstrings de cenário descrevem o ataque; quebrá-las piora
+    "PT001",  # `@pytest.fixture` sem parênteses convive com a forma com
+    "PT006",  # nomes de parâmetro em tupla vs string: as duas formas em uso
+    "PT015",  # `assert False` explícito em prova de inalcançabilidade
+    "PT017",  # asserção sobre exceção capturada em bloco `except`
+    "PT019",  # fixture sem valor passada por nome
+    "PT022",  # `yield` final em fixture de escopo curto
+    "B011",   # `assert False` idem
+    "S105",   # tokens de teste são literais de propósito
+    "S106",
+    "S107",   # `pass_rate_reply` é texto de resposta aprovada; o gatilho é "pass"
+    "PT018",  # asserção composta com mensagem única explica melhor que duas soltas
+    "RUF012", # atributo de classe em dublê de teste, escopo de uma função
+    "TRY004", # `AssertionError` é o tipo certo para invariante de teste violada
+    "PT012",  # `raises` precisa envolver o `with transaction()` inteiro: o que se
+              # mede é a saída do gerenciador DURANTE a exceção
+    "SIM117", # aninhar `raises` e `transaction` explicita qual dos dois falha
+    "S311",   # random não-criptográfico serve para gerar dado de teste
+    "DTZ001", # datetime ingênuo é usado para provar que o produto o rejeita
+    "DTZ005",
+    "DTZ007",
+]
+# Exports de conversa (WhatsApp) não carregam fuso. Produzir timestamp ingênuo
+# é a leitura correta do arquivo; anexar um fuso arbitrário **inventaria** dado
+# que o cliente não forneceu. O contrato de ausência/inválido está em
+# `tests/test_conversation_parsers.py`.
+"app/services/conversation_parsers.py" = ["DTZ007"]
+# Páginas Streamlit: `date.today()` num seletor de data é a data local de quem
+# está olhando a tela, que é justamente o que o componente pede.
+"app/ui/pages/*.py" = ["DTZ005", "DTZ011"]
+# `repository.py` monta fragmentos de SQL por backend em if/else explícito.
+# `tests/test_sql_interpolation_guard.py` registra a **origem sintática** de
+# cada fragmento; o ternário que o SIM108 propõe muda essa origem e derruba o
+# guarda — que foi exatamente o que aconteceu quando o lint reescreveu a linha.
+"app/storage/repository.py" = ["SIM108"]
+# O worker roda como processo isolado e imprime diagnóstico de inicialização
+# antes de o logger existir.
+"app/tools/*.py" = ["T201"]
+
+[lint.isort]
+known-first-party = ["app", "tests"]
+
+[lint.flake8-tidy-imports]
+ban-relative-imports = "all"

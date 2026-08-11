@@ -459,7 +459,7 @@ def test_check_limit_cancelled_still_in_period(monkeypatch):
 
 
 def test_all_plans_have_required_fields():
-    for key, plan in PLANS.items():
+    for plan in PLANS.values():
         assert "name" in plan
         assert "price_monthly_cents" in plan
         assert "price_annual_monthly_cents" in plan

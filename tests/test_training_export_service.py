@@ -74,7 +74,7 @@ class FakeRepository:
 def test_get_curated_training_examples_filters_and_deduplicates(monkeypatch) -> None:
     monkeypatch.setattr(training_export_service, "repository", FakeRepository())
 
-    curated_examples = training_export_service.get_curated_training_examples()
+    curated_examples = training_export_service.get_curated_training_examples(company_id=1)
 
     assert len(curated_examples) == 2
     scenario_types = {example["scenario_type"] for example in curated_examples}
@@ -91,7 +91,7 @@ def test_get_curated_training_examples_filters_and_deduplicates(monkeypatch) -> 
 def test_get_exportable_training_records_returns_preview_records(monkeypatch) -> None:
     monkeypatch.setattr(training_export_service, "repository", FakeRepository())
 
-    records = training_export_service.get_exportable_training_records()
+    records = training_export_service.get_exportable_training_records(company_id=1)
 
     assert len(records) == 2
     first_record = records[0]
@@ -106,7 +106,7 @@ def test_get_exportable_training_records_returns_preview_records(monkeypatch) ->
 def test_get_finetuning_split_records_returns_train_and_validation(monkeypatch) -> None:
     monkeypatch.setattr(training_export_service, "repository", FakeRepository())
 
-    split_records = training_export_service.get_finetuning_split_records(validation_ratio=0.5, seed=123)
+    split_records = training_export_service.get_finetuning_split_records(validation_ratio=0.5, seed=123, company_id=1)
 
     assert "train" in split_records
     assert "validation" in split_records
@@ -122,7 +122,7 @@ def test_get_finetuning_split_records_returns_train_and_validation(monkeypatch) 
 def test_export_finetuning_train_jsonl_returns_valid_jsonl(monkeypatch) -> None:
     monkeypatch.setattr(training_export_service, "repository", FakeRepository())
 
-    jsonl_output = training_export_service.export_finetuning_train_jsonl(validation_ratio=0.5, seed=123)
+    jsonl_output = training_export_service.export_finetuning_train_jsonl(validation_ratio=0.5, seed=123, company_id=1)
 
     lines = [line for line in jsonl_output.splitlines() if line.strip()]
     assert len(lines) == 1

@@ -1,3 +1,4 @@
+import logging
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -5,16 +6,18 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
+from app.core.logging import get_logger, log_event
 from app.llm.providers.openai_provider import OpenAIProvider
 from app.services.appointment_queue_service import process_queue_contact_message, release_booking_slot
 from app.services.calendar_service import (
     create_calendar_booking,
     query_calendar_availability,
-    resolve_scheduling_profile,
     reschedule_calendar_booking,
+    resolve_scheduling_profile,
 )
 from app.storage.repository import RuntimeRepository
 
+logger = get_logger(__name__)
 
 repository = RuntimeRepository()
 CONFIRMATION_TERMS = {
@@ -365,7 +368,7 @@ def _looks_like_operator_scheduling_message(message: str) -> bool:
 
     has_operator_verb = any(
         re.search(rf"\b{verb}\b", normalized)
-        for verb in {"marca", "marcar", "marque", "agenda", "agendar", "agende", "encaixa", "encaixar", "encaixe"}
+        for verb in ("marca", "marcar", "marque", "agenda", "agendar", "agende", "encaixa", "encaixar", "encaixe")
     )
     if not has_operator_verb:
         return False
@@ -436,11 +439,11 @@ def _select_booking_from_message(
 
 def _fallback_booking_change_intent(message: str) -> dict[str, Any]:
     normalized = _normalize_text(message)
-    if any(term in normalized for term in {"remarcar", "reagendar", "mudar meu horário", "mudar meu horario", "trocar meu horário", "trocar meu horario"}):
+    if any(term in normalized for term in ("remarcar", "reagendar", "mudar meu horário", "mudar meu horario", "trocar meu horário", "trocar meu horario")):
         intent = "reschedule_booking"
-    elif any(term in normalized for term in {"cancelar", "desmarcar", "não vou conseguir", "nao vou conseguir"}):
+    elif any(term in normalized for term in ("cancelar", "desmarcar", "não vou conseguir", "nao vou conseguir")):
         intent = "cancel_booking"
-    elif any(term in normalized for term in {"manter", "deixa como está", "deixa como esta"}):
+    elif any(term in normalized for term in ("manter", "deixa como está", "deixa como esta")):
         intent = "keep_booking"
     else:
         intent = "unclear"
@@ -468,8 +471,13 @@ def _interpret_booking_change_intent(
             )
             if str(result.get("intent") or "").strip().lower() in BOOKING_CHANGE_INTENTS:
                 return result
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "conversation.booking_change_intent.provider_failed",
+                error_type=type(exc).__name__,
+            )
     return _fallback_booking_change_intent(message)
 
 
@@ -495,8 +503,13 @@ def _extract_operator_booking_command(message: str) -> dict[str, Any]:
             result = provider.extract_operator_booking_command(operator_message=message)
             if str(result.get("intent") or "").strip().lower() in {"schedule_for_customer", "unclear"}:
                 return result
-        except Exception:
-            pass
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "conversation.operator_booking_command.provider_failed",
+                error_type=type(exc).__name__,
+            )
     return _fallback_operator_booking_command(message)
 
 
@@ -579,12 +592,11 @@ def _find_contact_matches(
     company_id: int | None,
     customer_reference: str,
 ) -> list[dict[str, Any]]:
-    matches = repository.search_contacts(
+    return repository.search_contacts(
         query=customer_reference,
         company_id=company_id,
         limit=10,
     )
-    return matches
 
 
 def _booking_change_result_metadata(booking: dict[str, Any]) -> dict[str, Any]:

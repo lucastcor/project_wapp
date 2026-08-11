@@ -4,9 +4,9 @@ import hmac
 from fastapi.testclient import TestClient
 
 from app import main as main_module
-from app.main import app
 from app.api import routes
 from app.core.config import settings
+from app.main import app
 from app.services.rate_limit_service import reset_rate_limit_state
 
 client = TestClient(app)
@@ -92,10 +92,17 @@ def test_platform_session_cookie_can_access_admin_routes(monkeypatch) -> None:
         )
         assert login_response.status_code == 200
 
-        summary_response = local_client.get("/admin/observability/summary")
+        # A rota-sonda é catálogo estático de propósito. O que este teste prova
+        # é que o cookie de sessão autentica; usar `/admin/observability/summary`
+        # amarrava a prova de autenticação à política daquela rota, e quando o
+        # T-07 a moveu para `platform_global` o teste quebrou por um motivo que
+        # não tem nada a ver com sessão.
+        taxonomy_response = local_client.get("/admin/taxonomy")
+        assert taxonomy_response.status_code == 200
 
-        assert summary_response.status_code == 200
-        assert summary_response.json()["totals"]["messages"] == 1
+        # E o mesmo cookie de viewer não alcança postura da plataforma.
+        summary_response = local_client.get("/admin/observability/summary")
+        assert summary_response.status_code == 403
 
 
 def test_readiness_check() -> None:
@@ -135,7 +142,8 @@ def test_readiness_check_returns_503_when_runtime_is_blocked(monkeypatch) -> Non
     assert response.json()["blockers"] == ["postgres_target"]
 
 
-def test_incoming_message(monkeypatch) -> None:
+def test_incoming_message(monkeypatch, tenant_credential_factory) -> None:
+    credential = tenant_credential_factory()
     monkeypatch.setattr(routes, "process_incoming_message", lambda **kwargs: {
         "contact_id": kwargs["contact_id"],
         "classification": "lead_novo",
@@ -159,7 +167,11 @@ def test_incoming_message(monkeypatch) -> None:
         "contact_name": "Cliente Teste",
         "message": "oi",
     }
-    response = client.post("/messages/incoming", json=payload)
+    response = client.post(
+        "/messages/incoming",
+        json=payload,
+        headers={"X-Tenant-Token": credential["token"]},
+    )
 
     assert response.status_code == 200
     data = response.json()
@@ -179,7 +191,8 @@ def test_incoming_message_empty_after_trim() -> None:
     assert response.status_code == 400
 
 
-def test_incoming_message_rate_limited(monkeypatch) -> None:
+def test_incoming_message_rate_limited(monkeypatch, tenant_credential_factory) -> None:
+    credential = tenant_credential_factory()
     reset_rate_limit_state()
     monkeypatch.setattr(settings, "enable_rate_limiting", True)
     monkeypatch.setattr(settings, "rate_limit_window_seconds", 60)
@@ -208,7 +221,10 @@ def test_incoming_message_rate_limited(monkeypatch) -> None:
         "contact_name": "Cliente Teste",
         "message": "oi",
     }
-    headers = {"X-Forwarded-For": "198.51.100.10"}
+    headers = {
+        "X-Forwarded-For": "198.51.100.10",
+        "X-Tenant-Token": credential["token"],
+    }
     first_response = client.post("/messages/incoming", json=payload, headers=headers)
     second_response = client.post("/messages/incoming", json=payload, headers=headers)
 
@@ -289,7 +305,7 @@ def test_whatsapp_webhook(monkeypatch) -> None:
         {
             "provider": "whatsapp",
             "provider_message_id": "wamid.normalized.123",
-            "company_id": None,
+            "company_id": 1,
         }
     ]
     assert fake_repository.failed_receipts == []
@@ -347,8 +363,8 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
     })
 
     raw_payload = (
-        '{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
-    ).encode("utf-8")
+        b'{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
+    )
     signature = hmac.new(
         b"meta-app-secret",
         msg=raw_payload,
@@ -375,7 +391,7 @@ def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeyp
         {
             "provider": "whatsapp",
             "provider_message_id": "wamid.inbound.123",
-            "company_id": None,
+            "company_id": 1,
         }
     ]
 

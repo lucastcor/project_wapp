@@ -1,22 +1,26 @@
 import contextvars
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.config import settings
 
-
-_request_context: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+# O default é `None`, e não `{}`: um dicionário como default de ContextVar é
+# UM objeto compartilhado por todo o processo. Nenhum caminho de hoje o muta
+# in-place — todos fazem `.set(novo)` —, mas a primeira mutação que aparecer
+# vazaria contexto de log entre requisições de tenants diferentes, que é
+# exatamente o tipo de erro que não se descobre em teste.
+_request_context: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
     "request_context",
-    default={},
+    default=None,
 )
 
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),
@@ -89,7 +93,7 @@ def set_request_context(**kwargs: Any) -> None:
 
 
 def get_request_context() -> dict[str, Any]:
-    return dict(_request_context.get())
+    return dict(_request_context.get() or {})
 
 
 def clear_request_context() -> None:

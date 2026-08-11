@@ -1,11 +1,29 @@
+"""Importador legado de pares curados pergunta/resposta.
+
+Mantido para compatibilidade de `POST /admin/training-import`. O caminho
+governado para conversas brutas multi-turno é
+`POST /admin/conversation-import` (`conversation_import_service`).
+
+Diferenças em relação à versão anterior:
+- taxonomia normalizada pelos aliases canônicos;
+- PII anonimizada antes de qualquer escrita;
+- `used_for_training` nunca é ligado automaticamente: o exemplo entra como
+  `approval_status='pending'` e só vira dataset após revisão humana.
+"""
+
+from __future__ import annotations
+
 import csv
 import io
 import json
 from typing import Any
 
+from app.core.taxonomy import DEFAULT_PROFILE_NAME, normalize_with_fallback
+from app.core.tenancy import require_company_id
+from app.services.company_config_service import get_company_config
+from app.services.pii_service import POLICY_STANDARD, anonymize_text
 from app.services.training_export_service import is_example_eligible_for_training
 from app.storage.repository import RuntimeRepository
-
 
 repository = RuntimeRepository()
 
@@ -100,28 +118,57 @@ def _normalize_import_record(
     default_profile_name: str,
     default_scenario_type: str,
     default_quality_score: float,
-    auto_promote_eligible_examples: bool,
     active_default: bool,
+    pii_policy: str,
 ) -> dict[str, Any]:
-    customer_profile = _normalize_text(_extract_field(record, "customer_profile"))
-    profile_name = _normalize_text(_extract_field(record, "profile_name")) or customer_profile or default_profile_name
-    scenario_type = _normalize_text(_extract_field(record, "scenario_type")) or default_scenario_type
+    raw_customer_profile = _normalize_text(_extract_field(record, "customer_profile"))
+    customer_profile = None
+    profile_fallback_used = False
+    if raw_customer_profile:
+        customer_profile, profile_fallback_used = normalize_with_fallback(
+            "customer_profile", raw_customer_profile
+        )
+
+    profile_name, profile_name_fallback = normalize_with_fallback(
+        "profile_name",
+        _normalize_text(_extract_field(record, "profile_name")) or default_profile_name,
+    )
+    scenario_type, scenario_fallback = normalize_with_fallback(
+        "scenario_type",
+        _normalize_text(_extract_field(record, "scenario_type")) or default_scenario_type,
+    )
+
+    customer_message, customer_report = anonymize_text(
+        _extract_field(record, "customer_message"), policy=pii_policy
+    )
+    approved_reply, reply_report = anonymize_text(
+        _extract_field(record, "approved_reply"), policy=pii_policy
+    )
+
     normalized = {
         "contact_id": _normalize_text(_extract_field(record, "contact_id")),
         "contact_name": _normalize_text(_extract_field(record, "contact_name")),
         "customer_profile": customer_profile,
-        "profile_name": profile_name or "default",
-        "scenario_type": scenario_type or "general",
-        "customer_message": _normalize_text(_extract_field(record, "customer_message")),
-        "approved_reply": _normalize_text(_extract_field(record, "approved_reply")),
+        "profile_name": profile_name or DEFAULT_PROFILE_NAME,
+        "scenario_type": scenario_type,
+        "customer_message": customer_message.strip() or None,
+        "approved_reply": approved_reply.strip() or None,
         "style_notes": _normalize_text(_extract_field(record, "style_notes")),
         "quality_score": _parse_float(_extract_field(record, "quality_score"), default_quality_score),
         "used_for_training": _parse_bool(_extract_field(record, "used_for_training"), False),
         "active": _parse_bool(record.get("active"), active_default),
+        "pii_replacements": (customer_report.counts + reply_report.counts).total(),
+        "taxonomy_fallbacks": [
+            name
+            for name, used in (
+                ("customer_profile", profile_fallback_used),
+                ("profile_name", profile_name_fallback),
+                ("scenario_type", scenario_fallback),
+            )
+            if used
+        ],
     }
     normalized["eligible_for_training"] = is_example_eligible_for_training(normalized)
-    if auto_promote_eligible_examples and normalized["eligible_for_training"]:
-        normalized["used_for_training"] = True
     return normalized
 
 
@@ -141,6 +188,10 @@ def import_training_records(
     default_quality_score: float = 7.0,
     active_default: bool = True,
 ) -> dict[str, Any]:
+    resolved_company_id = require_company_id(company_id, context="training import")
+    company_config = get_company_config(resolved_company_id)
+    pii_policy = str(company_config.policy("pii_policy", POLICY_STANDARD))
+
     parsed_records = _parse_records(
         fmt=fmt,
         raw_text=raw_text,
@@ -156,8 +207,8 @@ def import_training_records(
             default_profile_name=default_profile_name,
             default_scenario_type=default_scenario_type,
             default_quality_score=default_quality_score,
-            auto_promote_eligible_examples=auto_promote_eligible_examples,
             active_default=active_default,
+            pii_policy=pii_policy,
         )
         for record in parsed_records
     ]
@@ -166,12 +217,16 @@ def import_training_records(
     examples_created = 0
     eligible_examples = 0
     skipped_examples = 0
+    pii_replacements = 0
+    taxonomy_fallbacks = 0
     errors: list[dict[str, Any]] = []
     preview: list[dict[str, Any]] = []
 
     for index, record in enumerate(normalized_records, start=1):
         if record["eligible_for_training"]:
             eligible_examples += 1
+        pii_replacements += int(record["pii_replacements"])
+        taxonomy_fallbacks += len(record["taxonomy_fallbacks"])
 
         if len(preview) < 20:
             preview.append(
@@ -183,7 +238,11 @@ def import_training_records(
                     "profile_name": record.get("profile_name"),
                     "scenario_type": record.get("scenario_type"),
                     "eligible_for_training": record.get("eligible_for_training"),
+                    # Continua refletindo apenas o pedido do arquivo; a
+                    # liberação real depende de revisão humana.
                     "used_for_training": record.get("used_for_training"),
+                    "pii_replacements": record.get("pii_replacements"),
+                    "taxonomy_fallbacks": record.get("taxonomy_fallbacks"),
                 }
             )
 
@@ -192,7 +251,7 @@ def import_training_records(
                 repository.save_contact(
                     contact_id=str(record["contact_id"]),
                     contact_name=record.get("contact_name"),
-                    company_id=company_id,
+                    company_id=resolved_company_id,
                     customer_profile=record.get("customer_profile"),
                 )
             contact_updates += 1
@@ -212,26 +271,37 @@ def import_training_records(
 
         if not dry_run:
             repository.create_message_example(
-                company_id=company_id,
+                company_id=resolved_company_id,
                 profile_name=str(record["profile_name"]),
                 scenario_type=str(record["scenario_type"]),
+                customer_profile=record.get("customer_profile"),
                 customer_message=str(record["customer_message"]),
                 approved_reply=str(record["approved_reply"]),
                 style_notes=record.get("style_notes"),
                 quality_score=float(record["quality_score"]),
-                used_for_training=bool(record["used_for_training"]),
+                # Conteúdo importado entra pendente de revisão. Nada vira
+                # dataset de treino sem aprovação humana explícita.
+                used_for_training=False,
+                approval_status="pending",
+                source_type="training_import",
+                pii_scrubbed=True,
                 active=bool(record["active"]),
             )
         examples_created += 1
 
     return {
         "dry_run": dry_run,
-        "company_id": company_id,
+        "company_id": resolved_company_id,
         "parsed_records": len(parsed_records),
         "contacts_to_update": contact_updates,
         "message_examples_to_create": examples_created,
         "eligible_examples": eligible_examples,
         "skipped_examples": skipped_examples,
+        "pii_replacements": pii_replacements,
+        "taxonomy_fallbacks": taxonomy_fallbacks,
+        "pii_policy": pii_policy,
+        "auto_promotion_disabled": True,
+        "review_required": True,
         "errors": errors[:50],
         "preview": preview,
     }

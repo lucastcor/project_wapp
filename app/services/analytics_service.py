@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from app.core.exceptions import TenantResourceNotFoundError
 from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
@@ -46,7 +47,7 @@ def record_booking_outcome(
 
     booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
-        raise AnalyticsError(f"Booking {booking_id} not found.")
+        raise TenantResourceNotFoundError(f"Booking {booking_id} not found.")
 
     booking_company_id = booking.get("company_id")
     repository.update_appointment_booking_outcome(
@@ -68,7 +69,7 @@ def record_cancellation_reason(
 ) -> dict[str, Any]:
     booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
-        raise AnalyticsError(f"Booking {booking_id} not found.")
+        raise TenantResourceNotFoundError(f"Booking {booking_id} not found.")
 
     booking_company_id = booking.get("company_id")
     repository.update_appointment_booking_cancellation_reason(

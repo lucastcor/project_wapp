@@ -182,7 +182,7 @@ class FakeConversationEngine:
                 "pipeline_stage": "encerrado",
                 "next_action": "Encaminhar para atendimento humano adequado.",
                 "lead_temperature": "cold",
-            } 
+            }
 
         if any(
             term in combined
@@ -269,11 +269,12 @@ EXPECTED_AUTO_REPLY = {
 }
 
 
-def test_business_conversation_scenarios(monkeypatch) -> None:
+def test_business_conversation_scenarios(monkeypatch, stub_company_config) -> None:
     fake_repository = FakeRepository()
     fake_engine = FakeConversationEngine()
 
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    stub_company_config(orchestrator, company_id=1, company_slug="default", company_name="Default Company")
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",

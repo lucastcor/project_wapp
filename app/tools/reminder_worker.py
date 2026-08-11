@@ -1,14 +1,13 @@
+import argparse
 import logging
 import time
-import argparse
 
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger, log_event
-from app.services.runtime_guard_service import validate_runtime_environment
 from app.services.appointment_queue_service import process_due_queue_offers
 from app.services.reminder_service import dispatch_due_reminders
+from app.services.runtime_guard_service import validate_runtime_environment
 from app.storage.db import init_db
-
 
 configure_logging()
 logger = get_logger(__name__)

@@ -1,0 +1,105 @@
+# Módulos cobertos por mypy e Bandit no CI.
+#
+# Esta é a fonte única: o workflow lê este arquivo em vez de repetir a lista,
+# e `tests/test_checked_modules.py` prova que nenhum módulo das superfícies
+# sensíveis (identidade, tenancy, automações, storage novo) ficou de fora.
+#
+# Linhas em branco e comentários são ignorados.
+
+# --- entrada da aplicação ---
+# `app/main.py` e `app/api/admin_routes.py` ficaram fora do gate por muito
+# tempo — e foi justamente em `admin_routes.py` que viveu o vazamento
+# cross-tenant. Um módulo fora do mypy/Bandit é um módulo onde o gate não
+# fala nada, por mais crítico que ele seja.
+app/main.py
+
+# --- API e autorização ---
+app/api/admin_routes.py
+app/api/admin_security.py
+app/api/admin_support.py
+app/api/automation_routes.py
+app/api/automation_schemas.py
+app/api/company_scope.py
+app/api/platform_admin_routes.py
+app/api/platform_routes.py
+app/api/platform_schemas.py
+app/api/routes.py
+app/api/schemas.py
+
+# --- domínio de automações (puro) ---
+app/automations/__init__.py
+app/automations/catalog.py
+app/automations/domain.py
+app/automations/effects.py
+app/automations/engine.py
+app/automations/events.py
+app/automations/exceptions.py
+app/automations/semantics.py
+app/automations/simulation.py
+app/automations/validation.py
+
+# --- núcleo ---
+app/core/credentials.py
+app/core/exceptions.py
+app/core/reply_contract.py
+app/core/taxonomy.py
+app/core/tenancy.py
+app/core/vertical_packs.py
+
+# --- LLM ---
+app/llm/embeddings.py
+
+# --- serviços ---
+app/services/admin_principal_service.py
+app/services/analytics_service.py
+app/services/appointment_queue_service.py
+app/services/automation_approval_service.py
+app/services/automation_event_service.py
+app/services/automation_execution_service.py
+app/services/automation_trigger_service.py
+app/services/automation_workflow_service.py
+app/services/calendar_service.py
+app/services/company_config_service.py
+app/services/conversation_import_service.py
+app/services/conversation_parsers.py
+app/services/dataset_service.py
+app/services/evaluation_executor.py
+app/services/evaluation_service.py
+app/services/finetuning_readiness_service.py
+app/services/finetuning_service.py
+app/services/knowledge_document_service.py
+app/services/knowledge_retrieval_service.py
+app/services/model_registry_service.py
+app/services/pii_service.py
+app/services/rate_limit_service.py
+app/services/shared_state.py
+app/services/system_readiness_service.py
+app/services/tenant_credential_service.py
+app/services/tenant_resolution_service.py
+
+# --- persistência ---
+app/storage/automation_repository.py
+app/storage/channel_repository.py
+app/storage/db.py
+app/storage/company_config_repository.py
+app/storage/dataset_repository.py
+app/storage/evaluation_repository.py
+app/storage/identity_repository.py
+app/storage/import_repository.py
+app/storage/knowledge_repository.py
+app/storage/memory_store.py
+app/storage/migrations_automation.py
+app/storage/migrations_hardening.py
+app/storage/migrations_identity.py
+app/storage/migrations_platform.py
+app/storage/model_repository.py
+app/storage/repository.py
+app/storage/schema_utils.py
+app/storage/sql_support.py
+
+# --- ferramentas ---
+app/tools/automation_worker.py
+app/tools/cleanup_operational_data.py
+app/tools/export_runtime_backup.py
+app/tools/preflight_check.py
+app/tools/reminder_worker.py

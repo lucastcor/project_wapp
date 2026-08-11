@@ -7,11 +7,13 @@ from openai import APIError, OpenAI
 
 from app.core.config import settings
 from app.core.logging import get_logger, log_event
+from app.core.tenancy import require_company_id
+from app.services.dataset_service import DatasetError, get_dataset_version
+from app.services.finetuning_readiness_service import evaluate_pretraining_readiness
+from app.services.model_registry_service import register_candidate_model, sync_model_from_job
+from app.services.training_export_service import export_dataset_version_jsonl
+from app.storage import dataset_repository
 from app.storage.repository import RuntimeRepository
-from app.services.training_export_service import (
-    export_finetuning_train_jsonl,
-    export_finetuning_validation_jsonl,
-)
 
 
 class FineTuningError(Exception):
@@ -92,27 +94,100 @@ class FineTuningService:
         }
 
     def _require_company_id(self, company_id: int | None) -> int:
-        if company_id is None or int(company_id) <= 0:
-            raise FineTuningError("company_id must be provided for fine-tuning operations.")
-        return int(company_id)
+        try:
+            return require_company_id(company_id, context="fine-tuning operations")
+        except Exception as exc:
+            raise FineTuningError("company_id must be provided for fine-tuning operations.") from exc
 
-    def create_finetuning_job(self, *, company_id: int | None) -> dict[str, Any]:
+    def preflight_finetuning_job(
+        self,
+        *,
+        company_id: int | None,
+        dataset_version_id: int,
+        require_evaluation: bool = True,
+    ) -> dict[str, Any]:
+        """Readiness de pré-treino. Nenhum arquivo é enviado aqui.
+
+        `require_evaluation` é aceito por compatibilidade e ignorado: avaliar o
+        modelo treinado pertence ao portão de promoção.
+        """
+        resolved_company_id = self._require_company_id(company_id)
+        return evaluate_pretraining_readiness(
+            company_id=resolved_company_id,
+            dataset_version_id=dataset_version_id,
+        )
+
+    def create_finetuning_job(
+        self,
+        *,
+        company_id: int | None,
+        dataset_version_id: int,
+        require_evaluation: bool = True,
+        requested_by: str | None = None,
+    ) -> dict[str, Any]:
+        """Cria o job a partir de uma dataset_version congelada.
+
+        O readiness bloqueia: com qualquer falha bloqueante, nenhum arquivo é
+        enviado e nenhum job é criado.
+        """
         if not settings.enable_finetuning_pipeline:
             raise FineTuningError(
                 "Fine-tuning pipeline is disabled. Set ENABLE_FINETUNING_PIPELINE=true to enable it."
             )
 
         resolved_company_id = self._require_company_id(company_id)
+
+        try:
+            version = get_dataset_version(
+                company_id=resolved_company_id,
+                dataset_version_id=dataset_version_id,
+            )
+        except DatasetError as exc:
+            raise FineTuningError(str(exc)) from exc
+
+        if version["status"] != dataset_repository.STATUS_FROZEN:
+            raise FineTuningError(
+                f"Dataset version {dataset_version_id} must be frozen before creating a job; "
+                f"current status is '{version['status']}'."
+            )
+
+        readiness = evaluate_pretraining_readiness(
+            company_id=resolved_company_id,
+            dataset_version_id=dataset_version_id,
+        )
+        if not readiness["is_ready"]:
+            log_event(
+                logger,
+                logging.WARNING,
+                "finetuning.job.creation.blocked",
+                company_id=resolved_company_id,
+                dataset_version_id=dataset_version_id,
+                blocking_failures=readiness["blocking_failures"],
+            )
+            raise FineTuningError(
+                "Fine-tuning readiness failed. Blocking checks: "
+                + ", ".join(readiness["blocking_failures"])
+            )
+
         log_event(
             logger,
             logging.INFO,
             "finetuning.job.creation.started",
             company_id=resolved_company_id,
+            dataset_version_id=dataset_version_id,
             base_model=self.base_model,
             suffix=self.suffix,
         )
-        train_jsonl = export_finetuning_train_jsonl(company_id=resolved_company_id)
-        validation_jsonl = export_finetuning_validation_jsonl(company_id=resolved_company_id)
+        train_jsonl = export_dataset_version_jsonl(
+            company_id=resolved_company_id,
+            dataset_version_id=dataset_version_id,
+            split=dataset_repository.SPLIT_TRAIN,
+        )
+        validation_jsonl = export_dataset_version_jsonl(
+            company_id=resolved_company_id,
+            dataset_version_id=dataset_version_id,
+            split=dataset_repository.SPLIT_VALIDATION,
+        )
 
         training_file_id = self._upload_jsonl_content(
             content=train_jsonl,
@@ -145,6 +220,18 @@ class FineTuningService:
                     suffix=self.suffix,
                     training_file_id=training_file_id,
                     validation_file_id=validation_file_id,
+                    dataset_version_id=dataset_version_id,
+                    readiness=readiness,
+                    requested_by=requested_by,
+                )
+                register_candidate_model(
+                    company_id=resolved_company_id,
+                    model_ref=f"pending:{job.id}",
+                    base_model=self.base_model,
+                    dataset_version_id=dataset_version_id,
+                    finetuning_job_id=job.id,
+                    notes="Registered on job creation; model_ref is replaced when training completes.",
+                    created_by=requested_by,
                 )
                 log_event(
                     logger,
@@ -160,6 +247,8 @@ class FineTuningService:
                     "status": job.status,
                     "base_model": self.base_model,
                     "suffix": self.suffix,
+                    "dataset_version_id": dataset_version_id,
+                    "readiness": readiness,
                     "training_file_id": training_file_id,
                     "validation_file_id": validation_file_id,
                     "training_file_info": training_file_info,
@@ -264,6 +353,17 @@ class FineTuningService:
                 provider_error_code=provider_error_code,
                 provider_error_message=provider_error_message,
                 finished_at=finished_at_str,
+            )
+
+        if resolved_company_id is not None:
+            # O desfecho do job precisa refletir no candidato de modelo: sucesso
+            # troca o placeholder pelo modelo real, falha aposenta o candidato.
+            sync_model_from_job(
+                company_id=resolved_company_id,
+                finetuning_job_id=job.id,
+                job_status=str(job.status),
+                fine_tuned_model=getattr(job, "fine_tuned_model", None),
+                failure_reason=provider_error_message,
             )
 
         serialized_error = None

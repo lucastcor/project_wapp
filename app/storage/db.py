@@ -1,6 +1,13 @@
+import logging
+import re
 import sqlite3
+import threading
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from app.core.config import settings
@@ -97,6 +104,61 @@ def _normalize_sequence_params(params: Sequence[Any] | None) -> tuple[Any, ...]:
     return tuple(params)
 
 
+# Parâmetro que aparece **apenas** dentro de `IS NULL`. O PostgreSQL não
+# consegue inferir o tipo nesse caso e responde
+# `could not determine data type of parameter $N`.
+#
+# O repositório usa esse padrão 67 vezes para tornar um filtro opcional
+# (`WHERE (? IS NULL OR coluna = ?)`), então derrubava praticamente toda
+# listagem filtrável no backend de produção. O SQLite aceita, e por isso a
+# suíte nunca viu.
+#
+# `::text` é suficiente: o único uso do parâmetro é a checagem de nulidade, e
+# o `= %s` ao lado infere o tipo da própria coluna. A correção fica aqui, num
+# lugar só — espalhar cast por 67 pontos de chamada seria esquecido no próximo
+# SELECT escrito.
+_UNTYPED_NULL_CHECK = re.compile(r"%s(\s+IS\s+(?:NOT\s+)?NULL)", re.IGNORECASE)
+
+
+def _cast_optional_filter_parameters(query: str) -> str:
+    return _UNTYPED_NULL_CHECK.sub(r"%s::text\1", query)
+
+
+def _normalize_postgres_row(row: Any) -> Any:
+    """Faz o PostgreSQL devolver os mesmos tipos que o SQLite.
+
+    Duas divergências, ambas descobertas rodando a suíte contra PostgreSQL
+    real e invisíveis em SQLite:
+
+    1. **Timestamp vira `datetime`.** O SQLite entrega texto. Todo código que
+       compara, serializa ou valida com Pydantic quebrava — `CompanyResponse`
+       recusava o `created_at` do próprio banco.
+    2. **O fuso vem o da sessão.** Comparar ISO como string entre offsets
+       diferentes está errado: `13:36-03:00` e `15:36+00:00` são o mesmo
+       instante, mas a comparação textual diz que o primeiro é maior. Por isso
+       a conversão é para **UTC** antes do `isoformat()`.
+
+    `Decimal` acompanha pela mesma razão: o SQLite devolve `float`.
+    """
+    if row is None:
+        return None
+    if not isinstance(row, dict):
+        return row
+
+    normalized: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, datetime):
+            aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+            normalized[key] = aware.astimezone(UTC).isoformat()
+        elif isinstance(value, date):
+            normalized[key] = value.isoformat()
+        elif isinstance(value, Decimal):
+            normalized[key] = float(value)
+        else:
+            normalized[key] = value
+    return normalized
+
+
 def _normalize_postgres_query(
     query: str,
     params: Sequence[Any] | Mapping[str, Any] | None,
@@ -114,6 +176,7 @@ def _normalize_postgres_query(
         "(CURRENT_TIMESTAMP + CAST(%s AS interval))",
     )
     normalized_query = normalized_query.replace("?", "%s")
+    normalized_query = _cast_optional_filter_parameters(normalized_query)
 
     stripped = normalized_query.strip()
     upper = stripped.upper()
@@ -152,10 +215,10 @@ class PostgresCursorWrapper:
         return self
 
     def fetchone(self) -> Any:
-        return self._cursor.fetchone()
+        return _normalize_postgres_row(self._cursor.fetchone())
 
     def fetchall(self) -> list[Any]:
-        return self._cursor.fetchall()
+        return [_normalize_postgres_row(row) for row in self._cursor.fetchall()]
 
     @property
     def rowcount(self) -> int:
@@ -166,6 +229,7 @@ class PostgresConnectionWrapper:
     def __init__(self, raw_connection: Any, pool: Any) -> None:
         self._connection = raw_connection
         self._pool = pool
+        self._closed = False
 
     def cursor(self) -> PostgresCursorWrapper:
         return PostgresCursorWrapper(self._connection.cursor())
@@ -173,12 +237,37 @@ class PostgresConnectionWrapper:
     def commit(self) -> None:
         self._connection.commit()
 
+    def rollback(self) -> None:
+        self._connection.rollback()
+
     def close(self) -> None:
+        """Devolve a conexão ao pool **exatamente uma vez**.
+
+        A idempotência não é conveniência: devolver duas vezes é pior que
+        vazar. O pool passa a acreditar que tem uma conexão livre a mais do que
+        realmente tem, e duas partes do código recebem o mesmo objeto — o
+        segundo `putconn` corrompe a contabilidade do pool em vez de só
+        desperdiçar um recurso.
+        """
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._connection.rollback()
-        except Exception:
-            pass
-        self._pool.putconn(self._connection)
+        except Exception as exc:
+            # A conexão precisa voltar ao pool de qualquer forma: uma conexão
+            # vazada trava o pool inteiro. Mas falhar o rollback em silêncio
+            # devolveria uma transação abortada, e a próxima operação naquela
+            # conexão herdaria `current transaction is aborted`.
+            logging.getLogger(__name__).warning(
+                "postgres.connection.rollback_failed", extra={"error_type": type(exc).__name__}
+            )
+        finally:
+            self._pool.putconn(self._connection)
+
+
+# Protege a construção e o fechamento do pool único do processo (D-09).
+_POSTGRES_POOL_LOCK = threading.Lock()
 
 
 def _get_postgres_connect_kwargs() -> dict[str, Any]:
@@ -194,30 +283,51 @@ def _get_postgres_connect_kwargs() -> dict[str, Any]:
 
 
 def _get_postgres_pool() -> Any:
+    """Devolve o pool único do processo, construindo-o no máximo uma vez.
+
+    A checagem sem lock era uma corrida de verdade, não teórica: os handlers
+    síncronos do FastAPI rodam num threadpool, então no cold start e a cada
+    rolling update as primeiras requisições concorrentes entravam aqui juntas.
+    Oito threads num barrier construíam **oito** pools; `close_postgres_pool()`
+    alcançava apenas o último, e os outros sete seguravam backends e threads do
+    psycopg_pool até o processo morrer. Num PostgreSQL gerenciado isso consome
+    slots de `max_connections` de forma permanente.
+
+    O padrão é double-checked locking: a leitura rápida fora do lock mantém o
+    caminho quente barato, e a segunda checagem dentro dele é o que garante
+    unicidade.
+    """
     global _POSTGRES_POOL
     if _POSTGRES_POOL is not None:
         return _POSTGRES_POOL
 
-    try:
-        from psycopg_pool import ConnectionPool  # type: ignore
-    except ImportError as exc:
-        raise RuntimeError(
-            "Postgres backend requires psycopg_pool. Install dependencies from requirements.txt."
-        ) from exc
+    with _POSTGRES_POOL_LOCK:
+        if _POSTGRES_POOL is not None:
+            return _POSTGRES_POOL
 
-    _POSTGRES_POOL = ConnectionPool(**_get_postgres_connect_kwargs())
-    return _POSTGRES_POOL
+        try:
+            from psycopg_pool import ConnectionPool  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "Postgres backend requires psycopg_pool. Install dependencies from requirements.txt."
+            ) from exc
+
+        # `open=True` explícito: o default do psycopg_pool vai virar `False` numa
+        # versão futura, e herdar essa mudança em silêncio deixaria o pool fechado
+        # — o processo subiria e só falharia na primeira consulta.
+        _POSTGRES_POOL = ConnectionPool(**_get_postgres_connect_kwargs(), open=True)
+        return _POSTGRES_POOL
 
 
 def close_postgres_pool() -> None:
     global _POSTGRES_POOL
-    if _POSTGRES_POOL is None:
-        return
-
-    try:
-        _POSTGRES_POOL.close()
-    finally:
-        _POSTGRES_POOL = None
+    with _POSTGRES_POOL_LOCK:
+        if _POSTGRES_POOL is None:
+            return
+        try:
+            _POSTGRES_POOL.close()
+        finally:
+            _POSTGRES_POOL = None
 
 
 def get_connection() -> Any:
@@ -225,6 +335,16 @@ def get_connection() -> Any:
     if backend == "sqlite":
         connection = sqlite3.connect(get_runtime_database_path())
         connection.row_factory = sqlite3.Row
+        # Integridade referencial ligada. O SQLite a deixa DESLIGADA por padrão
+        # e por conexão, então sem esta linha ele aceita em silêncio o INSERT
+        # órfão que o PostgreSQL recusa — e a suíte inteira fica cega para a
+        # classe de defeito que só aparece em produção.
+        #
+        # Ligar isto exigiu fechar o I-01 primeiro: com as conexões vazando,
+        # cada violação de FK levava uma conexão junto e dez delas esgotavam o
+        # pool do PostgreSQL. Agora toda aquisição passa por `transaction()`,
+        # `read_connection()` ou `connection_scope()`, que devolvem em `finally`.
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     pool = _get_postgres_pool()
@@ -237,6 +357,87 @@ def get_connection() -> Any:
 
     raw_connection.row_factory = dict_row
     return PostgresConnectionWrapper(raw_connection, pool)
+
+
+@contextmanager
+def connection_scope() -> Iterator[Any]:
+    """Aquisição segura com o commit sob controle de quem chama.
+
+    Existe para o caso em que `transaction()` mudaria a semântica: um laço que
+    comita por iteração, como o claim de job, precisa que cada tentativa seja
+    durável antes da próxima. Um commit único no fim transformaria N decisões
+    independentes numa só.
+
+    A garantia que este gerenciador dá é só a devolução — quem usa continua
+    responsável por `commit()` e por `rollback()`.
+    """
+    connection = get_connection()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def read_connection() -> Iterator[Any]:
+    """Conexão para leitura. Devolvida em `finally`, sem commit.
+
+    Leitura não recebe commit: num pool isso custa um round-trip e mantém a
+    transação aberta mais tempo do que o necessário.
+    """
+    connection = get_connection()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@contextmanager
+def transaction() -> Iterator[Any]:
+    """Conexão para escrita: commit no sucesso, rollback no erro, close sempre.
+
+    Esta é a resposta ao I-01. O padrão anterior — `connection.close()` como
+    última linha da função — devolve a conexão **apenas no caminho feliz**.
+    Qualquer coisa que lance antes dela (`cursor()`, `execute()`, `fetchall()`,
+    `commit()`, conversão de linha, `int()` sobre coluna nula) pula o close.
+
+    No SQLite o coletor de lixo às vezes salva. No pool do PostgreSQL não
+    existe salvação: `putconn` só acontece dentro de `close()`. Medido contra
+    PostgreSQL real com `max_size=10`, dez escritas inválidas esgotavam o pool
+    e a décima primeira dava `PoolTimeout` — a plataforma inteira parava por
+    causa de entradas malformadas de um único tenant.
+
+    `BaseException` e não `Exception`: um `KeyboardInterrupt` ou um
+    `CancelledError` no meio de uma escrita também precisa devolver a conexão,
+    e com a transação desfeita.
+    """
+    connection = get_connection()
+    try:
+        yield connection
+        connection.commit()
+    except BaseException:
+        _rollback_quietly(connection)
+        raise
+    finally:
+        connection.close()
+
+
+def _rollback_quietly(connection: Any) -> None:
+    """Desfaz a transação antes de devolver, registrando falha do próprio rollback.
+
+    Engolir aqui é deliberado e tem limite: a exceção original precisa chegar
+    a quem chamou. Um rollback que falha não pode substituí-la — mas também não
+    pode sumir, porque significa que a conexão está voltando suja.
+    """
+    rollback = getattr(connection, "rollback", None)
+    if rollback is None:
+        return
+    try:
+        rollback()
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "database.rollback_failed", extra={"error_type": type(exc).__name__}
+        )
 
 
 def get_runtime_database_summary() -> dict[str, str | bool | int | None]:
@@ -318,11 +519,10 @@ def get_postgres_target_summary() -> dict[str, str | bool | int | None]:
 def check_runtime_database_connection() -> dict[str, str | bool]:
     backend = get_database_backend()
     try:
-        connection = get_connection()
-        cursor = connection.cursor()
-        cursor.execute("SELECT 1 AS ok")
-        cursor.fetchone()
-        connection.close()
+        with read_connection() as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1 AS ok")
+            cursor.fetchone()
     except Exception as exc:
         return {
             "ok": False,
@@ -358,10 +558,9 @@ def check_postgres_target_connection() -> dict[str, str | bool]:
             target_url,
             connect_timeout=3,
             options=f"-c statement_timeout={settings.database_statement_timeout_ms}",
-        ) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT 1")
-                cursor.fetchone()
+        ) as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
     except Exception as exc:
         return {
             "ok": False,
@@ -1352,10 +1551,7 @@ def _create_queue_tables(cursor: Any) -> None:
 
 
 def _add_booking_outcome_columns(cursor: Any) -> None:
-    if get_database_backend() == "postgres":
-        ensure_column = _ensure_postgres_column
-    else:
-        ensure_column = _ensure_sqlite_column
+    ensure_column = _ensure_postgres_column if get_database_backend() == "postgres" else _ensure_sqlite_column
 
     ensure_column(cursor, "appointment_bookings", "booking_outcome", "TEXT")
     ensure_column(cursor, "appointment_bookings", "booking_outcome_at", "TIMESTAMP")
@@ -1633,10 +1829,7 @@ SQLITE_ID_TABLES_BILLING = {"billing_plans", "billing_subscriptions", "billing_u
 
 def _repair_queue_columns(cursor: Any) -> None:
     """Ensure all queue columns exist for databases created before migration 011."""
-    if get_database_backend() == "postgres":
-        ensure_column = _ensure_postgres_column
-    else:
-        ensure_column = _ensure_sqlite_column
+    ensure_column = _ensure_postgres_column if get_database_backend() == "postgres" else _ensure_sqlite_column
 
     ensure_column(cursor, "appointment_queue_entries", "scheduling_profile_key", "TEXT")
     ensure_column(cursor, "appointment_queue_entries", "customer_profile", "TEXT")
@@ -1670,6 +1863,34 @@ MIGRATIONS: list[Migration] = [
     ("022_contact_company_profiles", "Create tenant-scoped contact profiles", _create_contact_company_profiles),
     ("023_contact_company_profile_indexes", "Create contact profile indexes", _create_contact_company_profile_indexes),
 ]
+
+# Migrations da plataforma multiempresa vivem em módulo próprio para manter
+# este arquivo focado no schema operacional legado.
+from app.storage.migrations_automation import (  # noqa: E402
+    AUTOMATION_ID_TABLES,
+    AUTOMATION_MIGRATIONS,
+)
+from app.storage.migrations_hardening import (  # noqa: E402
+    HARDENING_ID_TABLES,
+    HARDENING_MIGRATIONS,
+)
+from app.storage.migrations_identity import (  # noqa: E402
+    IDENTITY_ID_TABLES,
+    IDENTITY_MIGRATIONS,
+)
+from app.storage.migrations_platform import (  # noqa: E402
+    PLATFORM_ID_TABLES,
+    PLATFORM_MIGRATIONS,
+)
+
+MIGRATIONS.extend(PLATFORM_MIGRATIONS)
+MIGRATIONS.extend(IDENTITY_MIGRATIONS)
+MIGRATIONS.extend(HARDENING_MIGRATIONS)
+MIGRATIONS.extend(AUTOMATION_MIGRATIONS)
+SQLITE_ID_TABLES.update(PLATFORM_ID_TABLES)
+SQLITE_ID_TABLES.update(IDENTITY_ID_TABLES)
+SQLITE_ID_TABLES.update(HARDENING_ID_TABLES)
+SQLITE_ID_TABLES.update(AUTOMATION_ID_TABLES)
 
 
 def _ensure_schema_migrations_table(cursor: Any) -> None:
@@ -1724,8 +1945,12 @@ def _run_migrations(cursor: Any) -> None:
 
 
 def init_db() -> None:
-    connection = get_connection()
-    cursor = connection.cursor()
-    _run_migrations(cursor)
-    connection.commit()
-    connection.close()
+    """Aplica as migrations pendentes.
+
+    A conexão vive num `transaction()`: uma migration que falha no meio desfaz
+    o que aplicou e **devolve a conexão**. No padrão anterior ela vazava com a
+    transação de escrita aberta, o que no SQLite trava o banco inteiro até o
+    timeout e no PostgreSQL consome uma conexão do pool para sempre.
+    """
+    with transaction() as connection:
+        _run_migrations(connection.cursor())

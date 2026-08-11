@@ -67,9 +67,10 @@ class FakeRepository:
         self.updated_memory = kwargs
 
 
-def test_process_contact_message_without_auto_reply(monkeypatch) -> None:
+def test_process_contact_message_without_auto_reply(monkeypatch, stub_company_config) -> None:
     fake_repository = FakeRepository()
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    stub_company_config(orchestrator, company_id=1, company_slug="default", company_name="Default Company")
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",

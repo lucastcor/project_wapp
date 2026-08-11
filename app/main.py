@@ -10,9 +10,16 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.admin_routes import admin_router
-from app.api.platform_routes import PLATFORM_ASSETS_DIR, platform_router
+from app.api.automation_routes import automation_router
+from app.api.platform_admin_routes import platform_admin_router
+from app.api.platform_routes import (
+    AUTOMATION_STUDIO_DIR,
+    PLATFORM_ASSETS_DIR,
+    platform_router,
+)
 from app.api.routes import router
 from app.core.config import is_missing_or_placeholder, settings
+from app.core.exceptions import TenantResourceNotFoundError
 from app.core.logging import (
     clear_request_context,
     configure_logging,
@@ -20,6 +27,7 @@ from app.core.logging import (
     log_event,
     set_request_context,
 )
+from app.core.tenancy import TenantScopeError
 from app.services.rate_limit_service import build_rate_limit_headers, evaluate_rate_limit, get_request_client_ip
 from app.services.runtime_guard_service import get_runtime_blockers, validate_runtime_environment
 from app.services.system_readiness_service import get_system_readiness
@@ -153,8 +161,64 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestObservabilityMiddleware)
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(platform_admin_router)
+app.include_router(automation_router)
 app.include_router(platform_router)
 app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")
+
+# O bundle do Automation Studio só é montado quando existe. Montar um
+# diretório ausente derrubaria o processo inteiro por causa do frontend.
+if AUTOMATION_STUDIO_DIR.is_dir():
+    app.mount(
+        "/platform/automations",
+        StaticFiles(directory=str(AUTOMATION_STUDIO_DIR), html=True),
+        name="automation-studio",
+    )
+
+
+@app.exception_handler(TenantScopeError)
+async def tenant_scope_error_handler(request: Request, exc: TenantScopeError) -> JSONResponse:
+    """Empresa ausente ou inválida numa borda interna é **400**, não 500.
+
+    Sem este handler, `require_company_id` recusando um valor virava erro
+    interno: culpava o servidor por um erro do cliente, acionava alerta
+    operacional para um caso esperado, e era o único status cuja resposta podia
+    carregar detalhe interno. A mensagem da exceção cita contexto e tabela e
+    fica no log; o corpo devolve só a categoria.
+    """
+    log_event(
+        logger,
+        logging.WARNING,
+        "http.tenant_scope.rejected",
+        http_path=request.url.path,
+        reason=str(exc),
+    )
+    return JSONResponse(
+        status_code=400,
+        content={"detail": "A valid company scope is required for this operation."},
+    )
+
+
+@app.exception_handler(TenantResourceNotFoundError)
+async def tenant_resource_not_found_handler(
+    request: Request,
+    exc: TenantResourceNotFoundError,
+) -> JSONResponse:
+    """Recurso fora do escopo autorizado responde 404, sempre.
+
+    Registrado no app inteiro, e não em cada rota, porque a garantia é de
+    classe: um handler novo que carregue recurso por id herda o
+    comportamento correto sem precisar lembrar de nada. Não existe caminho em
+    que "é de outro tenant" pareça diferente de "não existe".
+    """
+    log_event(
+        logger,
+        logging.INFO,
+        "http.resource.not_found_in_scope",
+        request_id=getattr(request.state, "request_id", None),
+        http_path=request.url.path,
+    )
+    return JSONResponse(status_code=404, content={"detail": "Resource not found."})
 
 
 @app.exception_handler(Exception)

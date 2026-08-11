@@ -245,6 +245,14 @@ textarea { resize: vertical; min-height: 92px; }
   transition: background 180ms var(--ease), color 180ms var(--ease), border-color 180ms var(--ease), transform 140ms var(--ease);
 }
 
+/* O item do Automation Studio é um link, não um botão: ele navega para outro
+   bundle na mesma origem. A regra abaixo iguala a aparência dos dois. */
+a.nav-button {
+  text-decoration: none;
+  font-size: inherit;
+  font-family: inherit;
+}
+
 .nav-button:hover {
   color: var(--text);
   background: var(--surface-2);

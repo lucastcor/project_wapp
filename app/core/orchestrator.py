@@ -2,15 +2,16 @@ import logging
 import time
 
 from app.core.logging import get_logger, log_event, mask_identifier
+from app.services.automation_trigger_service import build_message_processed_event
 from app.services.classification_service import classify_message
+from app.services.company_config_service import get_company_config
+from app.services.conversation_workflow_service import handle_conversation_workflow
 from app.services.decision_service import decide_message_action
-from app.storage.repository import RuntimeRepository
-from app.services.reply_services import generate_business_reply
+from app.services.handoff_service import should_create_pending_question
 from app.services.memory_service import update_conversation_summary
 from app.services.pipeline_service import infer_pipeline_state
-from app.services.handoff_service import should_create_pending_question
-from app.core.company_context import get_company_context
-from app.services.conversation_workflow_service import handle_conversation_workflow
+from app.services.reply_services import generate_business_reply
+from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
@@ -43,11 +44,8 @@ def _process_contact_message(
     if resolved_company_id is None:
         resolved_company_id = repository.ensure_default_company()
 
-    resolved_company = repository.get_company(resolved_company_id)
-    resolved_company_slug = (
-        company_slug
-        or (resolved_company.get("slug") if resolved_company else None)
-    )
+    company_config = get_company_config(resolved_company_id)
+    resolved_company_slug = company_config.company_slug or company_slug
 
     repository.save_contact(contact_id, contact_name, company_id=resolved_company_id)
     contact = repository.get_contact(contact_id, company_id=resolved_company_id)
@@ -57,7 +55,8 @@ def _process_contact_message(
         contact_id,
         company_id=resolved_company_id,
     )
-    company_context = get_company_context(company_slug=resolved_company_slug)
+    company_context = company_config.context
+    customer_profile = contact.get("customer_profile") if contact else None
 
     workflow_result = handle_conversation_workflow(
         contact_id=contact_id,
@@ -66,6 +65,8 @@ def _process_contact_message(
         company_id=resolved_company_id,
         company_context=company_context,
     )
+
+    retrieval_trace: dict[str, object] = {}
 
     if workflow_result.handled:
         classification = str(workflow_result.classification or "workflow")
@@ -158,9 +159,11 @@ def _process_contact_message(
                 contact_id=contact_id,
                 company_id=resolved_company_id,
                 company_slug=resolved_company_slug,
+                customer_profile=customer_profile,
             )
             reply = reply_result["reply"]
             reply_source = reply_result["source"]
+            retrieval_trace = reply_result.get("retrieval") or {}
             log_event(
                 logger,
                 logging.INFO,
@@ -169,6 +172,11 @@ def _process_contact_message(
                 company_id=resolved_company_id,
                 reply_source=reply_source,
                 reply_length=len(reply),
+                knowledge_source_ids=[
+                    source.get("chunk_id") for source in retrieval_trace.get("sources", [])
+                ],
+                style_example_ids=retrieval_trace.get("style_example_ids"),
+                has_relevant_source=retrieval_trace.get("has_relevant_source"),
             )
 
         pending_question_id: int | None = None
@@ -190,6 +198,8 @@ def _process_contact_message(
                 question_type=handoff_decision["question_type"],
             )
 
+    handoff_required = bool(handoff_decision["should_handoff"]) and not latest_customer_clarification
+
     repository.save_message(
         contact_id=contact_id,
         company_id=resolved_company_id,
@@ -202,6 +212,24 @@ def _process_contact_message(
         reply_source=reply_source,
         action=decision["action"],
         priority=decision["priority"],
+        retrieval=retrieval_trace,
+        # Outbox transacional: o fato para a automação é gravado no mesmo
+        # commit da mensagem. A automação é pós-orquestração — a resposta
+        # síncrona acima continua sendo dona do atendimento.
+        automation_event_factory=lambda new_message_id: build_message_processed_event(
+            company_id=resolved_company_id,
+            message_id=new_message_id,
+            contact_id=contact_id,
+            classification=classification,
+            confidence=confidence,
+            action=str(decision["action"]),
+            pipeline_stage=contact.get("pipeline_stage") if contact else None,
+            customer_profile=customer_profile,
+            handoff_required=handoff_required,
+            reply_source=reply_source,
+            has_relevant_source=bool(retrieval_trace.get("has_relevant_source")),
+            auto_reply_sent=bool(decision["auto_reply"]) and bool(reply),
+        ),
     )
 
     new_summary = update_conversation_summary(

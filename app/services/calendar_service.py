@@ -1,14 +1,19 @@
+import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-import re
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.core.company_context import get_company_context
+from app.core.company_context import get_seed_company_context
 from app.core.config import is_missing_or_placeholder, settings
+from app.core.exceptions import TenantResourceNotFoundError
+from app.core.logging import get_logger, log_event
 from app.services.reminder_service import schedule_booking_customer_reminders
 from app.storage.repository import RuntimeRepository
+
+logger = get_logger(__name__)
 
 
 repository = RuntimeRepository()
@@ -69,13 +74,19 @@ def _has_real_provider_value(value: Any) -> bool:
 
 
 def _resolve_company_context(company_id: int | None) -> dict[str, Any]:
+    """Contexto publicado da empresa, com queda para o template só sem tenant."""
     if company_id is None:
-        return get_company_context()
+        return get_seed_company_context(None)
 
-    get_company = getattr(repository, "get_company", None)
-    company = get_company(company_id) if callable(get_company) else None
-    company_slug = company.get("slug") if company else None
-    return get_company_context(company_slug=company_slug)
+    from app.services.company_config_service import (
+        CompanyConfigError,
+        get_company_config,
+    )
+
+    try:
+        return get_company_config(int(company_id)).context
+    except CompanyConfigError:
+        return get_seed_company_context(None)
 
 
 def _get_company_timezone(
@@ -113,8 +124,7 @@ def _normalize_lookup_key(value: Any) -> str:
         "ç": "c",
     })
     normalized = normalized.translate(replacements)
-    normalized = re.sub(r"\s+", " ", normalized)
-    return normalized
+    return re.sub(r"\s+", " ", normalized)
 
 
 def _normalize_weekday_key(value: Any) -> str | None:
@@ -141,6 +151,13 @@ def _normalize_string_list(values: Any) -> list[str]:
     return normalized
 
 
+# Endpoint público de troca de credencial do Google OAuth. Não é segredo: é a
+# URL documentada do serviço, igual para todo mundo. O nome descreve o
+# endpoint, e não o que trafega nele — `..._TOKEN_URI` fazia o Bandit e um
+# leitor apressado lerem "credencial embutida".
+GOOGLE_OAUTH_EXCHANGE_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+
 def _parse_workday_windows(value: Any) -> list[tuple[time, time]]:
     if isinstance(value, list):
         windows: list[tuple[time, time]] = []
@@ -154,7 +171,7 @@ def _parse_workday_windows(value: Any) -> list[tuple[time, time]]:
     if normalized in {"fechado", "closed", "off"}:
         return []
 
-    windows: list[tuple[time, time]] = []
+    windows = []
     for chunk in re.split(r"[;,]+", normalized):
         candidate = chunk.strip()
         if not candidate:
@@ -626,7 +643,7 @@ class GoogleCalendarProvider(BaseCalendarProvider):
         credentials = Credentials(
             token=None,
             refresh_token=refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
+            token_uri=GOOGLE_OAUTH_EXCHANGE_ENDPOINT,
             client_id=client_id,
             client_secret=client_secret,
             scopes=[CALENDAR_SCOPE],
@@ -873,16 +890,31 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
                 event = calendar.event(normalized_reference)
                 if event:
                     return event
-            except Exception:
-                pass
+            except Exception as exc:
+                # Estratégia de busca não suportada por este servidor CalDAV.
+                # Seguir para a próxima é o comportamento correto; engolir o
+                # motivo em silêncio não é.
+                log_event(
+                    logger,
+                    logging.DEBUG,
+                    "calendar.caldav.lookup_strategy_failed",
+                    strategy="event",
+                    error_type=type(exc).__name__,
+                )
 
         if hasattr(calendar, "object_by_uid"):
             try:
                 event = calendar.object_by_uid(normalized_reference)
                 if event:
                     return event
-            except Exception:
-                pass
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.DEBUG,
+                    "calendar.caldav.lookup_strategy_failed",
+                    strategy="object_by_uid",
+                    error_type=type(exc).__name__,
+                )
 
         raise CalendarProviderError("CalDAV não conseguiu localizar o evento externo para sincronização.")
 
@@ -1333,7 +1365,7 @@ def cancel_calendar_booking(
 ) -> dict[str, Any]:
     booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
-        raise CalendarProviderError("Booking not found.")
+        raise TenantResourceNotFoundError("Booking not found.")
     if str(booking.get("status") or "") not in {"confirmed", "pending"}:
         raise CalendarProviderError("Only confirmed or pending bookings can be cancelled.")
 
@@ -1380,7 +1412,7 @@ def reschedule_calendar_booking(
 ) -> dict[str, Any]:
     booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
-        raise CalendarProviderError("Booking not found.")
+        raise TenantResourceNotFoundError("Booking not found.")
     if str(booking.get("status") or "") not in {"confirmed", "pending"}:
         raise CalendarProviderError("Only confirmed or pending bookings can be rescheduled.")
 

@@ -5,8 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.storage.db import get_connection, get_database_backend, init_db
-
+from app.storage.db import get_database_backend, init_db, read_connection
 
 BACKUP_TABLES: list[str] = [
     "companies",
@@ -68,30 +67,30 @@ def _serialize_json_compatible(value: Any) -> Any:
 
 def build_backup_payload() -> dict[str, Any]:
     init_db()
-    connection = get_connection()
-    cursor = connection.cursor()
+    with read_connection() as connection:
+        cursor = connection.cursor()
 
-    tables: dict[str, list[dict[str, Any]]] = {}
-    table_counts: dict[str, int] = {}
-    for table_name in BACKUP_TABLES:
-        if table_name not in BACKUP_TABLE_SET:
-            raise ValueError(f"Unsupported backup table: {table_name}")
-        order_by = TABLE_ORDER_BY.get(table_name)
-        query = f"SELECT * FROM {table_name}"  # nosec B608 - table names come from a closed internal whitelist
-        if order_by:
-            query = f"{query} ORDER BY {order_by}"
-        cursor.execute(query)
-        rows = [_serialize_json_compatible(dict(row)) for row in cursor.fetchall()]
-        tables[table_name] = rows
-        table_counts[table_name] = len(rows)
+        tables: dict[str, list[dict[str, Any]]] = {}
+        table_counts: dict[str, int] = {}
+        for table_name in BACKUP_TABLES:
+            if table_name not in BACKUP_TABLE_SET:
+                raise ValueError(f"Unsupported backup table: {table_name}")
+            order_by = TABLE_ORDER_BY.get(table_name)
+            order_clause = f" ORDER BY {order_by}" if order_by else ""
+            # `table_name` é validado contra BACKUP_TABLE_SET logo acima e
+            # `order_clause` vem do mapa literal TABLE_ORDER_BY. A origem literal
+            # é verificada em tests/test_sql_interpolation_guard.py.
+            cursor.execute(f"SELECT * FROM {table_name}{order_clause}")
+            rows = [_serialize_json_compatible(dict(row)) for row in cursor.fetchall()]
+            tables[table_name] = rows
+            table_counts[table_name] = len(rows)
 
-    connection.close()
-    return {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "database_backend": get_database_backend(),
-        "table_counts": table_counts,
-        "tables": tables,
-    }
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "database_backend": get_database_backend(),
+            "table_counts": table_counts,
+            "tables": tables,
+        }
 
 
 def write_backup_file(output_path: str | None = None) -> dict[str, Any]:

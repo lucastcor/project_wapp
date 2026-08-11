@@ -3,24 +3,40 @@ import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
+
+from app.api.admin_security import (
+    build_require_admin_access,
+    build_require_admin_role,
+    get_request_principal,
+)
+from app.api.admin_support import build_prometheus_metrics, record_audit_event
+from app.api.company_scope import (
+    authorize_company,
+    build_require_company_scope,
+    get_authorized_company_id,
+    get_authorized_company_ids,
+    require_authorized_company_id,
+    require_company_filter,
+)
+from app.api.platform_schemas import FineTuningJobPayload
 from app.api.schemas import (
-    AppointmentBookingPayload,
     AppointmentBookingCancellationPayload,
+    AppointmentBookingPayload,
     AppointmentBookingReschedulePayload,
     AppointmentQueueEntryPayload,
     AppointmentQueueOfferResponsePayload,
     BookingOutcomePayload,
     CalendarAvailabilityQueryPayload,
     CalendarIntegrationPayload,
-    CancelSubscriptionPayload,
     CancellationReasonPayload,
-    OnboardingSetupPayload,
+    CancelSubscriptionPayload,
     CompanyContextPayload,
     CompanyCreatePayload,
     CompanyResponse,
     ContactUpdatePayload,
     InternalReminderPayload,
     MessageExampleCreatePayload,
+    OnboardingSetupPayload,
     PendingQuestionAnswerPayload,
     PlanChangePayload,
     ReactivateSubscriptionPayload,
@@ -28,45 +44,20 @@ from app.api.schemas import (
     TrainingImportPayload,
     UsageRecordPayload,
 )
-from app.api.admin_security import (
-    build_require_admin_access,
-    build_require_admin_role,
-)
-from app.api.admin_support import build_prometheus_metrics, record_audit_event
-
-from app.storage.repository import RuntimeRepository
-
 from app.core.company_context import (
     CompanyContextError,
-    get_company_context,
-    save_company_context,
+    get_seed_company_context,
+    save_seed_company_context,
 )
-from app.services.handoff_service import normalize_owner_resolution
-from app.services.knowledge_service import (
-    build_knowledge_entry_from_resolution,
-    should_store_resolution_as_knowledge,
-)
-
-from app.services.training_export_service import (
-    export_finetuning_bundle_as_json,
-    export_finetuning_train_jsonl,
-    export_finetuning_validation_jsonl,
-    export_training_records_as_json,
-    export_training_records_as_jsonl,
-    export_training_review_report_as_json,
-    export_training_split_as_json,
-)
-from app.services.training_import_service import TrainingImportError, import_training_records
-
-from app.services.outbound_dispatch_service import (
-    OutboundDispatchError,
-    dispatch_outbound_message,
-    dispatch_pending_outbound_messages,
-)
-from app.services.system_readiness_service import (
-    get_onboarding_status,
-    get_system_profile,
-    get_system_readiness,
+from app.core.config import settings
+from app.core.logging import get_logger, log_event
+from app.services.appointment_queue_service import (
+    AppointmentQueueError,
+    create_queue_entry,
+    list_queue_entries,
+    list_queue_offers,
+    release_booking_slot,
+    respond_to_queue_offer,
 )
 from app.services.calendar_service import (
     CalendarProviderError,
@@ -81,25 +72,45 @@ from app.services.calendar_service import (
     query_calendar_availability,
     reschedule_calendar_booking,
 )
+from app.services.company_config_service import (
+    CompanyConfigError,
+    get_company_config,
+    save_company_config,
+)
+from app.services.finetuning_service import FineTuningError, FineTuningService
+from app.services.handoff_service import normalize_owner_resolution
+from app.services.knowledge_service import (
+    build_knowledge_entry_from_resolution,
+    should_store_resolution_as_knowledge,
+)
+from app.services.outbound_dispatch_service import (
+    OutboundDispatchError,
+    dispatch_outbound_message,
+    dispatch_pending_outbound_messages,
+)
+from app.services.realtime_service import broadcast_event
 from app.services.reminder_service import (
     ReminderServiceError,
     create_internal_reminder,
     dispatch_due_reminders,
     list_reminders,
 )
-from app.services.appointment_queue_service import (
-    AppointmentQueueError,
-    create_queue_entry,
-    list_queue_entries,
-    list_queue_offers,
-    release_booking_slot,
-    respond_to_queue_offer,
+from app.services.system_readiness_service import (
+    get_onboarding_status,
+    get_system_profile,
+    get_system_readiness,
 )
-
-from app.core.config import settings
-from app.services.realtime_service import broadcast_event
-from app.services.finetuning_service import FineTuningError, FineTuningService
-from app.core.logging import get_logger, log_event
+from app.services.training_export_service import (
+    export_finetuning_bundle_as_json,
+    export_finetuning_train_jsonl,
+    export_finetuning_validation_jsonl,
+    export_training_records_as_json,
+    export_training_records_as_jsonl,
+    export_training_review_report_as_json,
+    export_training_split_as_json,
+)
+from app.services.training_import_service import TrainingImportError, import_training_records
+from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
 logger = get_logger(__name__)
@@ -114,18 +125,19 @@ def _get_repository() -> RuntimeRepository:
     return repository
 
 
-def _resolve_company_scope(
-    *,
-    company_id: int | None = None,
-    company_slug: str | None = None,
-    required: bool = False,
-) -> int | None:
-    resolved_company_id = repository.resolve_company_id(
-        company_id=company_id,
-        company_slug=company_slug,
-    )
+def _resolve_company_scope(request: Request, *, required: bool = False) -> int | None:
+    """Empresa da requisição, sempre vinda do escopo já autorizado.
+
+    Este helper não resolve nada por conta própria. `require_company_scope`
+    já autorizou (ou recusou) a empresa; refazer a resolução aqui era o que
+    permitia cair na primeira empresa ativa quando nada era informado.
+    """
+    resolved_company_id = get_authorized_company_id(request)
     if required and resolved_company_id is None:
-        raise HTTPException(status_code=400, detail="company_id or company_slug must resolve to an existing company.")
+        raise HTTPException(
+            status_code=400,
+            detail="company_id or company_slug is required for this operation.",
+        )
     return resolved_company_id
 
 
@@ -166,16 +178,47 @@ def require_admin_role(required_role: str):
     )
 
 
+require_company_scope = build_require_company_scope(
+    logger=logger,
+    repository_getter=_get_repository,
+)
+
+
 admin_router = APIRouter(
     prefix="/admin",
     tags=["admin"],
-    dependencies=[Depends(require_admin_access)],
+    # Ordem importa: autenticar o principal antes de autorizar a empresa.
+    dependencies=[Depends(require_admin_access), Depends(require_company_scope)],
 )
 
 
 @admin_router.get("/state")
 def read_state() -> dict:
     return repository.get_state()
+
+
+@admin_router.get("/access/scope")
+def read_access_scope(request: Request) -> dict:
+    """Escopo que a plataforma resolveu para esta credencial.
+
+    Introspecção honesta do que a autorização decidiu: qual empresa ficou
+    ativa, quais estão ao alcance e por qual modo a identidade foi obtida.
+    O cliente usa isso para escolher o seletor de empresa sem adivinhar, e a
+    suíte usa para provar que o escopo aplicado é o da membership.
+    """
+    principal = get_request_principal(request)
+    allowed = get_authorized_company_ids(request)
+    return {
+        "actor": principal.actor,
+        "principal_id": principal.principal_id,
+        "global_role": principal.global_role,
+        "is_global": principal.is_global,
+        "auth_mode": principal.auth_mode,
+        "authorized_company_id": get_authorized_company_id(request),
+        "authorized_company_ids": (
+            sorted(allowed) if allowed is not None else sorted(principal.allowed_company_ids)
+        ),
+    }
 
 
 @admin_router.get("/observability/summary")
@@ -213,7 +256,7 @@ def read_audit_events(
     limit: int = 100,
     action: str | None = Query(default=None),
     resource_type: str | None = Query(default=None),
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> list[dict]:
     normalized_limit = max(1, min(limit, 500))
     return repository.get_audit_events(
@@ -293,10 +336,9 @@ def read_system_readiness() -> dict:
 
 @admin_router.get("/system/onboarding")
 def read_system_onboarding(
-    company_id: int | None = Query(default=None),
-    company_slug: str | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
-    onboarding = get_onboarding_status(company_id=company_id, company_slug=company_slug)
+    onboarding = get_onboarding_status(company_id=company_id, company_slug=None)
     log_event(
         logger,
         logging.INFO,
@@ -314,7 +356,7 @@ def read_calendar_providers() -> list[dict]:
 
 
 @admin_router.get("/calendar/profile")
-def read_calendar_profile(company_id: int | None = Query(default=None)) -> dict:
+def read_calendar_profile(company_id: int | None = Depends(require_company_filter)) -> dict:
     profile = get_calendar_profile(company_id=company_id)
     log_event(
         logger,
@@ -328,7 +370,7 @@ def read_calendar_profile(company_id: int | None = Query(default=None)) -> dict:
 
 @admin_router.get("/calendar/timeline")
 def read_calendar_timeline(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     start_date: str | None = Query(default=None),
     days: int = Query(default=7, ge=1, le=14),
 ) -> dict:
@@ -340,7 +382,7 @@ def read_calendar_timeline(
 
 
 @admin_router.get("/calendar/integrations")
-def read_calendar_integrations(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_calendar_integrations(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return get_calendar_integrations(company_id=company_id)
 
 
@@ -351,7 +393,7 @@ def read_calendar_integrations(company_id: int | None = Query(default=None)) -> 
 def create_calendar_integration_endpoint(
     payload: CalendarIntegrationPayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         integration = create_calendar_integration(
@@ -384,7 +426,7 @@ def create_calendar_integration_endpoint(
 )
 def query_calendar_availability_endpoint(
     payload: CalendarAvailabilityQueryPayload,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         return query_calendar_availability(
@@ -403,12 +445,12 @@ def query_calendar_availability_endpoint(
 
 
 @admin_router.get("/calendar/bookings")
-def read_calendar_bookings(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_calendar_bookings(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return get_calendar_bookings(company_id=company_id)
 
 
 @admin_router.get("/calendar/queue")
-def read_appointment_queue(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_appointment_queue(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     try:
         return list_queue_entries(company_id=company_id)
     except AppointmentQueueError as exc:
@@ -422,7 +464,7 @@ def read_appointment_queue(company_id: int | None = Query(default=None)) -> list
 def create_appointment_queue_entry_endpoint(
     payload: AppointmentQueueEntryPayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         entry = create_queue_entry(
@@ -465,7 +507,7 @@ def create_appointment_queue_entry_endpoint(
 
 @admin_router.get("/calendar/queue-offers")
 def read_appointment_queue_offers(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     status: str | None = Query(default=None),
 ) -> list[dict]:
     try:
@@ -481,7 +523,7 @@ def read_appointment_queue_offers(
 def create_calendar_booking_endpoint(
     payload: AppointmentBookingPayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         booking = create_calendar_booking(
@@ -564,12 +606,16 @@ def create_calendar_booking_endpoint(
             "confirmation_outbound_message_id": confirmation_outbound_id,
         },
     )
-    broadcast_event("new_booking", {
-        "booking_id": booking.get("id"),
-        "title": booking.get("title"),
-        "starts_at": booking.get("starts_at"),
-        "contact_id": booking.get("contact_id"),
-    })
+    broadcast_event(
+        "new_booking",
+        {
+            "booking_id": booking.get("id"),
+            "title": booking.get("title"),
+            "starts_at": booking.get("starts_at"),
+            "contact_id": booking.get("contact_id"),
+        },
+        company_id=company_id,
+    )
     if confirmation_outbound_id is not None:
         return {**booking, "confirmation_outbound_message_id": confirmation_outbound_id}
     return booking
@@ -582,10 +628,15 @@ def reschedule_calendar_booking_endpoint(
     booking_id: int,
     payload: AppointmentBookingReschedulePayload,
     request: Request,
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
+    # A empresa entra na consulta, e não é descoberta a partir do registro:
+    # carregar o booking pelo ID global e depois ler `booking["company_id"]`
+    # já teria lido o dado do outro tenant.
     try:
         booking = reschedule_calendar_booking(
             booking_id=booking_id,
+            company_id=company_id,
             starts_at=payload.starts_at,
             ends_at=payload.ends_at,
             timezone_name=payload.timezone,
@@ -602,7 +653,7 @@ def reschedule_calendar_booking_endpoint(
         action="reschedule",
         resource_type="appointment_booking",
         resource_id=str(booking_id),
-        company_id=booking.get("company_id"),
+        company_id=company_id,
         metadata={
             "starts_at": booking.get("starts_at"),
             "ends_at": booking.get("ends_at"),
@@ -622,12 +673,13 @@ def cancel_calendar_booking_endpoint(
     booking_id: int,
     payload: AppointmentBookingCancellationPayload,
     request: Request,
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         if payload.trigger_queue_recovery:
-            result = release_booking_slot(booking_id=booking_id)
+            result = release_booking_slot(booking_id=booking_id, company_id=company_id)
         else:
-            result = cancel_calendar_booking(booking_id=booking_id)
+            result = cancel_calendar_booking(booking_id=booking_id, company_id=company_id)
             result = {
                 "booking": result["booking"],
                 "cancelled_reminders": result["cancelled_reminders"],
@@ -646,7 +698,7 @@ def cancel_calendar_booking_endpoint(
         action="cancel",
         resource_type="appointment_booking",
         resource_id=str(booking_id),
-        company_id=result["booking"].get("company_id") if result.get("booking") else None,
+        company_id=company_id,
         metadata={
             "trigger_queue_recovery": payload.trigger_queue_recovery,
             "reason": payload.reason,
@@ -669,10 +721,12 @@ def respond_to_appointment_queue_offer_endpoint(
     offer_id: int,
     payload: AppointmentQueueOfferResponsePayload,
     request: Request,
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         result = respond_to_queue_offer(
             offer_id=offer_id,
+            company_id=company_id,
             response_status=payload.response_status,
             wait_minutes=payload.wait_minutes,
             response_notes=payload.response_notes,
@@ -687,7 +741,7 @@ def respond_to_appointment_queue_offer_endpoint(
         action="respond",
         resource_type="appointment_queue_offer",
         resource_id=str(offer_id),
-        company_id=result["offer"].get("company_id") if result.get("offer") else None,
+        company_id=company_id,
         metadata={
             "response_status": payload.response_status,
             "new_booking_id": (
@@ -707,7 +761,7 @@ def respond_to_appointment_queue_offer_endpoint(
 
 @admin_router.get("/reminders")
 def read_customer_reminders(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     status: str | None = Query(default=None),
     audience: str | None = Query(default=None),
 ) -> list[dict]:
@@ -721,7 +775,7 @@ def read_customer_reminders(
 def create_internal_reminder_endpoint(
     payload: InternalReminderPayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         reminder = create_internal_reminder(
@@ -779,13 +833,13 @@ def dispatch_due_customer_reminders(
 
 
 @admin_router.get("/messages")
-def read_messages(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_messages(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return repository.get_messages(company_id=company_id)
 
 
 @admin_router.get("/contacts")
 def read_contacts(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     q: str | None = Query(default=None),
     limit: int = Query(default=100, ge=1, le=500),
 ) -> list[dict]:
@@ -802,7 +856,7 @@ def read_contacts(
 @admin_router.get("/contacts/{contact_id}")
 def read_contact(
     contact_id: str,
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
     contact = repository.get_contact(contact_id, company_id=company_id)
     if not contact:
@@ -818,7 +872,7 @@ def update_contact_endpoint(
     contact_id: str,
     payload: ContactUpdatePayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     contact = repository.get_contact(contact_id, company_id=company_id)
     if not contact:
@@ -892,24 +946,53 @@ def create_company(payload: CompanyCreatePayload, request: Request) -> CompanyRe
 
 
 @admin_router.get("/companies", response_model=list[CompanyResponse])
-def read_companies() -> list[CompanyResponse]:
-    return [CompanyResponse(**company) for company in repository.get_companies()]
+def read_companies(request: Request) -> list[CompanyResponse]:
+    """Empresas visíveis para o principal.
+
+    Um principal com membership só enxerga as próprias empresas; listar todas
+    exige acesso global.
+    """
+    principal = get_request_principal(request)
+    # T-09: o conjunto autorizado entra na consulta. Antes, a tabela inteira
+    # vinha do banco e o excedente era descartado em memória — resultado certo,
+    # fronteira no lugar errado.
+    company_ids = None if principal.is_global else sorted(principal.allowed_company_ids)
+    companies = repository.get_companies(company_ids=company_ids)
+    return [CompanyResponse(**company) for company in companies]
 
 
 @admin_router.get("/companies/{company_id}", response_model=CompanyResponse)
-def read_company(company_id: int) -> CompanyResponse:
+def read_company(company_id: int, request: Request) -> CompanyResponse:
+    principal = get_request_principal(request)
     company = repository.get_company(company_id)
-    if not company:
+    # Mesma resposta para inexistente e não autorizado: evita enumeração.
+    if not company or not principal.can_access_company(company_id):
         raise HTTPException(status_code=404, detail="Company not found.")
     return CompanyResponse(**company)
 
 
 @admin_router.get("/company-context")
-def read_company_context(company_slug: str | None = Query(default=None)) -> dict:
+def read_company_context(
+    request: Request,
+    company_id: int | None = Depends(require_company_filter),
+) -> dict:
+    """Contexto operacional publicado da empresa.
+
+    Sem empresa resolvida, devolve o template global (seed), útil apenas para
+    inspeção. O runtime nunca responde com esse template em produção.
+    """
+    resolved_company_id = _resolve_company_scope(request)
+
+    if resolved_company_id is None:
+        try:
+            return get_seed_company_context(None)
+        except CompanyContextError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
-        return get_company_context(company_slug=company_slug)
-    except CompanyContextError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return get_company_config(resolved_company_id).context
+    except CompanyConfigError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @admin_router.put(
@@ -919,40 +1002,77 @@ def read_company_context(company_slug: str | None = Query(default=None)) -> dict
 def update_company_context(
     payload: CompanyContextPayload,
     request: Request,
-    company_slug: str | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
+    publish: bool = Query(default=True),
 ) -> dict:
-    try:
-        result = save_company_context(payload.data, company_slug=company_slug)
-        log_event(
-            logger,
-            logging.INFO,
-            "admin.company_context.updated",
-            company_slug=company_slug or "global",
-        )
+    """Cria uma nova versão do contexto da empresa.
+
+    Escrita nunca sobrescreve a versão anterior: o histórico é preservado e
+    permite rollback. Sem empresa resolvida, grava apenas o template seed.
+    """
+    # `require_company_filter` devolve None **apenas** para principal global.
+    # O template seed é global; um principal tenant-scoped nunca chega aqui com
+    # None — ele recebe 400 antes de entrar no handler.
+    resolved_company_id = company_id
+
+    if resolved_company_id is None:
+        try:
+            result = save_seed_company_context(payload.data, company_slug=None)
+        except CompanyContextError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         _record_audit_event(
             request=request,
             action="update",
-            resource_type="company_context",
-            resource_id=company_slug or "global",
-            metadata={
-                "company_slug": company_slug or "global",
-                "top_level_keys": sorted(payload.data.keys()),
-            },
+            resource_type="company_context_seed",
+            resource_id="global",
+            metadata={"top_level_keys": sorted(payload.data.keys())},
         )
         return result
-    except CompanyContextError as exc:
+
+    try:
+        stored = save_company_config(
+            company_id=resolved_company_id,
+            context=payload.data,
+            author=getattr(request.state, "admin_actor", None),
+            change_note="Updated through admin API",
+            publish=publish,
+        )
+    except CompanyConfigError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.company_context.version_created",
+        company_id=resolved_company_id,
+        version=stored["version"],
+        published=publish,
+    )
+    _record_audit_event(
+        request=request,
+        action="update",
+        resource_type="company_context",
+        resource_id=str(stored["id"]),
+        company_id=resolved_company_id,
+        metadata={
+            "version": stored["version"],
+            "status": stored["status"],
+            "content_hash": stored["content_hash"],
+            "top_level_keys": sorted(payload.data.keys()),
+        },
+    )
+    return stored
 
 
 @admin_router.get("/pending-questions")
-def read_pending_questions(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_pending_questions(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return repository.get_pending_questions(company_id=company_id)
 
 
 @admin_router.get("/pending-questions/{question_id}")
 def read_pending_question(
     question_id: int,
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
     pending_question = repository.get_pending_question(question_id, company_id=company_id)
     if not pending_question:
@@ -968,23 +1088,24 @@ def answer_pending_question(
     question_id: int,
     payload: PendingQuestionAnswerPayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     pending_question = repository.get_pending_question(question_id, company_id=company_id)
     if not pending_question:
         raise HTTPException(status_code=404, detail="Pending question not found.")
 
     try:
-        company_slug = None
-        if pending_question.get("company_id") is not None:
-            company = repository.get_company(int(pending_question["company_id"]))
-            if company:
-                company_slug = company.get("slug")
+        pending_company_id = pending_question.get("company_id")
+        resolved_context = (
+            get_company_config(int(pending_company_id)).context
+            if pending_company_id is not None
+            else get_seed_company_context(None)
+        )
 
         normalized_resolution = normalize_owner_resolution(
             {
                 **payload.model_dump(),
-                "company_context": get_company_context(company_slug=company_slug),
+                "company_context": resolved_context,
             }
         )
     except ValueError as exc:
@@ -1067,14 +1188,14 @@ def answer_pending_question(
 
 
 @admin_router.get("/knowledge-entries")
-def read_knowledge_entries(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_knowledge_entries(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return repository.get_knowledge_entries(company_id=company_id)
 
 
 @admin_router.get("/knowledge-entries/{knowledge_entry_id}")
 def read_knowledge_entry(
     knowledge_entry_id: int,
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
     knowledge_entry = repository.get_knowledge_entry(knowledge_entry_id, company_id=company_id)
     if not knowledge_entry:
@@ -1089,7 +1210,7 @@ def read_knowledge_entry(
 def create_message_example(
     payload: MessageExampleCreatePayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     message_example_id = repository.create_message_example(
         company_id=company_id,
@@ -1132,14 +1253,14 @@ def create_message_example(
 
 
 @admin_router.get("/message-examples")
-def read_message_examples(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_message_examples(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return repository.get_message_examples(company_id=company_id)
 
 
 @admin_router.get("/message-examples/{message_example_id}")
 def read_message_example(
     message_example_id: int,
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
     message_example = repository.get_message_example(message_example_id, company_id=company_id)
     if not message_example:
@@ -1148,23 +1269,23 @@ def read_message_example(
 
 
 @admin_router.get("/training-dataset/json")
-def read_training_dataset_json(company_id: int | None = Query(default=None)) -> dict:
+def read_training_dataset_json(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_training_records_as_json(company_id=company_id)}
 
 
 @admin_router.get("/training-dataset/jsonl")
-def read_training_dataset_jsonl(company_id: int | None = Query(default=None)) -> dict:
+def read_training_dataset_jsonl(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_training_records_as_jsonl(company_id=company_id)}
 
 
 
 @admin_router.get("/training-dataset/split")
-def read_training_dataset_split(company_id: int | None = Query(default=None)) -> dict:
+def read_training_dataset_split(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_training_split_as_json(company_id=company_id)}
 
 
 @admin_router.get("/training-dataset/review")
-def read_training_dataset_review(company_id: int | None = Query(default=None)) -> dict:
+def read_training_dataset_review(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_training_review_report_as_json(company_id=company_id)}
 
 
@@ -1175,7 +1296,7 @@ def read_training_dataset_review(company_id: int | None = Query(default=None)) -
 def import_training_records_endpoint(
     payload: TrainingImportPayload,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         result = import_training_records(
@@ -1214,29 +1335,29 @@ def import_training_records_endpoint(
 
 
 @admin_router.get("/finetuning-dataset/train-jsonl")
-def read_finetuning_train_jsonl(company_id: int | None = Query(default=None)) -> dict:
+def read_finetuning_train_jsonl(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_finetuning_train_jsonl(company_id=company_id)}
 
 
 @admin_router.get("/finetuning-dataset/validation-jsonl")
-def read_finetuning_validation_jsonl(company_id: int | None = Query(default=None)) -> dict:
+def read_finetuning_validation_jsonl(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_finetuning_validation_jsonl(company_id=company_id)}
 
 
 @admin_router.get("/finetuning-dataset/bundle")
-def read_finetuning_dataset_bundle(company_id: int | None = Query(default=None)) -> dict:
+def read_finetuning_dataset_bundle(company_id: int | None = Depends(require_company_filter)) -> dict:
     return {"dataset": export_finetuning_bundle_as_json(company_id=company_id)}
 
 
 @admin_router.get("/outbound-messages")
-def read_outbound_messages(company_id: int | None = Query(default=None)) -> list[dict]:
+def read_outbound_messages(company_id: int | None = Depends(require_company_filter)) -> list[dict]:
     return repository.get_outbound_messages(company_id=company_id)
 
 
 @admin_router.get("/outbound-messages/{outbound_message_id}")
 def read_outbound_message(
     outbound_message_id: int,
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
     outbound_message = repository.get_outbound_message(outbound_message_id, company_id=company_id)
     if not outbound_message:
@@ -1251,7 +1372,7 @@ def read_outbound_message(
 def mark_outbound_message_sent(
     outbound_message_id: int,
     request: Request,
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     outbound_message = repository.get_outbound_message(outbound_message_id, company_id=company_id)
     if not outbound_message:
@@ -1287,7 +1408,7 @@ def dispatch_single_outbound_message(
     outbound_message_id: int,
     request: Request,
     channel: str = "generic",
-    company_id: int | None = Query(default=None),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     try:
         result = dispatch_outbound_message(
@@ -1354,16 +1475,21 @@ def dispatch_all_pending_outbound_messages(request: Request, channel: str = "gen
 )
 def create_finetuning_job(
     request: Request,
-    company_id: int | None = Query(default=None),
-    company_slug: str | None = Query(default=None),
+    payload: FineTuningJobPayload,
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
-    resolved_company_id = _resolve_company_scope(
-        company_id=company_id,
-        company_slug=company_slug,
-        required=True,
-    )
+    """Cria um job de fine-tuning a partir de uma dataset_version congelada.
+
+    O readiness bloqueia a criação: qualquer falha bloqueante impede upload de
+    arquivo e criação de job.
+    """
     try:
-        result = _get_finetuning_service().create_finetuning_job(company_id=resolved_company_id)
+        result = _get_finetuning_service().create_finetuning_job(
+            company_id=company_id,
+            dataset_version_id=payload.dataset_version_id,
+            require_evaluation=payload.require_evaluation,
+            requested_by=getattr(request.state, "admin_actor", None),
+        )
         log_event(
             logger,
             logging.INFO,
@@ -1371,17 +1497,19 @@ def create_finetuning_job(
             job_id=result.get("job_id"),
             status=result.get("status"),
             base_model=result.get("base_model"),
-            company_id=resolved_company_id,
+            company_id=company_id,
+            dataset_version_id=payload.dataset_version_id,
         )
         _record_audit_event(
             request=request,
             action="create",
             resource_type="finetuning_job",
             resource_id=str(result.get("job_id")),
-            company_id=resolved_company_id,
+            company_id=company_id,
             metadata={
                 "status": result.get("status"),
                 "base_model": result.get("base_model"),
+                "dataset_version_id": payload.dataset_version_id,
             },
         )
         return result
@@ -1391,14 +1519,11 @@ def create_finetuning_job(
 
 @admin_router.get("/finetuning/jobs")
 def list_finetuning_jobs(
+    request: Request,
     limit: int = 10,
-    company_id: int | None = Query(default=None),
-    company_slug: str | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> list[dict]:
-    resolved_company_id = _resolve_company_scope(
-        company_id=company_id,
-        company_slug=company_slug,
-    )
+    resolved_company_id = _resolve_company_scope(request)
     try:
         results = _get_finetuning_service().list_finetuning_jobs(
             limit=limit,
@@ -1419,14 +1544,11 @@ def list_finetuning_jobs(
 
 @admin_router.get("/finetuning/jobs/{job_id}")
 def read_finetuning_job(
+    request: Request,
     job_id: str,
-    company_id: int | None = Query(default=None),
-    company_slug: str | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
-    resolved_company_id = _resolve_company_scope(
-        company_id=company_id,
-        company_slug=company_slug,
-    )
+    resolved_company_id = _resolve_company_scope(request)
     try:
         result = _get_finetuning_service().retrieve_finetuning_job(
             job_id,
@@ -1447,26 +1569,23 @@ def read_finetuning_job(
 
 @admin_router.get("/finetuning/jobs-db")
 def read_persisted_finetuning_jobs(
-    company_id: int | None = Query(default=None),
-    company_slug: str | None = Query(default=None),
+    request: Request,
+    company_id: int | None = Depends(require_company_filter),
 ) -> list[dict]:
-    resolved_company_id = _resolve_company_scope(
-        company_id=company_id,
-        company_slug=company_slug,
+    resolved_company_id = _resolve_company_scope(request)
+    return repository.get_finetuning_job_records(
+        company_id=resolved_company_id,
+        company_ids=get_authorized_company_ids(request),
     )
-    return repository.get_finetuning_job_records(company_id=resolved_company_id)
 
 
 @admin_router.get("/finetuning/jobs-db/{job_id}")
 def read_persisted_finetuning_job(
+    request: Request,
     job_id: str,
-    company_id: int | None = Query(default=None),
-    company_slug: str | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
 ) -> dict:
-    resolved_company_id = _resolve_company_scope(
-        company_id=company_id,
-        company_slug=company_slug,
-    )
+    resolved_company_id = _resolve_company_scope(request)
     job_record = repository.get_finetuning_job_record(job_id, company_id=resolved_company_id)
     if not job_record:
         raise HTTPException(status_code=404, detail="Persisted fine-tuning job not found.")
@@ -1478,7 +1597,7 @@ def read_persisted_finetuning_job(
 
 @admin_router.get("/analytics/dashboard")
 def read_analytics_dashboard(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     period: str = Query(default="30d"),
 ) -> dict:
     from app.services.analytics_service import AnalyticsError, get_no_show_dashboard
@@ -1501,11 +1620,15 @@ def read_analytics_dashboard(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/analytics/bookings/{booking_id}/outcome")
+@admin_router.post(
+    "/analytics/bookings/{booking_id}/outcome",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
 def record_booking_outcome_endpoint(
     booking_id: int,
     payload: BookingOutcomePayload,
     request: Request,
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.analytics_service import AnalyticsError, record_booking_outcome
 
@@ -1514,12 +1637,14 @@ def record_booking_outcome_endpoint(
             booking_id,
             outcome=payload.outcome,
             notes=payload.notes,
+            company_id=company_id,
         )
         _record_audit_event(
             request=request,
             action="record_outcome",
             resource_type="appointment_booking",
             resource_id=str(booking_id),
+            company_id=company_id,
             metadata={"outcome": payload.outcome},
         )
         log_event(
@@ -1534,21 +1659,30 @@ def record_booking_outcome_endpoint(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/analytics/bookings/{booking_id}/cancellation-reason")
+@admin_router.post(
+    "/analytics/bookings/{booking_id}/cancellation-reason",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
 def record_cancellation_reason_endpoint(
     booking_id: int,
     payload: CancellationReasonPayload,
     request: Request,
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.analytics_service import AnalyticsError, record_cancellation_reason
 
     try:
-        result = record_cancellation_reason(booking_id, reason=payload.reason)
+        result = record_cancellation_reason(
+            booking_id,
+            reason=payload.reason,
+            company_id=company_id,
+        )
         _record_audit_event(
             request=request,
             action="record_cancellation_reason",
             resource_type="appointment_booking",
             resource_id=str(booking_id),
+            company_id=company_id,
             metadata={"reason": payload.reason},
         )
         log_event(
@@ -1564,7 +1698,7 @@ def record_cancellation_reason_endpoint(
 
 @admin_router.get("/analytics/trend")
 def read_analytics_trend(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     months: int = Query(default=6, ge=1, le=24),
 ) -> list[dict]:
     trend = repository.get_analytics_monthly_trend(
@@ -1584,7 +1718,7 @@ def read_analytics_trend(
 
 @admin_router.get("/analytics/reminder-effectiveness")
 def read_reminder_effectiveness(
-    company_id: int | None = Query(default=None),
+    company_id: int | None = Depends(require_company_filter),
     period: str = Query(default="30d"),
 ) -> dict:
     from app.services.analytics_service import _resolve_period
@@ -1615,7 +1749,10 @@ def read_onboarding_presets() -> dict:
     return get_onboarding_presets()
 
 
-@admin_router.post("/onboarding/setup")
+@admin_router.post(
+    "/onboarding/setup",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def run_onboarding_setup(
     payload: OnboardingSetupPayload,
     request: Request,
@@ -1669,9 +1806,17 @@ def run_onboarding_setup(
 
 
 @admin_router.get("/onboarding/setup-status/{company_id}")
-def read_onboarding_setup_status(company_id: int) -> dict:
+def read_onboarding_setup_status(request: Request, company_id: int) -> dict:
+    """Estado de configuração de **uma** empresa.
+
+    `require_company_scope` lê apenas a query string, então um `company_id` no
+    path passava direto por ela. Sem esta autorização, a rota era um oráculo de
+    enumeração: iterar o id devolvia nome, slug e postura de configuração de
+    toda a base de clientes da plataforma.
+    """
     from app.services.onboarding_service import OnboardingError, get_setup_status
 
+    authorize_company(request, company_id)
     try:
         return get_setup_status(company_id)
     except OnboardingError as exc:
@@ -1690,10 +1835,13 @@ def read_billing_plans() -> list[dict]:
     return plans
 
 
-@admin_router.post("/billing/trial")
+@admin_router.post(
+    "/billing/trial",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def start_billing_trial(
     request: Request,
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.billing_service import BillingError, start_trial
 
@@ -1716,11 +1864,14 @@ def start_billing_trial(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/activate")
+@admin_router.post(
+    "/billing/activate",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def activate_billing_subscription(
     payload: SubscriptionActivatePayload,
     request: Request,
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.billing_service import BillingError, activate_subscription
 
@@ -1752,11 +1903,14 @@ def activate_billing_subscription(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/cancel")
+@admin_router.post(
+    "/billing/cancel",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def cancel_billing_subscription(
     payload: CancelSubscriptionPayload,
     request: Request,
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.billing_service import BillingError, cancel_subscription
 
@@ -1779,11 +1933,14 @@ def cancel_billing_subscription(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/reactivate")
+@admin_router.post(
+    "/billing/reactivate",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def reactivate_billing_subscription(
     payload: ReactivateSubscriptionPayload,
     request: Request,
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.billing_service import BillingError, reactivate_subscription
 
@@ -1813,11 +1970,14 @@ def reactivate_billing_subscription(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@admin_router.post("/billing/change-plan")
+@admin_router.post(
+    "/billing/change-plan",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
 def change_billing_plan(
     payload: PlanChangePayload,
     request: Request,
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.billing_service import BillingError, change_plan
 
@@ -1846,7 +2006,7 @@ def change_billing_plan(
 
 
 @admin_router.get("/billing/usage")
-def read_billing_usage(company_id: int = Query(...)) -> dict:
+def read_billing_usage(company_id: int = Depends(require_authorized_company_id)) -> dict:
     from app.services.billing_service import get_usage_dashboard
 
     dashboard = get_usage_dashboard(company_id)
@@ -1858,11 +2018,14 @@ def read_billing_usage(company_id: int = Query(...)) -> dict:
     return dashboard
 
 
-@admin_router.post("/billing/usage/record")
+@admin_router.post(
+    "/billing/usage/record",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
 def record_billing_usage(
     payload: UsageRecordPayload,
     request: Request,
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
 ) -> dict:
     from app.services.billing_service import BillingError, record_usage
 
@@ -1883,7 +2046,7 @@ def record_billing_usage(
 
 @admin_router.get("/billing/check-limit")
 def check_billing_limit(
-    company_id: int = Query(...),
+    company_id: int = Depends(require_authorized_company_id),
     metric: str = Query(...),
 ) -> dict:
     from app.services.billing_service import check_limit

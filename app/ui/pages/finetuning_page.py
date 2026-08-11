@@ -5,7 +5,6 @@ import streamlit as st
 from app.ui.admin_api_client import AdminApiClientError
 
 
-
 def render_finetuning_page(page_context: dict[str, Any]) -> None:
     client = page_context["client"]
     selected_company_id = page_context.get("company_id")
@@ -72,12 +71,41 @@ def render_finetuning_page(page_context: dict[str, Any]) -> None:
     col_create_job, col_train_jsonl, col_validation_jsonl = st.columns([1, 1, 1])
 
     with col_create_job:
+        # O job só nasce de uma dataset_version congelada; a curadoria completa
+        # vive em /platform (Data Governance).
+        frozen_versions: list[dict] = []
+        if selected_company_id is not None:
+            try:
+                frozen_versions = [
+                    version
+                    for version in client.get_dataset_versions(company_id=selected_company_id)
+                    if version.get("status") == "frozen"
+                ]
+            except Exception:
+                frozen_versions = []
+
+        selected_version_id = None
+        if frozen_versions:
+            selected_version_id = st.selectbox(
+                "Dataset congelado",
+                options=[int(version["id"]) for version in frozen_versions],
+                format_func=lambda version_id: f"v{version_id}",
+            )
+        else:
+            st.caption("Nenhuma dataset_version congelada disponível.")
+
         if st.button("Criar novo job", use_container_width=True):
             if selected_company_id is None:
                 st.error("Selecione uma empresa para criar o job de fine-tuning.")
                 return
+            if selected_version_id is None:
+                st.error("Congele uma dataset_version antes de criar o job.")
+                return
             try:
-                result = client.create_finetuning_job(company_id=selected_company_id)
+                result = client.create_finetuning_job(
+                    company_id=selected_company_id,
+                    dataset_version_id=int(selected_version_id),
+                )
                 st.success(f"Job criado com sucesso: {result.get('job_id')}")
                 st.json(result)
             except AdminApiClientError as exc:

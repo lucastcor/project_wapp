@@ -6,7 +6,6 @@ from app.core.logging import get_logger, log_event, mask_identifier
 from app.services.whatsapp_provider import WhatsAppProvider, WhatsAppProviderError
 from app.storage.repository import RuntimeRepository
 
-
 repository = RuntimeRepository()
 logger = get_logger(__name__)
 

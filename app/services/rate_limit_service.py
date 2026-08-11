@@ -1,11 +1,10 @@
 import time
 from dataclasses import dataclass
-from threading import Lock
 
 from fastapi import Request
 
 from app.core.config import settings
-
+from app.services.shared_state import get_counter_store, reset_counter_store
 
 LOCAL_CLIENT_IDENTIFIERS = {"127.0.0.1", "::1", "localhost", "testclient"}
 
@@ -22,13 +21,8 @@ class RateLimitDecision:
     retry_after: int
 
 
-_RATE_LIMIT_STATE: dict[str, tuple[int, int]] = {}
-_RATE_LIMIT_LOCK = Lock()
-
-
 def reset_rate_limit_state() -> None:
-    with _RATE_LIMIT_LOCK:
-        _RATE_LIMIT_STATE.clear()
+    reset_counter_store()
 
 
 def get_request_client_ip(request: Request) -> str:
@@ -71,28 +65,23 @@ def evaluate_rate_limit(request: Request) -> RateLimitDecision | None:
     now = int(time.time())
     window_start = (now // window_seconds) * window_seconds
     window_reset_at = window_start + window_seconds
-    storage_key = f"{scope}:{client_id}"
+    # A janela entra na chave para que o contador expire naturalmente e o
+    # mesmo contrato sirva ao backend em memória e ao compartilhado.
+    storage_key = f"project_wapp:ratelimit:{scope}:{client_id}:{window_start}"
 
-    with _RATE_LIMIT_LOCK:
-        stored_window_start, stored_count = _RATE_LIMIT_STATE.get(storage_key, (window_start, 0))
-        if stored_window_start != window_start:
-            stored_window_start = window_start
-            stored_count = 0
+    current_count = get_counter_store().increment(storage_key, window_seconds)
 
-        if stored_count >= limit:
-            return RateLimitDecision(
-                scope=scope,
-                limit=limit,
-                window_seconds=window_seconds,
-                client_id=client_id,
-                allowed=False,
-                remaining=0,
-                reset_at=window_reset_at,
-                retry_after=max(1, window_reset_at - now),
-            )
-
-        stored_count += 1
-        _RATE_LIMIT_STATE[storage_key] = (stored_window_start, stored_count)
+    if current_count > limit:
+        return RateLimitDecision(
+            scope=scope,
+            limit=limit,
+            window_seconds=window_seconds,
+            client_id=client_id,
+            allowed=False,
+            remaining=0,
+            reset_at=window_reset_at,
+            retry_after=max(1, window_reset_at - now),
+        )
 
     return RateLimitDecision(
         scope=scope,
@@ -100,7 +89,7 @@ def evaluate_rate_limit(request: Request) -> RateLimitDecision | None:
         window_seconds=window_seconds,
         client_id=client_id,
         allowed=True,
-        remaining=max(0, limit - stored_count),
+        remaining=max(0, limit - current_count),
         reset_at=window_reset_at,
         retry_after=0,
     )

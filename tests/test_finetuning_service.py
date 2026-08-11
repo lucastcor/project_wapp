@@ -131,7 +131,7 @@ def test_create_finetuning_job_raises_when_pipeline_is_disabled(monkeypatch) -> 
     service = FineTuningService()
 
     with pytest.raises(FineTuningError, match="disabled"):
-        service.create_finetuning_job(company_id=1)
+        service.create_finetuning_job(company_id=1, dataset_version_id=1)
 
 
 def test_create_finetuning_job_requires_company_scope(monkeypatch) -> None:
@@ -142,7 +142,39 @@ def test_create_finetuning_job_requires_company_scope(monkeypatch) -> None:
     service = FineTuningService()
 
     with pytest.raises(FineTuningError, match="company_id must be provided"):
-        service.create_finetuning_job(company_id=None)
+        service.create_finetuning_job(company_id=None, dataset_version_id=1)
+
+
+def _install_ready_finetuning_stubs(monkeypatch, export_calls, *, is_ready=True, status="frozen"):
+    monkeypatch.setattr(
+        finetuning_service,
+        "get_dataset_version",
+        lambda *, company_id, dataset_version_id: {
+            "id": dataset_version_id,
+            "company_id": company_id,
+            "status": status,
+        },
+    )
+    monkeypatch.setattr(
+        finetuning_service,
+        "evaluate_pretraining_readiness",
+        lambda *, company_id, dataset_version_id: {
+            "is_ready": is_ready,
+            "blocking_failures": [] if is_ready else ["minimum_examples", "evaluation_gate"],
+        },
+    )
+    monkeypatch.setattr(
+        finetuning_service,
+        "export_dataset_version_jsonl",
+        lambda *, company_id, dataset_version_id, split: (
+            export_calls.append((split, company_id)) or '{"messages": []}'
+        ),
+    )
+    monkeypatch.setattr(
+        finetuning_service,
+        "register_candidate_model",
+        lambda **kwargs: {"id": 1, **kwargs},
+    )
 
 
 def test_create_finetuning_job_creates_scoped_record(monkeypatch) -> None:
@@ -154,29 +186,60 @@ def test_create_finetuning_job_creates_scoped_record(monkeypatch) -> None:
     monkeypatch.setattr(settings, "openai_api_key", "test-key")
     monkeypatch.setattr(settings, "openai_finetuning_base_model", "gpt-4o-mini-2024-07-18")
     monkeypatch.setattr(settings, "openai_finetuning_suffix", "project-wapp-style")
-    monkeypatch.setattr(
-        finetuning_service,
-        "export_finetuning_train_jsonl",
-        lambda company_id=None: export_calls.append(("train", company_id)) or '{"messages": []}',
-    )
-    monkeypatch.setattr(
-        finetuning_service,
-        "export_finetuning_validation_jsonl",
-        lambda company_id=None: export_calls.append(("validation", company_id)) or '{"messages": []}',
-    )
+    _install_ready_finetuning_stubs(monkeypatch, export_calls)
     monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
 
     service = FineTuningService()
-    result = service.create_finetuning_job(company_id=7)
+    result = service.create_finetuning_job(company_id=7, dataset_version_id=42)
 
     assert result["job_id"] == "ftjob-test-123"
     assert result["status"] == "validating_files"
+    assert result["dataset_version_id"] == 42
     assert result["training_file_info"]["status"] == "processed"
     assert result["validation_file_info"]["status"] == "processed"
     assert export_calls == [("train", 7), ("validation", 7)]
     assert len(fake_repository.created_records) == 1
     assert fake_repository.created_records[0]["job_id"] == "ftjob-test-123"
     assert fake_repository.created_records[0]["company_id"] == 7
+    assert fake_repository.created_records[0]["dataset_version_id"] == 42
+
+
+def test_create_finetuning_job_is_blocked_when_readiness_fails(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    export_calls: list[tuple[str, int | None]] = []
+
+    monkeypatch.setattr(finetuning_service, "repository", fake_repository)
+    monkeypatch.setattr(settings, "enable_finetuning_pipeline", True)
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    _install_ready_finetuning_stubs(monkeypatch, export_calls, is_ready=False)
+    monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
+
+    service = FineTuningService()
+
+    with pytest.raises(FineTuningError, match="readiness failed"):
+        service.create_finetuning_job(company_id=7, dataset_version_id=42)
+
+    assert export_calls == []
+    assert fake_repository.created_records == []
+
+
+def test_create_finetuning_job_requires_frozen_dataset_version(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    export_calls: list[tuple[str, int | None]] = []
+
+    monkeypatch.setattr(finetuning_service, "repository", fake_repository)
+    monkeypatch.setattr(settings, "enable_finetuning_pipeline", True)
+    monkeypatch.setattr(settings, "openai_api_key", "test-key")
+    _install_ready_finetuning_stubs(monkeypatch, export_calls, status="draft")
+    monkeypatch.setattr(finetuning_service, "OpenAI", lambda api_key: FakeOpenAIClient())
+
+    service = FineTuningService()
+
+    with pytest.raises(FineTuningError, match="must be frozen"):
+        service.create_finetuning_job(company_id=7, dataset_version_id=42)
+
+    assert export_calls == []
+    assert fake_repository.created_records == []
 
 
 def test_retrieve_finetuning_job_updates_persisted_record(monkeypatch) -> None:

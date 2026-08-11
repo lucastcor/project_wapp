@@ -1,3 +1,12 @@
+import {
+  GOVERNANCE_VIEW_KEY,
+  bindGovernanceEvents,
+  createGovernanceState,
+  governanceNavItem,
+  loadGovernanceData,
+  renderGovernanceView,
+} from "/platform/assets/governance.js"
+
 const STORAGE_KEY = "project-wapp-platform-config-v1"
 const STUDIO_SESSIONS_KEY = "project-wapp-studio-sessions-v1"
 
@@ -57,6 +66,7 @@ const ICONS = {
   clock: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>',
   check: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
   search: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.3-4.3"/></svg>',
+  shield: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v6c0 4.5-3 7.6-7 9-4-1.4-7-4.5-7-9V6z"/><path d="M9.2 12.2l1.9 1.9 3.7-3.9"/></svg>',
   spark: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v4M12 17v4M3 12h4M17 12h4M5.6 5.6l2.8 2.8M15.6 15.6l2.8 2.8M5.6 18.4l2.8-2.8M15.6 8.4l2.8-2.8"/></svg>',
   target: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>',
   handoff: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 11V7a5 5 0 0 0-10 0v4"/><rect x="5" y="11" width="14" height="10" rx="2"/></svg>',
@@ -102,9 +112,14 @@ const NAV_ITEMS = [
   { key: "analytics", label: "Analytics", caption: "No-show, lembretes e funil", icon: "target" },
   { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
   { key: "flows", label: "Flow Studio", caption: "Pipelines, playbooks e respostas", icon: "flow" },
+  // O Automation Studio é um bundle React separado, servido na mesma origem.
+  // `href` faz o item navegar em vez de trocar `state.view`, porque não é uma
+  // view desta SPA.
+  { key: "automations", label: "Automation Studio", caption: "Fluxos visuais, execuções e aprovações", icon: "flow", href: "/platform/automations" },
   { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
   { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
   { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
+  governanceNavItem,
   { key: "billing", label: "Billing", caption: "Planos, uso e assinatura", icon: "tag" },
   { key: "onboarding", label: "Setup Wizard", caption: "Configurar nova empresa", icon: "spark" },
 ]
@@ -205,6 +220,7 @@ const state = {
   billingPlans: null,
   billingUsage: null,
   trainingImportResult: null,
+  governance: createGovernanceState(),
   availabilityResult: null,
   simulator: {
     transcript: [],
@@ -694,6 +710,25 @@ function ensureConversationPipelines(context) {
   return normalizedContext
 }
 
+function buildGovernanceContext() {
+  return {
+    state,
+    apiRequest,
+    companyParams: getCompanyParams,
+    escapeHtml,
+    formatNumber,
+    formatDateTime,
+    renderMetricCard,
+    pushToast,
+    summarizeError,
+    ICONS,
+    reload: async () => {
+      await loadGovernanceData(buildGovernanceContext())
+      renderApp()
+    },
+  }
+}
+
 let _refreshInFlight = null
 
 async function refreshCurrentView({ silent = false } = {}) {
@@ -732,6 +767,8 @@ async function _doRefreshCurrentView({ silent = false } = {}) {
     } else if (state.view === "contacts") {
       await loadCompanies()
       await loadContactsData()
+    } else if (state.view === GOVERNANCE_VIEW_KEY) {
+      await loadGovernanceData(buildGovernanceContext())
     } else if (state.view === "training") {
       await loadCompanies()
       await loadTrainingData()
@@ -767,6 +804,7 @@ function viewLoadingLabel(view) {
   if (view === "agenda") return "Buscando agenda e fila de prioridade..."
   if (view === "contacts") return "Buscando contatos..."
   if (view === "training") return "Montando operação de curadoria..."
+  if (view === GOVERNANCE_VIEW_KEY) return "Carregando governança de dados e modelo..."
   return "Carregando..."
 }
 
@@ -838,6 +876,7 @@ function renderViewTitle() {
   if (state.view === "agenda") return "Agenda Console com controle manual e visão operacional"
   if (state.view === "contacts") return "Contacts Desk para decidir com contexto e precisão"
   if (state.view === "training") return "Training Ops para curar base histórica com segurança"
+  if (state.view === GOVERNANCE_VIEW_KEY) return "Data Governance para conhecimento, dataset e modelo"
   return "Project WAPP Platform"
 }
 
@@ -851,6 +890,7 @@ function renderViewCopy() {
   if (state.view === "agenda") return "Monitore disponibilidade, bookings, remanejamento e ajustes manuais."
   if (state.view === "contacts") return "Enriqueça customer_profile, organize notas e desambiguação de atendimento."
   if (state.view === "training") return "Importe CRM, faça dry-run, acompanhe o dataset e acione fine-tuning."
+  if (state.view === GOVERNANCE_VIEW_KEY) return "Fontes aprovadas, curadoria revisada, dataset congelado e modelo por empresa."
   return "Painel premium do Project WAPP."
 }
 
@@ -882,7 +922,17 @@ function renderSidebar() {
       <div class="nav-section-label">Workspace</div>
       <nav class="nav-list">
         ${NAV_ITEMS.map(
-          (item) => `
+          (item) => item.href
+            ? `
+            <a class="nav-button" href="${item.href}">
+              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
+              <span>
+                <span class="nav-label">${escapeHtml(item.label)}</span>
+                <span class="nav-caption">${escapeHtml(item.caption)}</span>
+              </span>
+            </a>
+          `
+            : `
             <button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">
               <span class="nav-icon">${ICONS[item.icon] || ""}</span>
               <span>
@@ -3444,6 +3494,7 @@ function renderCurrentView() {
   if (state.view === "agenda") return renderAgendaView()
   if (state.view === "contacts") return renderContactsView()
   if (state.view === "training") return renderTrainingView()
+  if (state.view === GOVERNANCE_VIEW_KEY) return renderGovernanceView(buildGovernanceContext())
   if (state.view === "billing") return renderBillingView()
   if (state.view === "onboarding") return renderOnboardingView()
   return ""
@@ -4008,6 +4059,9 @@ function bindEvents() {
   bindAgendaEvents()
   bindContactsEvents()
   bindTrainingEvents()
+  if (state.view === GOVERNANCE_VIEW_KEY) {
+    bindGovernanceEvents(buildGovernanceContext())
+  }
 }
 
 function bindStudioEvents() {
@@ -5137,7 +5191,11 @@ let _eventSource = null
 function connectSSE() {
   if (_eventSource) return
   try {
-    _eventSource = new EventSource("/platform/events")
+    const scope = new URLSearchParams()
+    if (state.config.companyId) scope.set("company_id", state.config.companyId)
+    else if (state.config.companySlug) scope.set("company_slug", state.config.companySlug)
+    const scopeQuery = scope.toString()
+    _eventSource = new EventSource(`/platform/events${scopeQuery ? `?${scopeQuery}` : ""}`)
 
     _eventSource.addEventListener("connected", () => {
       state.connected = true

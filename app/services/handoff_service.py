@@ -5,7 +5,6 @@ from typing import Any
 from app.core.config import settings
 from app.llm.providers.openai_provider import OpenAIProvider
 
-
 VALID_RESOLUTION_TYPES = {
     "final_answer",
     "needs_customer_clarification",

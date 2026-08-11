@@ -88,8 +88,8 @@ def test_query_calendar_availability_respects_local_conflicts(monkeypatch) -> No
     monkeypatch.setattr(settings, "calendar_slot_increment_minutes", 60)
     monkeypatch.setattr(
         calendar_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "_resolve_company_context",
+        lambda company_id=None: {
             "business_hours": {
                 "timezone": "America/Sao_Paulo",
             },
@@ -154,8 +154,8 @@ def test_create_calendar_booking_persists_mock_booking(monkeypatch) -> None:
     monkeypatch.setattr(settings, "calendar_timezone", "America/Sao_Paulo")
     monkeypatch.setattr(
         calendar_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "_resolve_company_context",
+        lambda company_id=None: {
             "business_hours": {
                 "timezone": "America/Sao_Paulo",
             },
@@ -195,8 +195,8 @@ def test_query_calendar_availability_respects_company_business_hours(monkeypatch
     monkeypatch.setattr(settings, "calendar_provider", "mock")
     monkeypatch.setattr(
         calendar_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "_resolve_company_context",
+        lambda company_id=None: {
             "business_hours": {
                 "timezone": "America/Sao_Paulo",
                 "weekdays": "10:00-12:00",
@@ -238,8 +238,8 @@ def test_query_calendar_availability_respects_scheduling_profile_windows(monkeyp
     monkeypatch.setattr(settings, "calendar_provider", "mock")
     monkeypatch.setattr(
         calendar_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "_resolve_company_context",
+        lambda company_id=None: {
             "business_hours": {
                 "timezone": "America/Sao_Paulo",
                 "weekdays": "09:00-18:00",
@@ -403,8 +403,8 @@ def test_reschedule_calendar_booking_updates_existing_booking_and_provider(monke
     monkeypatch.setattr(calendar_service, "schedule_booking_customer_reminders", lambda booking: [{"id": 1}])
     monkeypatch.setattr(
         calendar_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "_resolve_company_context",
+        lambda company_id=None: {
             "business_hours": {
                 "timezone": "America/Sao_Paulo",
                 "weekdays": "09:00-18:00",

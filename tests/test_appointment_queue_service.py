@@ -1,9 +1,19 @@
+from app.core.config import settings
 from app.services import appointment_queue_service as queue_service
 from app.services import calendar_service
-from app.core.config import settings
 
 
 class FakeQueueRepository:
+    def get_contact(self, contact_id, company_id=None):
+        """O serviço confere se há para quem enviar antes de mutar (E-01).
+
+        O dublê responde que o contato existe: estes testes exercitam a
+        transição de estado da fila, não a integridade do contato. Os casos em
+        que o contato **não** existe vivem em
+        `tests/test_queue_offer_atomicity.py`, contra o banco de verdade.
+        """
+        return {"contact_id": contact_id, "company_id": company_id}
+
     def __init__(self) -> None:
         self.bookings = {
             7: {

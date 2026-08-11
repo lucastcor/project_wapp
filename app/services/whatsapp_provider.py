@@ -2,7 +2,6 @@
 
 from typing import Any
 
-
 from app.core.config import settings
 
 
@@ -33,8 +32,13 @@ class WhatsAppProvider:
             )
 
     def _build_url(self) -> str:
-        assert self.base_url is not None
-        assert self.phone_number_id is not None
+        # `assert` some com `python -O`, e o que sobraria é um f-string com
+        # `None` no meio da URL do provider: a validação viraria formatação
+        # silenciosa contra um endpoint inexistente.
+        if self.base_url is None or self.phone_number_id is None:
+            raise WhatsAppProviderError(
+                "WhatsApp provider is not fully configured: base_url and phone_number_id are required."
+            )
         return f"{self.base_url.rstrip('/')}/{self.phone_number_id}/messages"
 
     def send_message(self, contact_id: str, message: str) -> dict[str, Any]:
