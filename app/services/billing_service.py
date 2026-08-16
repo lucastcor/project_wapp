@@ -24,11 +24,14 @@ PLANS: dict[str, dict[str, Any]] = {
             "finetuning_jobs": 0,
             "handoffs": 50,
             "reminders_per_booking": 2,
+            "automation_workflows": 3,
+            "automation_executions": 2000,
         },
         "features": {
             "finetuning": False,
             "priority_support": False,
             "dedicated_support": False,
+            "automations": True,
         },
     },
     "avancado": {
@@ -44,11 +47,14 @@ PLANS: dict[str, dict[str, Any]] = {
             "finetuning_jobs": 1,
             "handoffs": 200,
             "reminders_per_booking": 3,
+            "automation_workflows": 15,
+            "automation_executions": 15000,
         },
         "features": {
             "finetuning": True,
             "priority_support": True,
             "dedicated_support": False,
+            "automations": True,
         },
     },
     "premium": {
@@ -64,11 +70,14 @@ PLANS: dict[str, dict[str, Any]] = {
             "finetuning_jobs": 5,
             "handoffs": 1000,
             "reminders_per_booking": 5,
+            "automation_workflows": 60,
+            "automation_executions": 60000,
         },
         "features": {
             "finetuning": True,
             "priority_support": True,
             "dedicated_support": True,
+            "automations": True,
         },
     },
 }
@@ -79,9 +88,12 @@ USAGE_METRICS = {
     "outbound_campaigns",
     "handoffs",
     "finetuning_jobs",
+    # Cada inscrição num fluxo consome orçamento. É a única forma honesta de
+    # cobrar automação: o custo é por execução, não por fluxo desenhado.
+    "automation_executions",
 }
 
-DEGRADED_METRICS = {"outbound_campaigns", "handoffs", "finetuning_jobs"}
+DEGRADED_METRICS = {"outbound_campaigns", "handoffs", "finetuning_jobs", "automation_executions"}
 HARD_LIMIT_METRICS = {"bookings", "outbound_campaigns", "finetuning_jobs"}
 ALERT_THRESHOLD = 0.80
 
@@ -602,6 +614,29 @@ def get_usage_dashboard(company_id: int) -> dict[str, Any]:
         "features": features,
         "alerts": alerts,
     }
+
+
+def get_plan_limits_for_company(company_id: int) -> dict[str, int]:
+    """Limites efetivos do plano vigente da empresa.
+
+    Sem assinatura, devolve os limites do plano de entrada em vez de um dicionário
+    vazio. Um dicionário vazio faria toda capability parecer ausente e tornaria o
+    produto inutilizável durante o trial, que é justamente quando a empresa
+    precisa conseguir montar o primeiro fluxo.
+
+    Assinatura sem acesso (expirada ou cancelada) devolve zeros: aí a ausência de
+    direito é real e precisa aparecer como tal.
+    """
+    subscription = repository.get_billing_subscription(company_id)
+    if not subscription:
+        return dict(PLANS["essencial"]["limits"])
+
+    has_access, _reason = _subscription_access(subscription)
+    if not has_access:
+        return dict.fromkeys(PLANS["essencial"]["limits"], 0)
+
+    plan = PLANS.get(subscription["plan_key"], PLANS["essencial"])
+    return dict(plan["limits"])
 
 
 def check_limit(company_id: int, metric: str) -> dict[str, Any]:

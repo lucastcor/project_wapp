@@ -4,6 +4,7 @@ from typing import Any
 
 from app.core.company_context import get_company_context
 from app.core.logging import get_logger, log_event, mask_identifier
+from app.services.automation_trigger_service import build_message_processed_event
 from app.services.billing_service import consume_usage
 from app.services.classification_service import classify_message
 from app.services.conversation_workflow_service import handle_conversation_workflow
@@ -210,6 +211,26 @@ def _process_contact_message(
         reply_source=reply_source,
         action=decision["action"],
         priority=decision["priority"],
+        # Outbox transacional: o fato para a automação entra no mesmo commit
+        # da mensagem, então não existe janela em que a conversa foi salva e
+        # o evento se perdeu. A automação é pós-orquestração — a resposta
+        # síncrona acima continua sendo dona do atendimento.
+        automation_event_factory=lambda new_message_id: build_message_processed_event(
+            company_id=resolved_company_id,
+            message_id=new_message_id,
+            contact_id=contact_id,
+            classification=classification,
+            confidence=confidence or 0.0,
+            action=str(decision["action"]),
+            pipeline_stage=contact.get("pipeline_stage") if contact else None,
+            customer_profile=(contact or {}).get("customer_profile"),
+            handoff_required=bool(
+                handoff_decision["should_handoff"] and not latest_customer_clarification
+            ),
+            reply_source=str(reply_source or ""),
+            has_relevant_source=bool(reply_source and reply_source != "fallback"),
+            auto_reply_sent=bool(decision["auto_reply"] and reply),
+        ),
     )
     try:
         consume_usage(

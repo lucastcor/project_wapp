@@ -754,7 +754,20 @@ class RuntimeRepository:
         priority: str | None = None,
         auto_reply: bool = False,
         company_id: int | None = None,
-    ) -> None:
+        automation_event_factory: Callable[[int], dict[str, Any] | None] | None = None,
+    ) -> int | None:
+        """Persiste a mensagem e, opcionalmente, o evento de automação.
+
+        `automation_event_factory` recebe o id da mensagem recém-criada e
+        devolve o evento canônico a gravar. Evento e mensagem entram no
+        **mesmo commit**: é isso que torna o outbox transacional, e o que
+        elimina a janela em que a mensagem está salva e o fato para a
+        automação foi perdido.
+
+        A escrita do evento acontece sob SAVEPOINT dentro de
+        `insert_event_with_outbox_on_cursor`, então uma falha ali desfaz só o
+        evento. Automação é pós-atendimento: ela nunca derruba a conversa.
+        """
         connection = get_connection()
         cursor = connection.cursor()
 
@@ -790,8 +803,60 @@ class RuntimeRepository:
             ),
         )
 
+        message_id = cursor.lastrowid
+        if automation_event_factory is not None and message_id is not None:
+            self._write_automation_event(
+                cursor,
+                company_id=company_id,
+                event_factory=automation_event_factory,
+                message_id=int(message_id),
+            )
+
         connection.commit()
         connection.close()
+        return int(message_id) if message_id is not None else None
+
+    @staticmethod
+    def _write_automation_event(
+        cursor: Any,
+        *,
+        company_id: int | None,
+        event_factory: Callable[[int], dict[str, Any] | None],
+        message_id: int,
+    ) -> None:
+        """Grava o evento de automação no cursor da transação em curso.
+
+        A **construção** do evento acontece dentro do try, e não no chamador.
+        Construir fora deixaria a exceção da factory escapar por cima desta
+        guarda e derrubaria o atendimento — que é exatamente o modo de falha
+        que o `except Exception` aqui existe para impedir. Automação é
+        pós-atendimento: ela nunca decide se a conversa acontece.
+
+        Import tardio para evitar o ciclo automation_repository -> repository.
+        """
+        if company_id is None:
+            return
+        try:
+            from app.storage.automation_repository import insert_event_with_outbox_on_cursor
+
+            event = event_factory(message_id)
+            if event is None:
+                return
+            insert_event_with_outbox_on_cursor(
+                cursor,
+                company_id=int(company_id),
+                event_key=str(event["event_key"]),
+                event_type=str(event["event_type"]),
+                schema_version=str(event["schema_version"]),
+                payload=dict(event["payload"]),
+            )
+        except Exception:
+            # Import tardio como no resto deste módulo: app.core.logging só é
+            # necessário no caminho de falha, e importá-lo no topo fecharia o
+            # ciclo com app.storage.db.
+            from app.core.logging import get_logger
+
+            get_logger(__name__).warning("automation.event.write_failed", exc_info=True)
 
     def get_messages(
         self,

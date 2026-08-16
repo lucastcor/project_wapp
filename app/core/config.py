@@ -166,5 +166,40 @@ class Settings:
     whatsapp_webhook_verify_token: str | None = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
     whatsapp_app_secret: str | None = os.getenv("WHATSAPP_APP_SECRET")
 
+    # --- Automation Studio ---
+    #
+    # O motor nasce desligado. Ativar automação é decisão de operação, não
+    # efeito colateral de um deploy que trouxe as migrations: um fluxo mal
+    # publicado que comece a executar sozinho na subida é o modo de falha que
+    # este default previne.
+    automation_engine_enabled: bool = os.getenv(
+        "AUTOMATION_ENGINE_ENABLED", "false"
+    ).lower() == "true"
+    # Teto de passos por execução. Sem ele, um grafo com ciclo — que a
+    # validação recusa, mas um bug futuro poderia deixar passar — roda para
+    # sempre consumindo worker e orçamento.
+    automation_max_steps_per_execution: int = int(
+        os.getenv("AUTOMATION_MAX_STEPS_PER_EXECUTION", "50")
+    )
+    automation_max_attempts: int = int(os.getenv("AUTOMATION_MAX_ATTEMPTS", "5"))
+    # Backoff exponencial entre tentativas, com teto.
+    automation_retry_base_seconds: int = int(os.getenv("AUTOMATION_RETRY_BASE_SECONDS", "10"))
+    automation_retry_max_seconds: int = int(os.getenv("AUTOMATION_RETRY_MAX_SECONDS", "900"))
+    # Lease de job: quanto tempo um worker segura o trabalho antes de outro
+    # poder retomá-lo. Curto demais duplica trabalho; longo demais atrasa a
+    # recuperação quando um worker morre.
+    automation_job_lease_seconds: int = int(os.getenv("AUTOMATION_JOB_LEASE_SECONDS", "120"))
+    automation_gate_lease_seconds: int = int(os.getenv("AUTOMATION_GATE_LEASE_SECONDS", "300"))
+    # Limite de tamanho do evento: o payload é persistido e relido a cada
+    # retry, então um evento gigante multiplica custo de I/O por tentativa.
+    automation_max_event_bytes: int = int(os.getenv("AUTOMATION_MAX_EVENT_BYTES", "65536"))
+    # O worker é um processo separado e também nasce desligado: ligar o
+    # motor não pode, sozinho, pôr uma máquina a executar trabalho.
+    automation_worker_enabled: bool = os.getenv(
+        "AUTOMATION_WORKER_ENABLED", "false"
+    ).lower() == "true"
+    automation_worker_poll_seconds: int = int(os.getenv("AUTOMATION_WORKER_POLL_SECONDS", "5"))
+    automation_worker_batch_size: int = int(os.getenv("AUTOMATION_WORKER_BATCH_SIZE", "10"))
+
 
 settings = Settings()

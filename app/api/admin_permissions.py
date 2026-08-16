@@ -23,6 +23,30 @@ SUPERADMIN: Final = "superadmin"
 
 # (HTTP method, route path) -> minimum required role.
 ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
+    # Automation Studio.
+    #
+    # Autoria (criar, editar, publicar, ativar) exige superadmin: publicar põe
+    # um fluxo no ar em nome da empresa. Operação do dia a dia (disparar,
+    # repetir, cancelar, decidir aprovação) exige operator, que é quem cuida
+    # do atendimento. Rodar o worker é operação de plataforma.
+    ("POST", "/admin/automations/workflows"): SUPERADMIN,
+    ("PATCH", "/admin/automations/workflows/{workflow_id}"): SUPERADMIN,
+    ("PUT", "/admin/automations/workflows/{workflow_id}/draft"): SUPERADMIN,
+    # Validar e simular são POST por causa do corpo, não por causa de
+    # efeito. Ainda assim exigem operator: a matriz mantém a invariante de
+    # que nenhuma mutação HTTP é gravável por viewer, e abrir uma exceção
+    # aqui trocaria uma regra verificável por uma lista de casos especiais.
+    # Um viewer continua lendo fluxos, execuções e aprovações.
+    ("POST", "/admin/automations/workflows/validate"): OPERATOR,
+    ("POST", "/admin/automations/workflows/simulate"): OPERATOR,
+    ("POST", "/admin/automations/workflows/{workflow_id}/publish"): SUPERADMIN,
+    ("POST", "/admin/automations/workflows/{workflow_id}/state"): SUPERADMIN,
+    ("POST", "/admin/automations/workflows/{workflow_id}/trigger"): OPERATOR,
+    ("POST", "/admin/automations/executions/{execution_id}/retry"): OPERATOR,
+    ("POST", "/admin/automations/executions/{execution_id}/cancel"): OPERATOR,
+    ("POST", "/admin/automations/approvals/{gate_id}/claim"): OPERATOR,
+    ("POST", "/admin/automations/approvals/{gate_id}/decide"): OPERATOR,
+    ("POST", "/admin/automations/worker/run-once"): SUPERADMIN,
     # Security / audit administration
     ("POST", "/admin/audit-events/cleanup"): SUPERADMIN,
     # Company and onboarding administration

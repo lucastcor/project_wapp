@@ -30,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 # Sem dimensão de empresa: catálogo estático, igual para todos os tenants.
 #
@@ -82,12 +82,19 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     # ver o relatório da Release 1, seção de riscos remanescentes.
     ("/admin/onboarding/setup", frozenset({"POST"}), POLICY_UNSCOPED),
     # --- operação da plataforma ---
+    # Rodar o worker de automação move trabalho de todas as empresas, não de
+    # uma: é operação de plataforma e exige credencial de plataforma.
+    ("/admin/automations/worker", None, POLICY_PLATFORM_GLOBAL),
     ("/admin/system/migrations", None, POLICY_PLATFORM_GLOBAL),
     ("/admin/system/profile", None, POLICY_PLATFORM_GLOBAL),
     ("/admin/system/readiness", None, POLICY_PLATFORM_GLOBAL),
     # --- tenant-scoped ---
     ("/admin/analytics", None, POLICY_TENANT),
     ("/admin/audit-events", None, POLICY_TENANT),
+    # O catálogo de nós é o mesmo para todos os tenants: é a paleta do
+    # editor, não dado de ninguém.
+    ("/admin/automations/catalog", frozenset({"GET"}), POLICY_UNSCOPED),
+    ("/admin/automations", None, POLICY_TENANT),
     ("/admin/billing", None, POLICY_TENANT),
     ("/admin/calendar", None, POLICY_TENANT),
     # Listar as próprias empresas atravessa memberships; ler ou alterar uma
@@ -232,3 +239,57 @@ def set_authorized_scope(
 
 def get_authorized_scope(request: Request) -> AuthorizedScope | None:
     return getattr(request.state, "authorized_scope", None)
+
+
+def require_authorized_company_id(request: Request) -> int:
+    """A empresa única autorizada para esta requisição.
+
+    Substitui qualquer resolução própria do handler. Nunca cai numa empresa
+    default: sem escopo resolvido a resposta é 400, e não a primeira empresa
+    ativa — que é como um handler acaba respondendo com dado de outro tenant
+    quando o chamador esquece o parâmetro.
+
+    Os dois modos de autenticação chegam aqui por caminhos diferentes:
+
+    - **sessão de identidade**: `authorized_company_id` já foi resolvido e
+      conferido contra os memberships em `admin_security`. Confiar nele é o
+      ponto do escopo centralizado;
+    - **token de break-glass**: é global e não tem membership a conferir, então
+      a empresa vem do parâmetro explícito. Continua sendo obrigatória — um
+      operador de plataforma também precisa dizer em qual empresa está
+      mexendo.
+    """
+    scope = get_authorized_scope(request)
+    if scope is not None and scope.company_id is not None:
+        return int(scope.company_id)
+
+    if scope is not None and scope.is_global:
+        raw = request.query_params.get("company_id")
+        if raw:
+            try:
+                candidate = int(raw)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid company_id.") from exc
+            if candidate > 0:
+                return candidate
+
+    raise HTTPException(
+        status_code=400,
+        detail="company_id or company_slug is required for this operation.",
+    )
+
+
+def authorize_company(request: Request, company_id: int) -> int:
+    """Autoriza um company_id vindo do corpo ou do caminho, não da query string.
+
+    A dependência de autenticação valida o `company_id` da query. Um id que
+    chega pelo corpo da requisição não passou por lá, então precisa ser
+    conferido aqui — senão o corpo vira um caminho lateral para operar noutra
+    empresa com uma sessão legítima.
+    """
+    scope = get_authorized_scope(request)
+    if scope is None:
+        raise HTTPException(status_code=403, detail="Company access denied.")
+    if not scope.allows(int(company_id)):
+        raise HTTPException(status_code=403, detail="Company access denied for this principal.")
+    return int(company_id)

@@ -57,10 +57,15 @@ jobs:
 
       - name: Run application SAST
         run: |
-          # Runtime repository SQL fragments are assembled only from validated
-          # identifiers/internal predicates and are covered by DB portability
-          # and tenant-integrity tests; Bandit's B608 cannot distinguish them.
-          bandit -q -ll -r app -x app/storage/repository.py
+          # Repository SQL fragments are assembled only from validated
+          # identifiers and internal predicates. Bandit's B608 is textual and
+          # cannot tell those apart from caller data, so the two repository
+          # modules are excluded here and covered instead by
+          # tests/test_dynamic_sql_guard.py, which proves over the AST that no
+          # interpolated expression can derive from a parameter — a stronger
+          # guarantee than the one being suppressed.
+          bandit -q -ll -r app \
+            -x app/storage/repository.py,app/storage/automation_repository.py
 
       - name: Audit dependencies
         run: pip-audit -r requirements.txt

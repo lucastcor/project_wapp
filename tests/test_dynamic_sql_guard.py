@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import pathlib
+import re
 
 import pytest
 
@@ -366,3 +367,98 @@ def test_guard_is_insensitive_to_formatting() -> None:
         verdicts.append(_expression_is_safe(expression, scope))
 
     assert verdicts == [True, True]
+
+
+# --- placeholders sem tipo (PostgreSQL IndeterminateDatatype) ---------------------
+
+
+_UNTYPED_PLACEHOLDER_PATTERNS = (
+    # `(? IS NULL OR coluna = ?)`: o primeiro `?` aparece sozinho num IS NULL,
+    # sem nada de onde o PostgreSQL inferir o tipo.
+    re.compile(r"\?\s+IS\s+(?:NOT\s+)?NULL", re.IGNORECASE),
+    # `CAST(? AS ...)` é a saída correta; `? = ?` entre dois placeholders não é.
+    re.compile(r"\?\s*=\s*\?"),
+)
+
+
+def _docstring_nodes(tree: ast.Module) -> set[int]:
+    """Ids dos literais que são docstring, e não SQL.
+
+    Uma docstring que *explica* o padrão proibido não é uma ocorrência dele.
+    Sem esta exclusão, documentar o perigo faria o guard falhar — o que
+    ensinaria a não documentá-lo.
+    """
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        body = getattr(node, "body", [])
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            ids.add(id(body[0].value))
+    return ids
+
+
+def _sql_string_literals(tree: ast.Module) -> list[tuple[int, str]]:
+    """Literais de string do módulo, exceto docstrings.
+
+    Varre a AST em vez do texto porque comentários somem: um comentário que
+    descreve o padrão proibido não é uma ocorrência dele.
+    """
+    skip = _docstring_nodes(tree)
+    found: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
+            found.append((node.lineno, node.value))
+        elif isinstance(node, ast.JoinedStr):
+            found.extend(
+                (node.lineno, part.value)
+                for part in node.values
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            )
+    return found
+
+
+def test_no_sql_uses_an_untyped_placeholder() -> None:
+    """Nenhum filtro opcional volta a usar placeholder sem tipo.
+
+    `(? IS NULL OR coluna = ?)` roda no SQLite e falha no PostgreSQL com
+    IndeterminateDatatype (SQLSTATE 42P18): o servidor recusa a query antes de
+    executá-la, porque não há de onde inferir o tipo do primeiro parâmetro.
+
+    O modo de falha é o pior possível — a suíte passa inteira no backend de
+    desenvolvimento e quebra só no de produção. Foi exatamente o que aconteceu
+    ao portar o repositório de automação: 33 testes verdes no SQLite e os
+    mesmos 33 vermelhos no PostgreSQL, sem uma linha de diferença no código.
+
+    A alternativa correta é `optional_equals()`, que devolve o predicado
+    neutro **sem parâmetro nenhum** quando não há filtro.
+    """
+    offenders: list[str] = []
+    for path in _iter_python_files():
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for lineno, literal in _sql_string_literals(tree):
+            for pattern in _UNTYPED_PLACEHOLDER_PATTERNS:
+                match = pattern.search(literal)
+                if match:
+                    offenders.append(f"{path}:{lineno}: {match.group(0)!r}")
+
+    assert offenders == [], (
+        "SQL com placeholder sem tipo (quebra no PostgreSQL); use optional_equals():\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_untyped_placeholder_guard_actually_matches() -> None:
+    """O guard reconhece o padrão que existe para proibir."""
+    tree = ast.parse('q = "SELECT 1 WHERE (? IS NULL OR status = ?)"')
+    literals = _sql_string_literals(tree)
+    assert any(
+        pattern.search(literal)
+        for _lineno, literal in literals
+        for pattern in _UNTYPED_PLACEHOLDER_PATTERNS
+    )

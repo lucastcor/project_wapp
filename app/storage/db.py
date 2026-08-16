@@ -2733,15 +2733,34 @@ MIGRATIONS: list[Migration] = [
 # O import é feito aqui, no fim do módulo, e não no topo: `schema_utils`
 # consulta `get_database_backend()`, definido neste arquivo, e um import no
 # topo fecharia o ciclo.
-from app.storage.migrations_automation import AUTOMATION_MIGRATIONS  # noqa: E402
+from app.storage.migrations_automation import (  # noqa: E402
+    AUTOMATION_ID_TABLES,
+    AUTOMATION_MIGRATIONS,
+)
 from app.storage.migrations_hardening import HARDENING_MIGRATIONS  # noqa: E402
-from app.storage.migrations_identity import IDENTITY_MIGRATIONS  # noqa: E402
-from app.storage.migrations_platform import PLATFORM_MIGRATIONS  # noqa: E402
+from app.storage.migrations_identity import (  # noqa: E402
+    IDENTITY_ID_TABLES,
+    IDENTITY_MIGRATIONS,
+)
+from app.storage.migrations_platform import (  # noqa: E402
+    PLATFORM_ID_TABLES,
+    PLATFORM_MIGRATIONS,
+)
 
 MIGRATIONS.extend(PLATFORM_MIGRATIONS)
 MIGRATIONS.extend(IDENTITY_MIGRATIONS)
 MIGRATIONS.extend(HARDENING_MIGRATIONS)
 MIGRATIONS.extend(AUTOMATION_MIGRATIONS)
+
+# Tabelas com PK autoincremental precisam de `RETURNING id` no PostgreSQL para
+# que `cursor.lastrowid` funcione — no SQLite ele vem de graça, no PostgreSQL
+# não existe. Cada módulo de migration declara as suas, e é aqui que entram no
+# registro: sem isso todo INSERT nessas tabelas devolveria `lastrowid = None`
+# no PostgreSQL e o código chamador gravaria um id nulo, ou quebraria, apenas
+# no backend de produção.
+SQLITE_ID_TABLES.update(PLATFORM_ID_TABLES)
+SQLITE_ID_TABLES.update(IDENTITY_ID_TABLES)
+SQLITE_ID_TABLES.update(AUTOMATION_ID_TABLES)
 
 
 def _assert_migration_versions_are_ordered() -> None:

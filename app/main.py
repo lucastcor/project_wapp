@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.api.admin_routes import admin_router
+from app.api.automation_routes import automation_router
 from app.api.billing_routes import billing_router
 from app.api.platform_routes import PLATFORM_ASSETS_DIR, platform_router
 from app.api.routes import router
@@ -200,6 +201,7 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestObservabilityMiddleware)
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(automation_router)
 app.include_router(billing_router)
 app.include_router(platform_router)
 app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")

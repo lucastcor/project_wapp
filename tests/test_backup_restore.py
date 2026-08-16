@@ -593,12 +593,19 @@ def test_partial_restore_does_not_delete_omitted_tables(
     tmp_path,
     monkeypatch,
 ) -> None:
+    # `billing_plans` é catálogo: não referencia empresa. A escolha é
+    # deliberada — restaurar parcialmente uma tabela tenant-scoped num banco
+    # limpo falha, e falha *corretamente*, porque o trigger de integridade de
+    # tenant recusa linhas que apontam para empresas inexistentes. Usar uma
+    # tabela sem referência prova a propriedade em questão ("o restore parcial
+    # não apaga as tabelas omitidas") sem depender de quais empresas existem no
+    # banco de origem.
     full_payload = build_backup_payload()
     partial = copy.deepcopy(full_payload)
-    partial["tables"] = {"audit_events": full_payload["tables"]["audit_events"]}
-    partial["table_counts"] = {"audit_events": len(partial["tables"]["audit_events"])}
+    partial["tables"] = {"billing_plans": full_payload["tables"]["billing_plans"]}
+    partial["table_counts"] = {"billing_plans": len(partial["tables"]["billing_plans"])}
     partial["schema_manifest"] = {
-        "audit_events": full_payload["schema_manifest"]["audit_events"]
+        "billing_plans": full_payload["schema_manifest"]["billing_plans"]
     }
     _refresh_checksum(partial)
 
