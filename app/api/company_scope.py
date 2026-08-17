@@ -27,10 +27,14 @@ antes de aparecer em produção.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from fastapi import HTTPException, Request
+
+from app.services.admin_auth_service import ADMIN_ROLE_HIERARCHY
+from app.services.identity_service import ADMIN_ROLE_MAP
 
 # Sem dimensão de empresa: catálogo estático, igual para todos os tenants.
 #
@@ -70,6 +74,10 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     ("/admin/billing/plans", frozenset({"GET"}), POLICY_UNSCOPED),
     ("/admin/onboarding/presets", frozenset({"GET"}), POLICY_UNSCOPED),
     ("/admin/calendar/providers", frozenset({"GET"}), POLICY_UNSCOPED),
+    # Taxonomia e pacotes verticais são vocabulário do produto, idênticos
+    # para todo tenant: é o que o editor usa para desenhar formulários.
+    ("/admin/taxonomy", frozenset({"GET"}), POLICY_UNSCOPED),
+    ("/admin/vertical-packs", frozenset({"GET"}), POLICY_UNSCOPED),
     # Criação de empresa. No momento da chamada ainda não existe empresa a
     # que escopar, então não há `company_id` a exigir — daí `unscoped`.
     #
@@ -97,6 +105,16 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     ("/admin/automations", None, POLICY_TENANT),
     ("/admin/billing", None, POLICY_TENANT),
     ("/admin/calendar", None, POLICY_TENANT),
+    # Plataforma multiempresa: conhecimento, datasets, avaliação, modelos e
+    # importação de conversas. Tudo aqui é dado privado da empresa.
+    ("/admin/channel-bindings", None, POLICY_TENANT),
+    ("/admin/company-config", None, POLICY_TENANT),
+    ("/admin/conversation-import", None, POLICY_TENANT),
+    ("/admin/dataset-versions", None, POLICY_TENANT),
+    ("/admin/evaluation", None, POLICY_TENANT),
+    ("/admin/knowledge", None, POLICY_TENANT),
+    ("/admin/models", None, POLICY_TENANT),
+    ("/admin/training-candidates", None, POLICY_TENANT),
     # Listar as próprias empresas atravessa memberships; ler ou alterar uma
     # delas (`/admin/companies/{id}`) cai no prefixo mais longo abaixo.
     ("/admin/companies$", frozenset({"GET"}), POLICY_TENANT_COLLECTION),
@@ -192,6 +210,29 @@ class AuthorizedScope:
     effective_role: str
     is_global: bool
     policy: str
+    # Papel por empresa, na sessão de identidade. Vazio para o token global.
+    membership_roles: Mapping[int, str] = field(default_factory=dict)
+
+    def has_role(self, required_role: str, *, company_id: int | None = None) -> bool:
+        """Se o principal alcança `required_role` **na empresa indicada**.
+
+        Sem `company_id` a resposta é sobre o papel global — o que só um token
+        de plataforma tem. Isso importa: um papel global de superadmin não pode
+        valer dentro de uma empresa onde a pessoa é apenas viewer, senão
+        rebaixar alguém no tenant não tira dele nada.
+        """
+        required = ADMIN_ROLE_HIERARCHY.get(required_role, 0)
+        if not required:
+            return False
+        if self.is_global:
+            return ADMIN_ROLE_HIERARCHY.get(self.effective_role, 0) >= required
+        if company_id is None:
+            # Sessão de identidade nunca é global.
+            return False
+        identity_role = self.membership_roles.get(int(company_id))
+        if identity_role is None:
+            return False
+        return ADMIN_ROLE_HIERARCHY.get(ADMIN_ROLE_MAP.get(identity_role, ""), 0) >= required
 
     def allows(self, company_id: int) -> bool:
         if self.is_global or self.company_ids is None:
@@ -215,6 +256,7 @@ def set_authorized_scope(
     effective_role: str,
     is_global: bool,
     policy: str,
+    membership_roles: Mapping[int, str] | None = None,
 ) -> AuthorizedScope:
     """Registra o escopo autorizado como fonte única para os handlers.
 
@@ -229,6 +271,7 @@ def set_authorized_scope(
         effective_role=effective_role,
         is_global=is_global,
         policy=policy,
+        membership_roles=dict(membership_roles or {}),
     )
     request.state.authorized_scope = scope
     # Campos planos, para o código que já lê `request.state` diretamente.

@@ -114,6 +114,19 @@ ignore = [
     "SIM105",
 ]
 
+[tool.ruff.lint.flake8-bugbear]
+# B008 proíbe chamada de função em default de argumento, porque o valor é
+# avaliado uma vez e compartilhado. No FastAPI, porém, `Body`/`Form`/`File`
+# são marcadores de declaração de parâmetro, como `Query` e `Depends` — que o
+# Ruff já isenta por padrão. Eles não produzem estado compartilhado; o que
+# produz é passar um modelo mutável como `default=`, e isso continua sendo
+# pego, porque a chamada ao modelo não está isenta.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.File",
+    "fastapi.Form",
+]
+
 [tool.ruff.lint.per-file-ignores]
 # Tests build small fakes and stubs where these rules add ceremony without
 # catching defects.

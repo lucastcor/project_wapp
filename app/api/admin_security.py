@@ -203,6 +203,7 @@ def build_require_admin_access(
                 ),
                 is_global=False,
                 policy=policy,
+                membership_roles=membership_roles,
             )
         else:
             # Token de break-glass: opera a plataforma inteira. `company_ids`

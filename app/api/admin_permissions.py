@@ -47,6 +47,41 @@ ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
     ("POST", "/admin/automations/approvals/{gate_id}/claim"): OPERATOR,
     ("POST", "/admin/automations/approvals/{gate_id}/decide"): OPERATOR,
     ("POST", "/admin/automations/worker/run-once"): SUPERADMIN,
+    # Plataforma multiempresa: conhecimento, datasets, avaliação, modelos,
+    # importação de conversas e configuração efetiva.
+    #
+    # A divisão segue quem responde pelo resultado. Curadoria e operação do
+    # dia a dia (importar conversa, revisar candidato, montar dataset, rodar
+    # avaliação, publicar documento) são operator. O que muda o que a produção
+    # usa — ativar modelo, publicar configuração, vincular canal — é
+    # superadmin: são as ações que alteram a resposta dada ao cliente final.
+    #
+    # `knowledge/search` e `evaluation/compare` são leituras que usam POST por
+    # causa do corpo. Ainda assim exigem operator: a matriz mantém a invariante
+    # de que nenhuma mutação HTTP é gravável por viewer, e trocar uma regra
+    # verificável por uma lista de exceções sai mais caro que o incômodo.
+    ("POST", "/admin/channel-bindings"): SUPERADMIN,
+    ("DELETE", "/admin/channel-bindings/{binding_id}"): SUPERADMIN,
+    ("POST", "/admin/company-config/bootstrap"): SUPERADMIN,
+    ("POST", "/admin/company-config/publish"): SUPERADMIN,
+    ("POST", "/admin/company-config/versions"): SUPERADMIN,
+    ("POST", "/admin/conversation-import"): OPERATOR,
+    ("POST", "/admin/dataset-versions"): OPERATOR,
+    ("POST", "/admin/dataset-versions/{dataset_version_id}/freeze"): OPERATOR,
+    ("POST", "/admin/dataset-versions/{dataset_version_id}/rebuild"): OPERATOR,
+    ("POST", "/admin/evaluation/cases"): OPERATOR,
+    ("POST", "/admin/evaluation/compare"): OPERATOR,
+    ("POST", "/admin/evaluation/runs"): OPERATOR,
+    ("POST", "/admin/finetuning/preflight"): OPERATOR,
+    ("POST", "/admin/knowledge/documents"): OPERATOR,
+    ("POST", "/admin/knowledge/documents/{document_id}/approve"): OPERATOR,
+    ("POST", "/admin/knowledge/documents/{document_id}/archive"): OPERATOR,
+    ("POST", "/admin/knowledge/import-legacy"): SUPERADMIN,
+    ("POST", "/admin/knowledge/search"): OPERATOR,
+    ("POST", "/admin/models"): SUPERADMIN,
+    ("POST", "/admin/models/rollback"): SUPERADMIN,
+    ("POST", "/admin/models/{model_id}/activate"): SUPERADMIN,
+    ("POST", "/admin/training-candidates/{candidate_id}/review"): OPERATOR,
     # Security / audit administration
     ("POST", "/admin/audit-events/cleanup"): SUPERADMIN,
     # Company and onboarding administration
