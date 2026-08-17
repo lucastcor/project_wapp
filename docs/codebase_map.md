@@ -15,7 +15,13 @@ Este arquivo serve como mapa rápido para manutenção. A ideia é responder dua
 | Plataforma web `/platform` | `app/platform/index.html`, `app/platform/assets/app.js`, `app/api/platform_routes.py`, `app/api/admin_routes.py` |
 | Segurança admin / sessão | `app/api/admin_security.py`, `app/services/admin_auth_service.py`, `app/services/platform_session_service.py` |
 | Fine-tuning e importação de base | `app/services/training_import_service.py`, `app/services/training_export_service.py`, `app/services/finetuning_service.py` |
-| Persistência e schema | `app/storage/repository.py`, `app/storage/db.py` |
+| Automação visual (fluxos, execução, aprovações) | `app/automations/`, `app/services/automation_*`, `app/api/automation_routes.py`, `app/tools/automation_worker.py` |
+| Editor visual (Automation Studio) | `frontend/automation-studio/`, servido em `/platform/automations` |
+| Conhecimento e recuperação (RAG) | `app/services/knowledge_retrieval_service.py`, `app/services/knowledge_document_service.py`, `app/storage/knowledge_repository.py` |
+| Dataset, avaliação e registro de modelo | `app/services/dataset_service.py`, `app/services/evaluation_service.py`, `app/services/model_registry_service.py` |
+| Proteção de PII | `app/services/pii_service.py` |
+| Escopo de empresa e política de rota | `app/api/company_scope.py`, `app/api/admin_permissions.py` |
+| Persistência e schema | `app/storage/repository.py`, `app/storage/db.py`, `app/storage/migrations_*.py` |
 | Painel Streamlit legado/apoio | `app/admin_app.py`, `app/ui/admin_api_client.py`, `app/ui/pages/*` |
 
 ## `app/`
@@ -34,7 +40,25 @@ Este arquivo serve como mapa rápido para manutenção. A ideia é responder dua
 - `app/api/admin_support.py` - utilitários da camada admin, especialmente métricas Prometheus e gravação de auditoria.
 - `app/api/platform_routes.py` - serve o frontend `/platform` e expõe login/logout/leitura da sessão web.
 - `app/api/routes.py` - API pública do bot: entrada de mensagens, webhook do WhatsApp e auto-reply outbound.
+- `app/api/automation_routes.py` - API do Automation Studio: catálogo, fluxos, rascunho, publicação, execução e aprovações.
+- `app/api/platform_admin_routes.py` - API dos subsistemas da plataforma: conhecimento, importação, dataset, avaliação, modelos e configuração da empresa.
+- `app/api/company_scope.py` - política central de escopo por empresa. Deny-by-default: caminho não declarado exige empresa.
+- `app/api/admin_permissions.py` - matriz de papéis por rota mutante. Nenhuma mutação HTTP é gravável por viewer.
 - `app/api/schemas.py` - modelos Pydantic dos payloads e respostas HTTP.
+
+### `app/automations/`
+
+Domínio puro do Automation Studio: sem I/O, sem relógio implícito, sem banco.
+
+- `domain.py` - grafo, estados, forma canônica e chaves de efeito. Posição no canvas fica fora do hash: mover um nó não cria versão.
+- `catalog.py` - catálogo de 25 nós. Fonte única lida pelo validador, pelo motor e pelo inspector do frontend.
+- `validation.py` - validação autoritativa do grafo (ciclo, alcance, alças, campos).
+- `semantics.py` - interpretação única das regras de condição e roteamento.
+- `entitlements.py` - traduz `required_capability` do nó em limite do plano contratado.
+- `engine.py` - motor durável: um passo por job, retomável.
+- `effects.py` - adapters de efeito externo, registrados no ledger de idempotência.
+- `events.py` - eventos canônicos, com payload redigido por allowlist.
+- `simulation.py` - percurso sem efeito, para o botão de simular.
 
 ### `app/core/`
 
