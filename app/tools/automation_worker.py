@@ -27,6 +27,7 @@ from app.core.config import settings
 from app.core.logging import configure_logging, get_logger, log_event
 from app.services.automation_event_service import dispatch_pending_events
 from app.services.automation_execution_service import recover_stalled_work, run_due_jobs
+from app.services.automation_scheduler_service import dispatch_scheduled_workflows
 from app.services.runtime_guard_service import validate_runtime_environment
 from app.storage import automation_repository as repo
 from app.storage.db import init_db
@@ -40,12 +41,16 @@ def run_worker_iteration(*, lease_owner: str | None = None, job_limit: int = 10)
     owner = lease_owner or repo.new_lease_owner("automation")
 
     recovered = recover_stalled_work()
+    # O scheduler vem antes do despacho para que o gatilho de agenda emitido
+    # neste ciclo já seja processado neste ciclo, e não só no seguinte.
+    scheduled = dispatch_scheduled_workflows()
     dispatched = dispatch_pending_events(limit=20, lease_owner=owner)
     executed = run_due_jobs(limit=job_limit, lease_owner=owner)
 
     return {
         "lease_owner": owner,
         "recovered": recovered,
+        "scheduled": scheduled,
         "dispatched": dispatched,
         "executed": executed,
     }
@@ -114,7 +119,11 @@ def main() -> None:
     while True:
         try:
             result = run_worker_iteration(lease_owner=owner, job_limit=int(args.job_limit))
-            if result["executed"]["processed"] or result["dispatched"]["dispatched"]:
+            if (
+                result["executed"]["processed"]
+                or result["dispatched"]["dispatched"]
+                or result["scheduled"]["emitted"]
+            ):
                 log_event(
                     logger,
                     logging.INFO,
@@ -123,6 +132,7 @@ def main() -> None:
                     enrolled=result["dispatched"]["enrolled"],
                     processed=result["executed"]["processed"],
                     recovered_jobs=result["recovered"]["recovered_jobs"],
+                    scheduled=result["scheduled"]["emitted"],
                 )
         except Exception:
             # O worker não morre por causa de um ciclo ruim: o próximo tenta

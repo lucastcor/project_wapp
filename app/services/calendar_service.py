@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from app.core.company_context import get_company_context
 from app.core.config import is_missing_or_placeholder, settings
+from app.services.automation_trigger_service import emit_appointment_booked
 from app.services.billing_service import (
     BillingLimitError,
     refund_usage_reservation,
@@ -1304,6 +1305,19 @@ def create_calendar_booking(
             raise CalendarProviderError("Booking não encontrado após criação.")
 
         scheduled_reminders = schedule_booking_customer_reminders(booking)
+        # `trigger.appointmentBooked` está na paleta do editor. Sem esta
+        # emissão, um fluxo publicado com esse gatilho nunca dispararia — o
+        # produto ofereceria um gatilho morto.
+        #
+        # Depois do commit do booking, e não dentro dele: a reserva já
+        # aconteceu, e `emit_event` é idempotente por `event_key`, então uma
+        # reentrega encontra o evento existente em vez de inscrever de novo.
+        if company_id is not None:
+            emit_appointment_booked(
+                company_id=int(company_id),
+                appointment_id=booking_id,
+                contact_id=contact_id,
+            )
         return {
             **booking,
             "provider_readiness": readiness,

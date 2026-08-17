@@ -4,7 +4,10 @@ from typing import Any
 
 from app.core.company_context import get_company_context
 from app.core.logging import get_logger, log_event, mask_identifier
-from app.services.automation_trigger_service import build_message_processed_event
+from app.services.automation_trigger_service import (
+    build_message_processed_event,
+    emit_handoff_created,
+)
 from app.services.billing_service import consume_usage
 from app.services.classification_service import classify_message
 from app.services.conversation_workflow_service import handle_conversation_workflow
@@ -197,6 +200,19 @@ def _process_contact_message(
                 company_id=resolved_company_id,
                 pending_question_id=pending_question_id,
                 question_type=handoff_decision["question_type"],
+            )
+            # `trigger.handoffCreated` está na paleta do editor: sem esta
+            # emissão, um fluxo publicado com esse gatilho nunca dispararia, e
+            # o produto anunciaria uma capacidade que não existe.
+            #
+            # Fora do outbox transacional de propósito: o handoff já foi
+            # gravado e comitado acima. `emit_event` é idempotente por
+            # `event_key`, então uma reentrega não cria uma segunda execução.
+            emit_handoff_created(
+                company_id=resolved_company_id,
+                handoff_id=pending_question_id,
+                contact_id=contact_id,
+                question_type=question_type,
             )
 
     repository.save_message(

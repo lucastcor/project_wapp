@@ -18,7 +18,7 @@ import pytest
 
 from app.automations import engine
 from app.automations.domain import EXECUTION_AWAITING_HUMAN, EXECUTION_SUCCEEDED
-from app.automations.events import EVENT_MESSAGE_PROCESSED
+from app.automations.events import EVENT_HANDOFF_CREATED, EVENT_MESSAGE_PROCESSED
 from app.core.config import settings
 from app.services import automation_approval_service as approvals
 from app.services import automation_event_service as events
@@ -397,7 +397,18 @@ def test_an_automation_failure_never_breaks_the_conversation(
 
     assert result["classification"]
     assert repository.get_messages(company_id=company_id)
-    assert repo.list_outbox_entries(company_id=company_id) == []
+
+    # O evento que falhou não foi gravado. A asserção é sobre **este** evento,
+    # e não sobre o outbox estar vazio: a mesma mensagem também dispara
+    # `handoff.created`, que é outro gatilho e funcionou. Exigir outbox vazio
+    # aqui transformaria "ligar um gatilho novo" em quebra deste teste, sem
+    # que nada tivesse regredido.
+    outbox = repo.list_outbox_entries(company_id=company_id)
+    emitted_types = {
+        repo.get_event(company_id=company_id, event_id=int(entry["event_id"]))["event_type"]
+        for entry in outbox
+    }
+    assert EVENT_MESSAGE_PROCESSED not in emitted_types
 
 
 # --- worker ---------------------------------------------------------------------------------
@@ -427,3 +438,59 @@ def test_the_worker_iteration_covers_recovery_dispatch_and_execution(
     assert result["dispatched"]["enrolled"] == 1
     assert result["executed"]["processed"] >= 1
     assert "recovered_jobs" in result["recovered"]
+
+
+# --- gatilhos ligados aos fatos do produto -------------------------------------------------
+
+
+def test_creating_a_handoff_emits_the_canonical_trigger(company_factory) -> None:
+    """`trigger.handoffCreated` dispara quando um handoff é criado.
+
+    O gatilho está na paleta do editor. Sem esta emissão o usuário publica um
+    fluxo que nunca roda, e o produto anuncia uma capacidade que não existe —
+    uma falha que nenhum teste de unidade do motor pegaria, porque o motor
+    está correto: ninguém o aciona.
+    """
+    from app.core import orchestrator
+
+    company_id = company_factory("gatilho-handoff")
+    orchestrator.process_incoming_message(
+        contact_id="trigger-contact-0001",
+        contact_name="Contato",
+        # Mensagem que força handoff: pedido fora do que o bot resolve.
+        message="Quero falar com um humano sobre um problema grave no meu pedido.",
+        company_id=company_id,
+    )
+
+    emitted = {
+        repo.get_event(company_id=company_id, event_id=int(entry["event_id"]))["event_type"]
+        for entry in repo.list_outbox_entries(company_id=company_id)
+    }
+    assert EVENT_HANDOFF_CREATED in emitted
+
+
+def test_a_trigger_emission_never_raises_into_the_caller(company_factory, monkeypatch) -> None:
+    """A emissão é pós-fato: falhar nela não pode derrubar quem a chamou.
+
+    A garantia está documentada em `emit_event`; este teste a verifica, porque
+    uma docstring não impede alguém de acrescentar um `raise` depois.
+    """
+    from app.services import automation_event_service
+    from app.services.automation_trigger_service import emit_handoff_created
+
+    company_id = company_factory("gatilho-falha")
+
+    def _explode(**kwargs):
+        raise RuntimeError("outbox indisponível")
+
+    monkeypatch.setattr(automation_event_service.repo, "record_event_with_outbox", _explode)
+
+    result = emit_handoff_created(
+        company_id=company_id,
+        handoff_id=1,
+        contact_id="trigger-contact-0002",
+        question_type="duvida_geral",
+    )
+
+    assert result["emitted"] is False
+    assert result["reason"]

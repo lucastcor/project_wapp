@@ -597,6 +597,38 @@ def list_active_deployments_for_trigger(
     )
 
 
+def list_active_deployments_for_trigger_globally(
+    *,
+    trigger_type: str,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    """Deployments ativos de **todas** as empresas para um gatilho.
+
+    Existe para o scheduler, que é global pela mesma razão que o worker: ele
+    percorre a fila sem filtrar empresa, e o isolamento vem do `company_id`
+    que acompanha cada linha e é usado imediatamente a seguir. A alternativa
+    — iterar empresa por empresa — faria o custo do scheduler crescer com a
+    carteira mesmo quando quase nenhuma tem fluxo agendado.
+
+    Junta a versão para trazer o grafo: a cadência está na configuração do nó
+    de gatilho, e sem ela o scheduler não sabe qual janela avaliar.
+    """
+    return fetch_all(
+        """
+        SELECT d.id, d.company_id, d.workflow_id, d.version_id, d.trigger_type,
+               d.state, v.graph_json
+        FROM automation_deployments AS d
+        JOIN automation_workflow_versions AS v
+          ON v.id = d.version_id AND v.company_id = d.company_id
+        WHERE d.trigger_type = ?
+          AND d.state = 'active'
+        ORDER BY d.company_id ASC, d.workflow_id ASC
+        LIMIT ?
+        """,
+        (trigger_type, limit),
+    )
+
+
 # --- eventos e outbox -------------------------------------------------------------------
 
 
