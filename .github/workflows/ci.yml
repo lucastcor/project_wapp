@@ -14,6 +14,42 @@ env:
   CI_POSTGRES_DB: wapp_ci
 
 jobs:
+  studio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: frontend/automation-studio
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/automation-studio/package-lock.json
+
+      # `npm ci` e não `npm install`: falha se o lockfile divergir do
+      # package.json, em vez de reescrever o lockfile silenciosamente no CI.
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      # A build é gate, não artefato: o backend serve o bundle na mesma
+      # origem, e um Studio que não compila é um deploy que sobe sem editor.
+      - name: Build
+        run: npm run build
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -161,7 +197,7 @@ jobs:
             -q --tb=short
 
   docker:
-    needs: [test, test-postgres]
+    needs: [test, test-postgres, studio]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

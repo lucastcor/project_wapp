@@ -97,6 +97,9 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     ("/admin/system/profile", None, POLICY_PLATFORM_GLOBAL),
     ("/admin/system/readiness", None, POLICY_PLATFORM_GLOBAL),
     # --- tenant-scoped ---
+    # Introspecção do próprio escopo: passa pela mesma resolução das demais
+    # rotas tenant, porque é justamente isso que ela precisa reportar.
+    ("/admin/access/scope", None, POLICY_TENANT),
     ("/admin/analytics", None, POLICY_TENANT),
     ("/admin/audit-events", None, POLICY_TENANT),
     # O catálogo de nós é o mesmo para todos os tenants: é a paleta do

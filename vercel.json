@@ -1,10 +1,12 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
+  "installCommand": "npm --prefix frontend/automation-studio ci --no-audit --no-fund",
+  "buildCommand": "npm --prefix frontend/automation-studio run build",
   "functions": {
     "app/index.py": {
       "maxDuration": 300,
-      "excludeFiles": "{tests/**,docs/**,.venv/**,.pytest_cache/**,.mypy_cache/**,.ruff_cache/**,app/ui/**,app/admin_app.py,project_wapp_documentacao_oficial.docx,requirements-admin*,requirements-dev*}"
+      "excludeFiles": "{tests/**,docs/**,.venv/**,.pytest_cache/**,.mypy_cache/**,.ruff_cache/**,app/ui/**,app/admin_app.py,project_wapp_documentacao_oficial.docx,requirements-admin*,requirements-dev*,frontend/**}"
     }
   }
 }

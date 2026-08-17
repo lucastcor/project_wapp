@@ -30,3 +30,10 @@ backups/
 !.env.example
 __pycache__/
 *.pyc
+
+# Frontend do Automation Studio
+node_modules/
+# Saída do build do Studio: artefato, gerado por `npm run build` no deploy.
+# Versioná-lo faria toda alteração de frontend aparecer como um diff binário
+# gigante e permitiria que o bundle divergisse do código-fonte sem ninguém ver.
+app/platform/automations/

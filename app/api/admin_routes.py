@@ -9,6 +9,7 @@ from app.api.admin_security import (
     build_require_admin_role,
 )
 from app.api.admin_support import build_prometheus_metrics, record_audit_event
+from app.api.company_scope import get_authorized_scope
 from app.api.schemas import (
     AppointmentBookingCancellationPayload,
     AppointmentBookingPayload,
@@ -220,6 +221,35 @@ admin_router = APIRouter(
 @admin_router.get("/state")
 def read_state(company_id: int | None = Query(default=None)) -> dict:
     return repository.get_state() if company_id is None else repository.get_state(company_id=company_id)
+
+
+@admin_router.get("/access/scope")
+def read_access_scope(request: Request) -> dict:
+    """Escopo que a plataforma resolveu para esta credencial.
+
+    Introspecção honesta do que a autorização decidiu: qual empresa ficou
+    ativa, quais estão ao alcance e por qual modo a identidade foi obtida.
+
+    O cliente usa isto para montar o seletor de empresa sem adivinhar — sem
+    esta rota, o frontend teria de inferir o escopo a partir de quais chamadas
+    falham, o que é exatamente como uma UI acaba mostrando dados de uma empresa
+    sob o rótulo de outra.
+    """
+    scope = get_authorized_scope(request)
+    company_ids = getattr(request.state, "admin_company_ids", None)
+    return {
+        "actor": getattr(request.state, "admin_actor", None),
+        "user_id": getattr(request.state, "admin_user_id", None),
+        "email": getattr(request.state, "admin_email", None),
+        "role": getattr(request.state, "admin_role", None),
+        "identity_role": getattr(request.state, "admin_identity_role", None),
+        "auth_mode": getattr(request.state, "admin_auth_mode", None),
+        "is_global": bool(scope.is_global) if scope is not None else False,
+        "authorized_company_id": scope.company_id if scope is not None else None,
+        # `None` significa "sem restrição" (token de plataforma), e é
+        # diferente de lista vazia, que é "nenhuma empresa ao alcance".
+        "authorized_company_ids": sorted(company_ids) if company_ids is not None else None,
+    }
 
 
 @admin_router.get("/observability/summary")

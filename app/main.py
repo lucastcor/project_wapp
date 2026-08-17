@@ -13,7 +13,11 @@ from app.api.admin_routes import admin_router
 from app.api.automation_routes import automation_router
 from app.api.billing_routes import billing_router
 from app.api.platform_admin_routes import platform_admin_router
-from app.api.platform_routes import PLATFORM_ASSETS_DIR, platform_router
+from app.api.platform_routes import (
+    AUTOMATION_STUDIO_DIR,
+    PLATFORM_ASSETS_DIR,
+    platform_router,
+)
 from app.api.routes import router
 from app.core.config import is_missing_or_placeholder, settings
 from app.core.logging import (
@@ -23,6 +27,7 @@ from app.core.logging import (
     log_event,
     set_request_context,
 )
+from app.core.tenancy import TenantScopeError
 from app.services.rate_limit_service import (
     build_rate_limit_headers,
     evaluate_rate_limit,
@@ -207,6 +212,32 @@ app.include_router(platform_admin_router)
 app.include_router(billing_router)
 app.include_router(platform_router)
 app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")
+
+# O bundle do Automation Studio é servido pelo mesmo host da API, e não de um
+# domínio próprio: assim o cookie de sessão canônico (HttpOnly, SameSite) e o
+# CSRF valem sem CORS nem um segundo mecanismo de autenticação para o editor.
+#
+# O mount é condicional porque o bundle é produto de um passo de build. Montar
+# um diretório ausente levanta na importação e derrubaria a API inteira por
+# causa do frontend — o backend tem de subir mesmo sem Studio compilado.
+if AUTOMATION_STUDIO_DIR.is_dir():
+    app.mount(
+        "/platform/automations",
+        StaticFiles(directory=str(AUTOMATION_STUDIO_DIR), html=True),
+        name="automation-studio",
+    )
+
+
+@app.exception_handler(TenantScopeError)
+async def tenant_scope_error_handler(_request: Request, exc: TenantScopeError) -> JSONResponse:
+    """Empresa ausente ou inválida numa borda interna é **400**, não 500.
+
+    `TenantScopeError` significa que o chamador não informou empresa, ou
+    informou uma inválida — erro do cliente. Sem este handler ele sobe como
+    exceção não tratada e vira 500, o que faz um erro de uso parecer falha do
+    servidor em alerta e em log.
+    """
+    return JSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 @app.exception_handler(Exception)

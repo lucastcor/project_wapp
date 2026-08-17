@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from starlette.responses import StreamingResponse
 
 from app.api.schemas import (
@@ -54,6 +54,11 @@ from app.services.transactional_email_service import (
 
 PLATFORM_DIR = Path(__file__).resolve().parent.parent / "platform"
 PLATFORM_ASSETS_DIR = PLATFORM_DIR / "assets"
+# Saída do build do Automation Studio (`frontend/automation-studio`, Vite).
+# Fica ao lado dos assets da plataforma porque é servido pelo mesmo host: o
+# editor usa o cookie de sessão canônico, e um domínio separado exigiria
+# CORS e um segundo mecanismo de autenticação só para ele.
+AUTOMATION_STUDIO_DIR = PLATFORM_ASSETS_DIR.parent / "automations"
 
 platform_router = APIRouter(include_in_schema=False)
 logger = get_logger(__name__)
@@ -110,6 +115,46 @@ def read_platform_shell() -> FileResponse:
 @platform_router.get("/platform/")
 def read_platform_shell_with_slash() -> RedirectResponse:
     return RedirectResponse(url="/platform")
+
+
+def automation_studio_is_built() -> bool:
+    return (AUTOMATION_STUDIO_DIR / "index.html").is_file()
+
+
+@platform_router.get("/platform/automations", response_model=None)
+def read_automation_studio_shell() -> FileResponse | HTMLResponse:
+    """Casca do Automation Studio.
+
+    Sem o bundle construído, responde 503 com a instrução de build em vez de
+    404. A causa é a build ausente, e um 404 apontaria para o lugar errado —
+    quem visse pensaria em rota faltando, não em passo de deploy não executado.
+    """
+    if not automation_studio_is_built():
+        return HTMLResponse(
+            """
+            <!doctype html>
+            <html lang="pt-BR"><head><meta charset="utf-8">
+            <title>Automation Studio - build ausente</title></head>
+            <body style="font-family:system-ui;background:#07100f;color:#f3f7fa;padding:40px">
+              <h1 style="font-size:20px">Automation Studio nao foi construido</h1>
+              <p style="color:#aebcc6;max-width:60ch;line-height:1.5">
+                O bundle ainda nao existe em <code>app/platform/automations</code>.
+                Gere-o com:
+              </p>
+              <pre style="background:#101b21;padding:12px;border-radius:10px">cd frontend/automation-studio
+npm ci
+npm run build</pre>
+              <p><a href="/platform" style="color:#1fd2bd">Voltar para a plataforma</a></p>
+            </body></html>
+            """,
+            status_code=503,
+        )
+    return FileResponse(AUTOMATION_STUDIO_DIR / "index.html")
+
+
+@platform_router.get("/platform/automations/")
+def read_automation_studio_shell_with_slash() -> RedirectResponse:
+    return RedirectResponse(url="/platform/automations")
 
 
 @platform_router.post("/platform/auth/session", response_model=PlatformSessionResponse)

@@ -1,0 +1,13 @@
+# O código-fonte do Studio é necessário no build (installCommand/buildCommand),
+# mas `node_modules` é reinstalado lá e não deve subir: são centenas de MB que
+# atrasam o upload sem serem usados.
+frontend/automation-studio/node_modules
+
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+backups
+*.db
+*.sqlite3
