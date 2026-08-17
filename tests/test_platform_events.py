@@ -33,7 +33,20 @@ def _expired_session_cookie(role: str = "superadmin") -> str:
     return _encode(payload)
 
 
-def _drain(subscription) -> list[dict]:
+def _drain(subscription, *, timeout: float = 0.0) -> list[dict]:
+    """Eventos entregues à assinatura, esperando até `timeout` pelo primeiro.
+
+    A espera existe porque a entrega não é síncrona em todo transporte. Com
+    `REDIS_URL` configurado, `broadcast_event` publica no Redis e o próprio
+    instance recebe de volta pelo listener — é isso que dá fan-out entre
+    réplicas sem entregar duas vezes. Drenar imediatamente só funciona no
+    caminho em memória, e um teste que assume isso passa na máquina do
+    desenvolvedor e falha no ambiente que se parece com produção.
+    """
+    deadline = time.monotonic() + timeout
+    while subscription.queue.empty() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
     events: list[dict] = []
     while not subscription.queue.empty():
         events.append(json.loads(subscription.queue.get_nowait()))
@@ -270,7 +283,7 @@ def test_broadcast_event_helper_forwards_company_scope() -> None:
     subscription = hub.subscribe([11])
     try:
         broadcast_event("new_message", {"classification": "faq"}, company_id=11)
-        delivered = _drain(subscription)
+        delivered = _drain(subscription, timeout=3.0)
     finally:
         hub.unsubscribe(subscription)
 

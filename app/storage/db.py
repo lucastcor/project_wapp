@@ -2746,11 +2746,17 @@ from app.storage.migrations_platform import (  # noqa: E402
     PLATFORM_ID_TABLES,
     PLATFORM_MIGRATIONS,
 )
+from app.storage.migrations_tenant_integrity import (  # noqa: E402
+    TENANT_INTEGRITY_MIGRATIONS,
+)
 
 MIGRATIONS.extend(PLATFORM_MIGRATIONS)
 MIGRATIONS.extend(IDENTITY_MIGRATIONS)
 MIGRATIONS.extend(HARDENING_MIGRATIONS)
 MIGRATIONS.extend(AUTOMATION_MIGRATIONS)
+# Por último: a guarda de integridade precisa que todas as tabelas já
+# existam para poder referenciá-las.
+MIGRATIONS.extend(TENANT_INTEGRITY_MIGRATIONS)
 
 # Tabelas com PK autoincremental precisam de `RETURNING id` no PostgreSQL para
 # que `cursor.lastrowid` funcione — no SQLite ele vem de graça, no PostgreSQL
