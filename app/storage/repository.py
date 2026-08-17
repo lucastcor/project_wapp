@@ -8,6 +8,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from app.core.tenancy import require_company_id
 from app.storage.db import (
     connection_scope,
     db_session,
@@ -1587,59 +1588,55 @@ class RuntimeRepository:
         limit: int = 10,
         company_id: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Conhecimento aplicável à empresa, opcionalmente restrito a um contato.
+
+        `company_id` é obrigatório. Era opcional, e o valor ausente virava
+        "sem filtro" — de modo que um chamador que esquecesse o parâmetro
+        recebia o conhecimento de todas as empresas sem nenhum sinal de erro.
+
+        O filtro de empresa envolve o predicado inteiro. Antes o ramo com
+        contato era `(applies_globally = 1 AND company_id = ?) OR contact_id = ?`,
+        e o `OR` escapava do escopo: `contact_id` é o telefone do cliente, o
+        mesmo telefone pode ser contato de duas empresas, e o conhecimento
+        registrado por uma aparecia para a outra.
+        """
+        resolved_company_id = require_company_id(
+            company_id, context="knowledge entry retrieval"
+        )
         connection = get_connection()
         cursor = connection.cursor()
 
-        if contact_id:
-            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-            cursor.execute(
-                f"""
-                SELECT
-                    id,
-                    source_question_id,
-                    contact_id,
-                    company_id,
-                    title,
-                    content,
-                    knowledge_type,
-                    applies_globally,
-                    status,
-                    created_at
-                FROM knowledge_entries
-                WHERE status = 'active'
-                  AND (
-                        (applies_globally = 1 AND {company_id_condition})
-                        OR contact_id = ?
-                      )
-                ORDER BY applies_globally DESC, id DESC
-                LIMIT ?
-                """,
-                (*company_id_params, contact_id, limit),
-            )
-        else:
-            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-            cursor.execute(
-                f"""
-                SELECT
-                    id,
-                    source_question_id,
-                    contact_id,
-                    company_id,
-                    title,
-                    content,
-                    knowledge_type,
-                    applies_globally,
-                    status,
-                    created_at
-                FROM knowledge_entries
-                WHERE status = 'active'
-                  AND applies_globally = 1
-                  AND {company_id_condition}
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (*company_id_params, limit),
-            )
+        # Dentro da empresa: o que vale para todos os contatos, mais o que foi
+        # registrado especificamente para este.
+        contact_condition, contact_params = _optional_equals("contact_id", contact_id)
+        scope_predicate = (
+            f"(applies_globally = 1 OR {contact_condition})"
+            if contact_id
+            else "applies_globally = 1"
+        )
+
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                source_question_id,
+                contact_id,
+                company_id,
+                title,
+                content,
+                knowledge_type,
+                applies_globally,
+                status,
+                created_at
+            FROM knowledge_entries
+            WHERE status = 'active'
+              AND company_id = ?
+              AND {scope_predicate}
+            ORDER BY applies_globally DESC, id DESC
+            LIMIT ?
+            """,
+            (resolved_company_id, *contact_params, limit),
+        )
 
         rows = cursor.fetchall()
         connection.close()
@@ -1657,7 +1654,32 @@ class RuntimeRepository:
         used_for_training: bool = False,
         active: bool = True,
         company_id: int | None = None,
+        customer_profile: str | None = None,
+        approval_status: str = "approved",
+        # `source_type` é NOT NULL com default 'manual' no esquema. Passar
+        # None explicitamente anula o default do banco e viola a constraint,
+        # então o default vive aqui também.
+        source_type: str = "manual",
+        source_reference: str | None = None,
+        source_group_key: str | None = None,
+        conversation_context: list[dict[str, Any]] | None = None,
+        source_batch_id: int | None = None,
+        source_conversation_id: int | None = None,
+        source_candidate_id: int | None = None,
+        approved_by: str | None = None,
+        pii_scrubbed: bool = False,
     ) -> int:
+        """Cria um exemplo de estilo, com linhagem até a conversa de origem.
+
+        Os campos de linhagem (migrations 049 e 053) existem para que um
+        exemplo aprovado possa ser rastreado de volta ao lote, à conversa e ao
+        candidato que o originou. Sem isso, descobrir que uma conversa foi
+        importada errada não permite achar o que ela contaminou no dataset.
+
+        `source_group_key` é o agrupamento estruturado. Antes esse papel era
+        cumprido por `source_reference`, uma string sobrecarregada que servia
+        de identificador e de agrupador ao mesmo tempo.
+        """
         connection = get_connection()
         cursor = connection.cursor()
 
@@ -1667,25 +1689,49 @@ class RuntimeRepository:
                 company_id,
                 profile_name,
                 scenario_type,
+                customer_profile,
                 customer_message,
                 approved_reply,
                 style_notes,
                 quality_score,
                 used_for_training,
-                active
+                active,
+                approval_status,
+                source_type,
+                source_reference,
+                source_group_key,
+                conversation_context_json,
+                source_batch_id,
+                source_conversation_id,
+                source_candidate_id,
+                approved_by,
+                approved_at,
+                pii_scrubbed
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 company_id,
                 profile_name,
                 scenario_type,
+                customer_profile,
                 customer_message,
                 approved_reply,
                 style_notes,
                 quality_score,
                 int(used_for_training),
                 int(active),
+                approval_status,
+                source_type,
+                source_reference,
+                source_group_key,
+                json.dumps(conversation_context or [], ensure_ascii=False),
+                source_batch_id,
+                source_conversation_id,
+                source_candidate_id,
+                approved_by,
+                datetime.now(UTC).isoformat() if approved_by else None,
+                int(pii_scrubbed),
             ),
         )
 
@@ -1694,6 +1740,37 @@ class RuntimeRepository:
         connection.close()
 
         return int(message_example_id)
+
+    def get_message_example_by_candidate(
+        self,
+        *,
+        company_id: int,
+        source_candidate_id: int,
+    ) -> dict[str, Any] | None:
+        """O exemplo promovido a partir deste candidato, se já houver.
+
+        Sustenta a idempotência da aprovação: aprovar o mesmo candidato duas
+        vezes devolve o exemplo existente em vez de criar um segundo. O índice
+        único `idx_message_examples_source_candidate` garante a invariante no
+        banco; esta leitura evita chegar a violá-la.
+        """
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, company_id, profile_name, scenario_type, customer_profile,
+                   customer_message, approved_reply, style_notes, quality_score,
+                   used_for_training, active, approval_status, source_candidate_id,
+                   created_at
+            FROM message_examples
+            WHERE company_id = ? AND source_candidate_id = ?
+            LIMIT 1
+            """,
+            (int(company_id), int(source_candidate_id)),
+        )
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
 
     def get_message_examples(
         self,
@@ -1772,110 +1849,63 @@ class RuntimeRepository:
         scenario_type: str | None = None,
         limit: int = 5,
         company_id: int | None = None,
+        customer_profile: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Exemplos de estilo relevantes, filtrados pelas dimensões informadas.
+
+        Era uma cadeia de quatro ramos com a mesma query repetida, uma por
+        combinação de filtros — e acrescentar `customer_profile` teria dobrado
+        os ramos para oito. Cada filtro opcional agora vira uma condição
+        neutra quando ausente, via `_optional_equals`, então a query é uma só
+        e uma dimensão nova custa uma linha.
+
+        `approval_status` entra no filtro porque exemplo reprovado não deve
+        virar few-shot: a coluna nasceu com default `approved` na migration
+        049, então linhas anteriores continuam elegíveis.
+        """
         connection = get_connection()
         cursor = connection.cursor()
 
-        if profile_name and scenario_type:
-            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-            cursor.execute(
-                f"""
-                SELECT
-                    id,
-                    company_id,
-                    profile_name,
-                    scenario_type,
-                    customer_message,
-                    approved_reply,
-                    style_notes,
-                    quality_score,
-                    used_for_training,
-                    active,
-                    created_at
-                FROM message_examples
-                WHERE active = 1
-                  AND {company_id_condition}
-                  AND profile_name = ?
-                  AND scenario_type = ?
-                ORDER BY quality_score DESC, id DESC
-                LIMIT ?
-                """,
-                (*company_id_params, profile_name, scenario_type, limit),
-            )
-        elif profile_name:
-            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-            cursor.execute(
-                f"""
-                SELECT
-                    id,
-                    company_id,
-                    profile_name,
-                    scenario_type,
-                    customer_message,
-                    approved_reply,
-                    style_notes,
-                    quality_score,
-                    used_for_training,
-                    active,
-                    created_at
-                FROM message_examples
-                WHERE active = 1
-                  AND {company_id_condition}
-                  AND profile_name = ?
-                ORDER BY quality_score DESC, id DESC
-                LIMIT ?
-                """,
-                (*company_id_params, profile_name, limit),
-            )
-        elif scenario_type:
-            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-            cursor.execute(
-                f"""
-                SELECT
-                    id,
-                    company_id,
-                    profile_name,
-                    scenario_type,
-                    customer_message,
-                    approved_reply,
-                    style_notes,
-                    quality_score,
-                    used_for_training,
-                    active,
-                    created_at
-                FROM message_examples
-                WHERE active = 1
-                  AND {company_id_condition}
-                  AND scenario_type = ?
-                ORDER BY quality_score DESC, id DESC
-                LIMIT ?
-                """,
-                (*company_id_params, scenario_type, limit),
-            )
-        else:
-            company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-            cursor.execute(
-                f"""
-                SELECT
-                    id,
-                    company_id,
-                    profile_name,
-                    scenario_type,
-                    customer_message,
-                    approved_reply,
-                    style_notes,
-                    quality_score,
-                    used_for_training,
-                    active,
-                    created_at
-                FROM message_examples
-                WHERE active = 1
-                  AND {company_id_condition}
-                ORDER BY quality_score DESC, id DESC
-                LIMIT ?
-                """,
-                (*company_id_params, limit),
-            )
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        profile_condition, profile_params = _optional_equals("profile_name", profile_name)
+        scenario_condition, scenario_params = _optional_equals("scenario_type", scenario_type)
+        customer_condition, customer_params = _optional_equals(
+            "customer_profile", customer_profile
+        )
+
+        cursor.execute(
+            f"""
+            SELECT
+                id,
+                company_id,
+                profile_name,
+                scenario_type,
+                customer_profile,
+                customer_message,
+                approved_reply,
+                style_notes,
+                quality_score,
+                used_for_training,
+                active,
+                created_at
+            FROM message_examples
+            WHERE active = 1
+              AND approval_status = 'approved'
+              AND {company_id_condition}
+              AND {profile_condition}
+              AND {scenario_condition}
+              AND {customer_condition}
+            ORDER BY quality_score DESC, id DESC
+            LIMIT ?
+            """,
+            (
+                *company_id_params,
+                *profile_params,
+                *scenario_params,
+                *customer_params,
+                limit,
+            ),
+        )
 
         rows = cursor.fetchall()
         connection.close()

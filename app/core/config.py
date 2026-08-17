@@ -166,6 +166,74 @@ class Settings:
     whatsapp_webhook_verify_token: str | None = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
     whatsapp_app_secret: str | None = os.getenv("WHATSAPP_APP_SECRET")
 
+    # --- Recuperação de conhecimento (RAG) ---
+    #
+    # O RAG funciona sem provider de embeddings: a busca lexical é
+    # determinística e roda igual em SQLite e PostgreSQL. Vetorial é uma
+    # extensão opcional, não um pré-requisito — exigir provider externo para
+    # responder com a base da empresa acoplaria o atendimento a um serviço que
+    # pode estar fora do ar.
+    knowledge_retrieval_enabled: bool = os.getenv(
+        "KNOWLEDGE_RETRIEVAL_ENABLED", "true"
+    ).lower() == "true"
+    knowledge_max_chunks: int = int(os.getenv("KNOWLEDGE_MAX_CHUNKS", "6"))
+    # Piso de relevância. Abaixo dele a fonte não entra no prompt e a resposta
+    # sinaliza ausência de fonte, em vez de inventar a partir de ruído.
+    knowledge_min_score: float = float(os.getenv("KNOWLEDGE_MIN_SCORE", "0.05"))
+    embeddings_provider: str = os.getenv("EMBEDDINGS_PROVIDER", "none")
+    embeddings_model: str = os.getenv("EMBEDDINGS_MODEL", "text-embedding-3-small")
+    enable_vector_search: bool = os.getenv("ENABLE_VECTOR_SEARCH", "false").lower() == "true"
+    # Distância de Levenshtein abaixo da qual dois textos contam como o mesmo
+    # exemplo. Deduplicar importa para treino: exemplo repetido vira peso
+    # duplicado, não sinal novo.
+    near_duplicate_max_distance: int = int(os.getenv("NEAR_DUPLICATE_MAX_DISTANCE", "4"))
+
+    # --- Importação de conversas ---
+    import_max_bytes: int = int(os.getenv("IMPORT_MAX_BYTES", "5242880"))
+    import_max_messages_per_batch: int = int(
+        os.getenv("IMPORT_MAX_MESSAGES_PER_BATCH", "20000")
+    )
+    # Silêncio maior que isto encerra a sessão: é o que separa duas conversas
+    # do mesmo contato em vez de fundi-las num diálogo que nunca existiu.
+    import_session_gap_minutes: int = int(os.getenv("IMPORT_SESSION_GAP_MINUTES", "360"))
+    import_max_context_turns: int = int(os.getenv("IMPORT_MAX_CONTEXT_TURNS", "6"))
+    import_max_context_chars: int = int(os.getenv("IMPORT_MAX_CONTEXT_CHARS", "2000"))
+
+    # --- Prontidão de fine-tuning ---
+    #
+    # Os pisos existem para recusar treino que não pode dar certo: poucos
+    # exemplos, poucos cenários ou cenários desbalanceados produzem um modelo
+    # pior que o base, e o custo do job é pago de qualquer forma.
+    finetuning_min_examples: int = int(os.getenv("FINETUNING_MIN_EXAMPLES", "50"))
+    finetuning_min_scenarios: int = int(os.getenv("FINETUNING_MIN_SCENARIOS", "3"))
+    finetuning_min_examples_per_scenario: int = int(
+        os.getenv("FINETUNING_MIN_EXAMPLES_PER_SCENARIO", "5")
+    )
+    finetuning_min_eval_pass_rate: float = float(
+        os.getenv("FINETUNING_MIN_EVAL_PASS_RATE", "0.7")
+    )
+    # Avaliação real chama o modelo; simulada não. Uma execução simulada nunca
+    # pode habilitar promoção — é o que `promotion_eligible` registra.
+    enable_real_model_evaluation: bool = os.getenv(
+        "ENABLE_REAL_MODEL_EVALUATION", "false"
+    ).lower() == "true"
+    # Válvula de escape para promover sem passar no portão. Existe porque
+    # emergência acontece, e nasce desligada porque promover às cegas é
+    # exatamente o que o portão previne.
+    allow_promotion_gate_override: bool = os.getenv(
+        "ALLOW_PROMOTION_GATE_OVERRIDE", "false"
+    ).lower() == "true"
+
+    # --- Proteção de PII ---
+    #
+    # A chave de pseudonimização é o que torna o pseudônimo irreversível: sem
+    # ela, um pseudônimo derivado só do valor é recuperável por enumeração —
+    # basta calcular o hash de todos os CPFs possíveis. Por isso
+    # `resolve_pseudonymization_key()` exige a chave em produção e só aceita
+    # fallback fora dela.
+    pii_pseudonymization_key: str | None = os.getenv("PII_PSEUDONYMIZATION_KEY")
+    pii_pseudonymization_key_version: str = os.getenv("PII_PSEUDONYMIZATION_KEY_VERSION", "v1")
+
     # --- Automation Studio ---
     #
     # O motor nasce desligado. Ativar automação é decisão de operação, não
@@ -200,6 +268,16 @@ class Settings:
     ).lower() == "true"
     automation_worker_poll_seconds: int = int(os.getenv("AUTOMATION_WORKER_POLL_SECONDS", "5"))
     automation_worker_batch_size: int = int(os.getenv("AUTOMATION_WORKER_BATCH_SIZE", "10"))
+
+
+def is_production_like() -> bool:
+    """Ambiente onde fallback permissivo é proibido.
+
+    `strict_runtime_validation` entra junto de propósito: staging que roda com
+    validação estrita quer o mesmo rigor de produção, e descobrir uma chave
+    ausente em staging é muito mais barato do que descobri-la em produção.
+    """
+    return settings.environment.strip().lower() == "production" or settings.strict_runtime_validation
 
 
 settings = Settings()

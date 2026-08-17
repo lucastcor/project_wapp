@@ -64,8 +64,7 @@ jobs:
           # tests/test_dynamic_sql_guard.py, which proves over the AST that no
           # interpolated expression can derive from a parameter — a stronger
           # guarantee than the one being suppressed.
-          bandit -q -ll -r app \
-            -x app/storage/repository.py,app/storage/automation_repository.py
+          bandit -q -ll -r app -x app/storage
 
       - name: Audit dependencies
         run: pip-audit -r requirements.txt

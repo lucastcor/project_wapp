@@ -516,3 +516,29 @@ def bootstrap_company_contexts() -> dict[str, Any]:
 
     with db_transaction() as connection:
         return import_seed_contexts_with_cursor(connection.cursor())
+
+
+# --- superfície pública usada pela configuração efetiva da empresa ---------------
+#
+# Wrappers finos sobre os helpers privados acima. Existem para que
+# `company_config_service` não dependa de nomes privados deste módulo — um
+# import de `_validate_company_context` de fora amarraria os dois arquivos e
+# faria qualquer renomeação interna virar mudança de contrato.
+
+
+def validate_company_context(data: dict[str, Any]) -> None:
+    """Valida a forma de um contexto de empresa, levantando em caso de erro."""
+    _validate_company_context(data)
+
+
+def get_seed_company_context(company_slug: str | None = None) -> dict[str, Any] | None:
+    """Contexto de bootstrap em arquivo, se houver.
+
+    Seed é ponto de partida, não fonte mutável: depois de importado para o
+    banco, quem manda é a versão publicada em `company_context_versions`.
+    """
+    return _read_seed_context(company_slug)
+
+
+def has_seed_company_context(company_slug: str | None = None) -> bool:
+    return _read_seed_context(company_slug) is not None

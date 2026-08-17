@@ -3,6 +3,21 @@ from app.services import reply_services
 from app.services.reply_services import generate_business_reply
 
 
+def _company_id() -> int:
+    """Empresa real para as chamadas de geração de resposta.
+
+    `generate_business_reply` recupera conhecimento e exemplos de estilo, e
+    ambos passaram a exigir `company_id`: sem ele, a recuperação devolveria o
+    conteúdo de todas as empresas. Os testes aqui verificam a geração da
+    resposta, não o escopo — então usam uma empresa de verdade, como o
+    orquestrador faz.
+    """
+    from app.storage.repository import RuntimeRepository
+
+    return RuntimeRepository().ensure_default_company()
+
+
+
 def test_reply_service_fallback_for_lead(monkeypatch) -> None:
     monkeypatch.setattr(settings, "classification_provider", "mock")
 
@@ -13,6 +28,7 @@ def test_reply_service_fallback_for_lead(monkeypatch) -> None:
         conversation_summary="Contato iniciou conversa.",
         last_classification="lead_novo",
         pipeline_stage="novo_lead",
+        company_id=_company_id(),
     )
 
     assert result["source"] == "template"
@@ -29,6 +45,7 @@ def test_reply_service_fallback_for_non_auto_reply_case(monkeypatch) -> None:
         conversation_summary="Contato mencionou nota fiscal.",
         last_classification="financeiro",
         pipeline_stage="encerrado",
+        company_id=_company_id(),
     )
 
     assert result["source"] == "none"
@@ -54,6 +71,7 @@ def test_reply_service_returns_openai_source_when_finetuned_flag_is_disabled(mon
         last_classification="lead_novo",
         pipeline_stage="novo_lead",
         contact_id="5511999991111",
+        company_id=_company_id(),
     )
 
     assert result["source"] == "openai"
@@ -79,6 +97,7 @@ def test_reply_service_returns_openai_finetuned_source_when_enabled(monkeypatch)
         last_classification="lead_novo",
         pipeline_stage="novo_lead",
         contact_id="5511999992222",
+        company_id=_company_id(),
     )
 
     assert result["source"] == "openai_finetuned"

@@ -135,3 +135,8 @@ ignore = [
 # conftest pins environment variables before any `app.*` import so the suite
 # never inherits a developer's .env; that ordering is the whole point.
 "tests/conftest.py" = ["E402"]
+# Chat exports (WhatsApp and friends) carry local wall-clock timestamps with
+# no offset. Parsing them as tz-aware would invent a timezone and shift every
+# imported conversation; the naive value is preserved verbatim and the
+# timezone is applied later, from the company context.
+"app/services/conversation_parsers.py" = ["DTZ007"]
