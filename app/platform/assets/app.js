@@ -102,6 +102,16 @@ const NAV_ITEMS = [
   { key: "analytics", label: "Analytics", caption: "No-show, lembretes e funil", icon: "target" },
   { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
   { key: "flows", label: "Flow Studio", caption: "Pipelines, playbooks e respostas", icon: "flow" },
+  // O Automation Studio é um app separado, servido na mesma origem. `href`
+  // marca o item como navegação de saída: sem ele, o operador não teria
+  // como descobrir o editor visual a partir da plataforma.
+  {
+    key: "automations",
+    label: "Automation Studio",
+    caption: "Fluxos visuais, execuções e aprovações",
+    icon: "flow",
+    href: "/platform/automations",
+  },
   { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
   { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
   { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
@@ -989,7 +999,17 @@ function renderSidebar() {
       <div class="nav-section-label">Workspace</div>
       <nav class="nav-list">
         ${NAV_ITEMS.map(
-          (item) => `
+          (item) => item.href
+            ? `
+            <a class="nav-button" href="${item.href}">
+              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
+              <span>
+                <span class="nav-label">${escapeHtml(item.label)}</span>
+                <span class="nav-caption">${escapeHtml(item.caption)}</span>
+              </span>
+            </a>
+          `
+            : `
             <button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">
               <span class="nav-icon">${ICONS[item.icon] || ""}</span>
               <span>
