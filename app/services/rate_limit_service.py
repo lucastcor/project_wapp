@@ -60,7 +60,42 @@ def _get_redis_client() -> Any | None:
     return _REDIS_CLIENT
 
 
+RATE_LIMIT_KEY_PREFIX = "project_wapp:rate_limit:"
+
+
+def clear_rate_limit_counters() -> None:
+    """Apaga também os contadores de janela que vivem no Redis.
+
+    Separada de `reset_rate_limit_state` de propósito. Quando o Redis está
+    configurado, o contador é **estado compartilhado**: descartá-lo é o oposto
+    de simular uma réplica nova, e é justamente a diferença entre as duas
+    funções.
+
+    Isolamento de teste precisa desta; sem ela, um teste que consome o limite
+    deixa a janela correndo para o próximo, que falha por um motivo que nada
+    tem a ver com o que ele testa.
+    """
+    client = _get_redis_client()
+    if client is not None:
+        try:
+            # SCAN, e não KEYS: o mesmo Redis pode servir outra coisa, e
+            # bloquear o servidor inteiro para limpar contador é caro demais.
+            for key in client.scan_iter(match=f"{RATE_LIMIT_KEY_PREFIX}*", count=500):
+                client.delete(key)
+        except Exception:
+            # Redis fora do ar não pode transformar limpeza em erro.
+            pass
+    reset_rate_limit_state()
+
+
 def reset_rate_limit_state() -> None:
+    """Descarta o estado **local** deste processo.
+
+    Não toca no Redis: com estado compartilhado, um processo que reinicia
+    encontra as janelas em curso exatamente onde estavam. É por isso que esta
+    função serve para simular uma réplica nova — e por que ela sozinha não
+    isola um teste do anterior.
+    """
     global _REDIS_CLIENT, _REDIS_CLIENT_URL
     with _RATE_LIMIT_LOCK:
         _RATE_LIMIT_STATE.clear()
@@ -148,7 +183,7 @@ def evaluate_rate_limit(request: Request) -> RateLimitDecision | None:
     redis_client = _get_redis_client()
     if redis_client is not None:
         client_digest = hashlib.sha256(client_id.encode("utf-8")).hexdigest()[:24]
-        redis_key = f"project_wapp:rate_limit:{scope}:{window_start}:{client_digest}"
+        redis_key = f"{RATE_LIMIT_KEY_PREFIX}{scope}:{window_start}:{client_digest}"
         try:
             stored_count, ttl = redis_client.eval(
                 _REDIS_FIXED_WINDOW_SCRIPT,

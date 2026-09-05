@@ -7,7 +7,11 @@ import pytest
 from fastapi import Request
 
 from app.core.config import settings
-from app.services.rate_limit_service import evaluate_rate_limit, reset_rate_limit_state
+from app.services.rate_limit_service import (
+    clear_rate_limit_counters,
+    evaluate_rate_limit,
+    reset_rate_limit_state,
+)
 from app.services.realtime_service import (
     broadcast_event,
     close_realtime_broker,
@@ -55,6 +59,37 @@ def test_redis_rate_limit_is_shared_across_process_state_resets(monkeypatch) -> 
     for key in client.scan_iter("project_wapp:rate_limit:incoming_message:*"):
         client.delete(key)
     client.close()
+
+
+def test_clearing_counters_releases_the_window_that_a_reset_keeps(monkeypatch) -> None:
+    """A diferença entre as duas funções, provada nos dois sentidos.
+
+    `reset_rate_limit_state` simula uma réplica nova e por isso **preserva** a
+    janela compartilhada — é o que o teste acima garante. Isolamento de teste
+    precisa do oposto, e sem esta função a suíte inteira herdava a janela do
+    teste anterior sempre que `REDIS_URL` apontava para um Redis real: uma
+    falha intermitente em quem apenas copiou o `.env.example`.
+    """
+    client_ip = f"203.0.113.{int(time.time()) % 200 + 1}"
+    monkeypatch.setattr(settings, "redis_url", TEST_REDIS_URL)
+    monkeypatch.setattr(settings, "require_shared_state", True)
+    monkeypatch.setattr(settings, "enable_rate_limiting", True)
+    monkeypatch.setattr(settings, "rate_limit_exempt_localhost", False)
+    monkeypatch.setattr(settings, "rate_limit_incoming_requests", 1)
+
+    first = evaluate_rate_limit(_incoming_request(client_ip))
+    reset_rate_limit_state()
+    blocked = evaluate_rate_limit(_incoming_request(client_ip))
+    clear_rate_limit_counters()
+    after_clear = evaluate_rate_limit(_incoming_request(client_ip))
+
+    assert first is not None and first.allowed is True
+    assert blocked is not None and blocked.allowed is False, (
+        "reset nao pode apagar o contador compartilhado"
+    )
+    assert after_clear is not None and after_clear.allowed is True, (
+        "clear precisa liberar a janela, senao o proximo teste herda o limite"
+    )
 
 
 def test_realtime_event_is_published_to_external_redis_subscriber(monkeypatch) -> None:

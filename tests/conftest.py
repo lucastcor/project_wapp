@@ -71,7 +71,7 @@ os.environ.pop("POSTGRES_DATABASE_URL", None)
 
 import pytest
 
-from app.services.rate_limit_service import reset_rate_limit_state
+from app.services.rate_limit_service import clear_rate_limit_counters
 from app.storage.db import init_db
 
 
@@ -85,9 +85,12 @@ def _bootstrap_test_database() -> pytest.FixtureRequest:
 
 @pytest.fixture(autouse=True)
 def _reset_rate_limit_between_tests() -> None:
-    reset_rate_limit_state()
+    # `clear_rate_limit_counters`, e nao `reset_rate_limit_state`: com REDIS_URL
+    # apontando para um Redis real, limpar so a memoria deixa a janela do teste
+    # anterior correndo, e o proximo teste falha por limite ja consumido.
+    clear_rate_limit_counters()
     yield
-    reset_rate_limit_state()
+    clear_rate_limit_counters()
 
 
 @pytest.fixture()

@@ -1,6 +1,8 @@
 # Project WAPP
 
-Backend de atendimento conversacional com foco em operação comercial, handoff para humano, outbound multicanal e preparação para fine-tuning.
+Plataforma multi-tenant de comércio conversacional: atendimento com IA, operação comercial, handoff para humano, outbound multicanal, automação visual de fluxos, recuperação sobre a base de conhecimento da empresa (RAG) e ciclo completo de fine-tuning.
+
+> **Chegando agora no projeto?** Comece por [`docs/estado_do_projeto.md`](docs/estado_do_projeto.md) — o que existe de fato, o que está verificado com evidência, e o que ainda depende de credencial externa.
 
 ## Visão geral
 O Project WAPP é um backend em FastAPI pensado para evoluir de um chatbot simples para uma plataforma de atendimento orientada a negócio. O sistema já suporta classificação de mensagens, geração de resposta com OpenAI, memória por contato, pipeline comercial, handoff para responsável humano, knowledge base incremental, outbound persistido e pipeline de fine-tuning.
@@ -43,6 +45,43 @@ A arquitetura foi organizada para manter separação clara entre:
 - Timeline/calendario visual de agenda com layout semanal baseado em endpoint proprio do backend
 - Testes automatizados para fluxos críticos
 
+### Automação visual (Automation Studio)
+- Editor de fluxos em canvas com catálogo de 25 nós (gatilhos, condições, ações,
+  aprovação humana, espera, terminais)
+- Motor de execução durável com outbox transacional, retry com backoff,
+  dead-letter e idempotência por efeito externo
+- Gatilhos reais: mensagem processada, handoff criado, agendamento criado,
+  campanha enviada e agenda (`trigger.schedule`) por janela horária/diária/semanal
+- Portões humanos: execução pausa aguardando aprovação e retoma no ponto exato
+- Version pinning: uma execução em andamento continua no grafo com que começou
+- Histórico de execução passo a passo, com redação de dados sensíveis
+- Publicação e ativação bloqueadas quando o plano não cobre a capacidade do fluxo
+
+### Conhecimento e recuperação (RAG)
+- Documentos versionados, com versão publicada e versão em edição separadas
+- Chunking por versão, busca lexical determinística e busca vetorial opcional
+- Filtro de tenant dentro da query, nunca em descarte posterior
+- Neutralização de injeção de prompt no conteúdo recuperado
+- Citações rastreáveis por resposta (`messages.retrieval_json`)
+- Sinal explícito de ausência de fonte relevante, em vez de silêncio
+
+### Proteção de PII
+- Detecção com validação real: CPF e CNPJ por dígito verificador, cartão por Luhn
+- Valor original nunca persistido em staging, candidato ou dataset
+- Pseudonimização irreversível com chave obrigatória em produção
+
+### Ciclo de fine-tuning
+- Importação de histórico com separação por sessão, candidatos e revisão humana
+- Deduplicação por distância de edição e split sem vazamento entre treino e validação
+- Critérios de prontidão que recusam o treino antes de gastar job de provider
+- Avaliação com casos versionados; execução simulada nunca habilita promoção
+- Portão de promoção que recusa regressão, e registro de modelo por empresa com fallback
+
+### Isolamento e operação
+- Guarda de integridade de tenant no próprio banco em todas as tabelas com `company_id`
+- Escopo de empresa deny-by-default por rota, com papéis owner/admin/operator/viewer
+- Workers duráveis em processos separados da API (lembretes e automação)
+
 ## Stack principal
 - Python 3.13+
 - FastAPI
@@ -59,43 +98,56 @@ A arquitetura foi organizada para manter separação clara entre:
 ```text
 app/
   api/
-    admin_routes.py
-    platform_routes.py
-    routes.py
-    schemas.py
+    routes.py                 entrada pública (mensagens, webhooks)
+    admin_routes.py           API administrativa
+    platform_routes.py        sessão e páginas da plataforma
+    automation_routes.py      fluxos, execuções, aprovações
+    knowledge_routes.py       documentos, versões, chunks
+    dataset_routes.py         datasets, avaliação, registro de modelo
+    company_scope.py          escopo de empresa deny-by-default
+    admin_security.py         autenticação e autorização admin
+  automations/
+    catalog.py                catálogo de nós e capacidades
+    domain.py                 grafo, validação e forma canônica
+    engine.py                 execução passo a passo
+    events.py                 eventos canônicos e mapa de gatilhos
+    entitlements.py           capacidade do fluxo x limite do plano
   core/
-    company_context.py
-    config.py
-    orchestrator.py
-    training_config.py
-  llm/
-    providers/
-      openai_provider.py
-  services/
-    classification_service.py
-    decision_service.py
-    finetuning_service.py
-    handoff_service.py
-    knowledge_service.py
-    memory_service.py
-    outbound_dispatch_service.py
-    pipeline_service.py
-    reply_services.py
-    style_service.py
-    training_export_service.py
-    whatsapp_provider.py
+    orchestrator.py           orquestra a mensagem recebida
+    company_context.py        contexto por empresa
+    config.py                 Settings
+  llm/providers/              OpenAI e mocks
+  services/                   regras de negócio (~40 serviços)
+    automation_*_service.py   workflow, trigger, execução, scheduler
+    knowledge_*_service.py    documento, chunking, recuperação
+    dataset_service.py        curadoria, split, congelamento
+    evaluation_service.py     casos, execuções e notas
+    model_registry_service.py resolução do modelo em runtime
+    pii_service.py            detecção e pseudonimização
   storage/
-    db.py
-    repository.py
-  platform/
-    index.html
-    assets/
-      app.js
-      styles.css
+    db.py                     conexão, pool e registro de migrations
+    repository.py             persistência do runtime de conversa
+    sql_support.py            helpers de SQL seguros para os repositórios
+    automation_repository.py  fluxos, execuções, outbox
+    knowledge_repository.py   documentos e chunks
+    migrations_*.py           067 migrations acumuladas
+  tools/
+    run_migrations.py         passo explícito de release
+    reminder_worker.py        worker de lembretes
+    automation_worker.py      worker de automação e scheduler
+    preflight_check.py        checagem antes de publicar
+  platform/                   plataforma web servida pela API
+    index.html, assets/
+    automations/              bundle compilado do Automation Studio
   main.py
-tests/
-README.md
-requirements.txt
+frontend/
+  automation-studio/          editor visual (Vite + TypeScript)
+tests/                        ~65 arquivos de teste
+docs/
+compose.yaml                  postgres, redis, migrate, api, worker,
+                              automation-worker, admin
+Dockerfile                    alvos api / admin, com estágio do Studio
+vercel.json
 ```
 
 ## Fluxos já implementados
@@ -535,6 +587,60 @@ A plataforma agora autentica por sessao propria. O token administrativo deixa de
 
 O painel Streamlit continua útil como contingência e apoio interno, mas a superfície dedicada em `/platform` passa a ser a camada principal de operação premium.
 
+### 7.2. Abrir o Automation Studio
+
+O editor visual é uma aplicação separada, servida pela própria API em
+`/platform/automations` — mesma origem, mesma sessão, sem CORS e sem um segundo
+domínio para autenticar.
+
+```text
+http://127.0.0.1:8000/platform/automations
+```
+
+Para desenvolver o editor com hot reload:
+
+```bash
+cd frontend/automation-studio
+npm ci
+npm run dev
+```
+
+O bundle versionado em `app/platform/automations` é gerado por `npm run build`.
+A API serve o que estiver ali; se a pasta estiver vazia, a rota responde uma
+página de instrução em vez de quebrar.
+
+### 7.3. Rodar os workers
+
+Os workers são **processos separados da API**, e não threads dentro dela. Uma
+requisição HTTP pode ser interrompida a qualquer momento; trabalho durável não
+pode depender disso. Em serverless a API sequer continua viva entre requisições.
+
+```bash
+python -m app.tools.reminder_worker      # lembretes de agenda
+python -m app.tools.automation_worker    # automação + gatilho de agenda
+```
+
+São dois processos porque falham por motivos diferentes e escalam de forma
+diferente: uma tempestade de automação não pode atrasar o lembrete de um
+agendamento. O `compose.yaml` sobe os dois como serviços distintos.
+
+Um motor de automação ligado **sem** o worker no ar aceita gatilhos, enfileira
+execuções e não processa nenhuma. Hoje isso não aparece no readiness — está na
+lista de próximos passos.
+
+### 7.4. Aplicar migrations
+
+Migrations são um **passo explícito de release**, nunca algo que acontece no
+start da aplicação:
+
+```bash
+python -m app.tools.run_migrations
+```
+
+Rodar migration no cold start significa que N instâncias competem pelo mesmo
+schema ao mesmo tempo, e que um deploy da Vercel altera o banco sem ninguém ter
+decidido isso. Detalhes em [`docs/production_runbook.md`](docs/production_runbook.md).
+
 ### 8. Migrar dados do SQLite atual para Postgres
 Se você já tiver dados em `project_wapp.db`, pode migrar assim:
 ```bash
@@ -588,12 +694,20 @@ Passos recomendados:
 O webhook agora aceita tanto payload normalizado interno quanto payload bruto de mensagem de texto do Meta. Eventos sem mensagem de texto, como status de entrega, sao reconhecidos e ignorados com `200`.
 
 ## Documentação complementar
-- `docs/architecture.md`
-- `docs/api_spec.md`
-- `docs/platform_frontend_guide.md`
-- `docs/codebase_map.md`
-- `docs/knowledge_base.md`
-- `.env.example`
+
+| Documento | Quando ler |
+| --- | --- |
+| [`docs/estado_do_projeto.md`](docs/estado_do_projeto.md) | **primeiro**: o que existe, o que está provado, o que falta |
+| [`docs/codebase_map.md`](docs/codebase_map.md) | em qual arquivo mexer para mudar um comportamento |
+| [`docs/automation_studio.md`](docs/automation_studio.md) | motor de automação, eventos, idempotência, catálogo de nós |
+| [`docs/rag_e_finetuning.md`](docs/rag_e_finetuning.md) | conhecimento, recuperação, PII e ciclo de modelo |
+| [`docs/production_runbook.md`](docs/production_runbook.md) | go-live, migrations, workers, backup, incidente |
+| [`docs/architecture.md`](docs/architecture.md) | visão de arquitetura de origem |
+| [`docs/api_spec.md`](docs/api_spec.md) | contrato das rotas |
+| [`docs/platform_frontend_guide.md`](docs/platform_frontend_guide.md) | plataforma web em `/platform` |
+| [`docs/migration_compatibility_map.md`](docs/migration_compatibility_map.md) | como as migrations do branch foram reconciliadas |
+| [`docs/knowledge_base.md`](docs/knowledge_base.md) | base de conhecimento por empresa |
+| `.env.example` | configuração compartilhável |
 
 ## Observabilidade
 - logs estruturados em JSON por padrão
@@ -701,43 +815,102 @@ Esse importador ja resolve a entrada inicial por CRM/planilha/export simples, ma
 - `POST /admin/training-import`
 
 ## Testes
-Para rodar a suíte completa:
+
+A suíte roda sem nenhum serviço externo: o padrão é um SQLite descartável.
+
 ```bash
 pytest
 ```
 
-Para rodar testes específicos:
+O mesmo conjunto roda contra PostgreSQL e Redis reais trocando duas variáveis.
+Vale a pena antes de qualquer release: parte das garantias de concorrência e
+integridade só existe no PostgreSQL.
+
 ```bash
-pytest tests/test_reply_service.py
-pytest tests/test_training_export_service.py
-pytest tests/test_finetuning_service.py
-pytest tests/test_outbound_dispatch_service.py
+TEST_DATABASE_URL=postgresql://user@host:5432/db \
+TEST_REDIS_URL=redis://127.0.0.1:6379/9 \
+pytest
 ```
 
+Resultado verificado em 2026-09-05, no commit de merge para `main`:
+
+| Configuração | Resultado |
+| --- | --- |
+| SQLite (padrão) | 1286 passaram, 17 pulados |
+| PostgreSQL + Redis | 1302 passaram, 1 pulado |
+| `ruff check .` | limpo |
+| `mypy app` | 140 arquivos, sem erros |
+
+Os testes pulados são condicionais, não falhas silenciadas: exigem PostgreSQL,
+Redis ou um bundle compilado do Studio. Rodar na configuração completa reduz os
+17 para 1 — o único restante é uma pragma específica de SQLite, que não existe
+no PostgreSQL.
+
+Frontend do Automation Studio:
+
+```bash
+cd frontend/automation-studio
+npm ci
+npm test          # 42 testes
+npm run typecheck
+npm run build     # gera app/platform/automations
+```
+
+### Escrevendo testes aqui
+
+- `company_factory` cria empresas isoladas com slug único; não reuse ids fixos.
+- `admin_principal_factory` devolve sessão e token CSRF do modelo canônico
+  (usuário + membership), não um token por principal.
+- Um teste que consome rate limit deve chamar `clear_rate_limit_counters()`;
+  `reset_rate_limit_state()` só descarta o estado local e existe para simular
+  uma réplica nova.
+
 ## Estado atual do produto
-As fundações dos Releases 1B/1C estão implementadas e validadas localmente:
-- fluxo de atendimento orientado a negócio
-- separação entre automação e decisão humana
-- outbound multicanal com provider mock e provider real de WhatsApp preparado
-- pipeline de fine-tuning com persistência de histórico
-- observabilidade, auditoria e readiness para operação e evolução
-- onboarding/admin UX mínimo porém funcional para multiempresa
-- agenda operacional com conversa natural para cliente e operacao interna, com lembretes consistentes para a equipe
-- identidade e ownership por tenant
-- gestão de equipe, convites e papéis por tenant na própria plataforma
-- jobs idempotentes com claim/retry/dead-letter
-- Stripe e quotas reconciliados por webhook
-- build reproduzível, PostgreSQL/Redis reais e imagens separadas
+
+O detalhamento com evidência está em [`docs/estado_do_projeto.md`](docs/estado_do_projeto.md).
+Resumo honesto:
+
+**Provado localmente, com teste automatizado**
+- atendimento conversacional, handoff e resposta do responsável
+- identidade SaaS canônica, papéis por empresa e escopo deny-by-default por rota
+- isolamento de tenant, agora também garantido pelo próprio banco
+- automação visual ponta a ponta: publicar, ativar, disparar, aprovar, retomar
+- recuperação sobre a base de conhecimento, com citação e proteção de injeção
+- detecção e pseudonimização de PII
+- curadoria de dataset, avaliação, portão de promoção e registro de modelo
+- billing com quotas, entitlements por plano e reconciliação por webhook
+- jobs idempotentes com claim, retry e dead-letter
+- suíte completa contra PostgreSQL e Redis reais
+
+**Completo em código, sem verificação externa**
+Nenhuma credencial real foi exercitada. Estes caminhos têm teste com mock, e
+nada além disso:
+- Stripe (checkout, portal, webhook)
+- Meta WhatsApp (envio e webhook de entrada)
+- OpenAI (resposta, embeddings, fine-tuning, avaliação com modelo real)
+- Google Calendar e CalDAV
+- deploy na Vercel
+- build da imagem Docker (o daemon não estava disponível no ambiente de trabalho)
+
+Tratar qualquer um desses como funcionando em produção antes do primeiro teste
+com credencial é otimismo, não evidência.
 
 ## Próximos passos naturais
-- criar staging com Vercel + PostgreSQL/Redis gerenciados e worker durável
-- executar o sandbox Stripe real e registrar os seis Price IDs
-- validar domínio/remetente no Resend
-- integrar envio real em produção com provider de WhatsApp
-- adicionar provider futuro para Instagram
-- concluir um job de fine-tuning com sucesso e plugar o modelo no runtime
-- conectar credenciais reais de Google Calendar ou CalDAV/iCloud
-- ensaiar backup/restore, rollback, alertas e E2E antes do piloto
+
+Em ordem de dependência, do que destrava mais:
+
+1. subir staging com PostgreSQL e Redis gerenciados, e o worker durável separado
+2. rodar o sandbox do Stripe e registrar os seis Price IDs
+3. construir a imagem Docker num ambiente com daemon e publicar no registry
+4. ligar o provider real de WhatsApp e validar o webhook de entrada
+5. concluir um job de fine-tuning real e promover o modelo pelo portão
+6. conectar Google Calendar ou CalDAV com credencial real
+7. cobrir com readiness o worker de automação e a chave de PII
+   (hoje a ausência só aparece quando o worker recusa subir)
+8. decidir a política de criação de empresa em `/admin/onboarding/setup`
+   (hoje `unscoped`: um superadmin de tenant pode criar empresa e tomar o slug
+   de um concorrente — está registrado como risco aceito, não como descuido)
+9. ensaiar backup, restore, rollback e alertas antes do piloto
 
 ## Boas práticas
 - nunca versionar `.env` com segredos reais

@@ -7,7 +7,7 @@ from app import main as main_module
 from app.api import routes
 from app.core.config import settings
 from app.main import app
-from app.services.rate_limit_service import reset_rate_limit_state
+from app.services.rate_limit_service import clear_rate_limit_counters
 
 client = TestClient(app)
 
@@ -188,7 +188,7 @@ def test_incoming_message_empty_after_trim() -> None:
 
 
 def test_incoming_message_rate_limited(monkeypatch) -> None:
-    reset_rate_limit_state()
+    clear_rate_limit_counters()
     monkeypatch.setattr(settings, "enable_rate_limiting", True)
     monkeypatch.setattr(settings, "rate_limit_window_seconds", 60)
     monkeypatch.setattr(settings, "rate_limit_incoming_requests", 1)
@@ -227,7 +227,7 @@ def test_incoming_message_rate_limited(monkeypatch) -> None:
     assert second_response.json()["detail"] == "Too many requests."
     assert second_response.headers["X-RateLimit-Scope"] == "incoming_message"
     assert second_response.headers["Retry-After"]
-    reset_rate_limit_state()
+    clear_rate_limit_counters()
 
 
 def test_whatsapp_webhook(monkeypatch) -> None:
