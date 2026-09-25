@@ -438,7 +438,7 @@ def test_reconnection_updates_the_same_integration_row(monkeypatch, google_env, 
     assert query["google"] == ["connected"]
     assert _active_google_id(company_id) == first_id
     row = _integration_row(first_id)
-    assert decrypt_secret(row["config"]["refresh_token"]) == "refresh-sintetico-2//DEF654"
+    assert decrypt_secret(row["config"]["refresh_token"]) == "refresh-sintetico-segundo"
     assert row["external_calendar_id"] == "primary"
     assert len(fetch_all("SELECT id FROM calendar_integrations WHERE company_id = ?", (company_id,))) == 1
 
