@@ -10,7 +10,7 @@ from app.api.admin_security import (
     build_require_admin_role,
 )
 from app.api.admin_support import build_prometheus_metrics, record_audit_event
-from app.api.company_scope import get_authorized_scope, require_authorized_company_id
+from app.api.company_scope import authorize_company, get_authorized_scope, require_authorized_company_id
 from app.api.schemas import (
     AppointmentBookingCancellationPayload,
     AppointmentBookingPayload,
@@ -2457,6 +2457,10 @@ def upsert_whatsapp_binding_endpoint(
     request: Request,
 ) -> WhatsAppBindingResponse:
     """Bind a Meta phone_number_id to a company (superadmin only)."""
+    # O company_id vem do corpo, não da query: sem esta checagem uma sessão
+    # de identidade autorizada para a empresa A poderia apontar o número da
+    # empresa B para si.
+    authorize_company(request, payload.company_id)
     company = repository.get_company(payload.company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Company not found.")

@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.api.admin_routes import admin_router
 from app.api.automation_routes import automation_router
 from app.api.billing_routes import billing_router
+from app.api.google_calendar_routes import google_calendar_router
 from app.api.platform_admin_routes import platform_admin_router
 from app.api.platform_routes import (
     AUTOMATION_STUDIO_DIR,
@@ -19,6 +20,7 @@ from app.api.platform_routes import (
     platform_router,
 )
 from app.api.routes import router
+from app.api.whatsapp_signup_routes import whatsapp_signup_router
 from app.core.config import is_missing_or_placeholder, settings
 from app.core.logging import (
     clear_request_context,
@@ -210,6 +212,8 @@ app.include_router(admin_router)
 app.include_router(automation_router)
 app.include_router(platform_admin_router)
 app.include_router(billing_router)
+app.include_router(whatsapp_signup_router)
+app.include_router(google_calendar_router)
 app.include_router(platform_router)
 app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")
 

@@ -2780,6 +2780,9 @@ MIGRATIONS.extend(OWNERSHIP_MIGRATIONS)
 from app.storage.migrations_recovery import RECOVERY_MIGRATIONS  # noqa: E402
 
 MIGRATIONS.extend(RECOVERY_MIGRATIONS)
+from app.storage.migrations_connections import CONNECTIONS_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(CONNECTIONS_MIGRATIONS)
 
 # Tabelas com PK autoincremental precisam de `RETURNING id` no PostgreSQL para
 # que `cursor.lastrowid` funcione — no SQLite ele vem de graça, no PostgreSQL
