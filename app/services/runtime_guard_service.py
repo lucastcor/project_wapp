@@ -21,7 +21,10 @@ def validate_runtime_environment(component: str) -> None:
     if not runtime_validation_enabled():
         return
 
-    blockers = get_runtime_blockers()
+    # Startup validates configuration; liveness belongs to readiness only.
+    # Requiring heartbeats here would deadlock the first API/worker deployment.
+    blockers = [check for check in get_runtime_blockers()
+                if check.get("code") not in {"automation_worker_heartbeat", "inbound_worker_heartbeat"}]
     if not blockers:
         return
 

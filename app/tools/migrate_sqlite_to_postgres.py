@@ -269,6 +269,9 @@ TABLE_COLUMNS: list[tuple[str, list[str], str | None]] = [
             "failed_at",
             "created_at",
             "sent_at",
+            "template_parameters_json",
+            "delivery_status",
+            "delivery_updated_at",
         ],
         "id",
     ),
@@ -340,6 +343,21 @@ TABLE_COLUMNS: list[tuple[str, list[str], str | None]] = [
         ],
         "id",
     ),
+    # Recurso antes do agendamento que o referencia (070).
+    (
+        "booking_resources",
+        [
+            "id",
+            "company_id",
+            "resource_key",
+            "label",
+            "capacity",
+            "active",
+            "created_at",
+            "updated_at",
+        ],
+        "id",
+    ),
     (
         "appointment_bookings",
         [
@@ -347,6 +365,9 @@ TABLE_COLUMNS: list[tuple[str, list[str], str | None]] = [
             "company_id",
             "contact_id",
             "integration_id",
+            "resource_id",
+            "hold_starts_at",
+            "hold_ends_at",
             "provider",
             "external_event_id",
             "scheduling_profile_key",
@@ -554,6 +575,14 @@ TABLE_COLUMNS: list[tuple[str, list[str], str | None]] = [
         ],
         "id",
     ),
+    ("inbound_jobs", ["id", "company_id", "provider_message_id", "contact_id", "payload_json", "status", "claim_token", "lease_expires_at", "result_json", "outbound_message_id", "last_error", "created_at", "updated_at", "available_at", "dispatch_attempts"], "id"),
+    ("booking_operations", ["id", "company_id", "contact_id", "kind", "status", "source", "booking_id", "resource_key", "params_json", "params_hash", "target_version", "flow_id", "idempotency_key", "expires_at", "confirmed_at", "confirmation_ref", "started_at", "completed_at", "result_json", "last_error", "external_ref", "attempt_count", "created_at", "updated_at"], "id"),
+    ("whatsapp_contact_states", ["company_id", "contact_id", "last_inbound_at", "opted_out_at", "opt_out_source", "updated_at"], None),
+    ("contact_consents", ["id", "company_id", "contact_id", "purpose", "status", "source", "evidence_ref", "created_at", "updated_at"], "id"),
+    ("whatsapp_templates", ["id", "company_id", "purpose", "name", "language_code", "category", "status", "parameter_count", "active", "created_at", "updated_at"], "id"),
+    ("whatsapp_delivery_events", ["id", "company_id", "provider_message_id", "outbound_message_id", "status", "provider_timestamp", "error_code", "received_at"], "id"),
+    ("conversation_ownerships", ["company_id", "contact_id", "owner", "owner_user_id", "reason", "version", "taken_at", "released_at", "updated_at"], None),
+    ("worker_heartbeats", ["component", "instance_id", "expires_at", "updated_at"], None),
     # Plataforma multiempresa e Automation Studio (migrations 038-066).
     # Mesma ordem pai-antes-de-filho de BACKUP_TABLES: a copia insere
     # nesta ordem e o TRUNCATE a percorre invertida.

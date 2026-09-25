@@ -1,0 +1,41 @@
+{
+  "greeting_fallback": {
+    "classification": {
+      "classification": "indefinido",
+      "confidence": 0.4,
+      "reason": "Sem sinal suficiente para classificação precisa."
+    },
+    "decision": {
+      "auto_reply": false,
+      "action": "review",
+      "priority": "medium"
+    }
+  },
+  "cancellation_mock_reproductions": [
+    {
+      "message": "não quero confirmar",
+      "first_action": "booking_cancel_confirmation_requested",
+      "second_action": "booking_cancelled",
+      "cancellation_effect_called": true
+    },
+    {
+      "message": "assim está bom?",
+      "first_action": "booking_cancel_confirmation_requested",
+      "second_action": "booking_cancelled",
+      "cancellation_effect_called": true
+    },
+    {
+      "message": "não, pode manter",
+      "first_action": "booking_cancel_confirmation_requested",
+      "second_action": "booking_cancel_confirmation_requested",
+      "cancellation_effect_called": false
+    },
+    {
+      "message": "isso cancela todos?",
+      "first_action": "booking_cancel_confirmation_requested",
+      "second_action": "booking_cancelled",
+      "cancellation_effect_called": true
+    }
+  ],
+  "scope": "No real database, LLM or external channel used; repository and cancel effect mocked."
+}

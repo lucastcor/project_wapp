@@ -9,6 +9,7 @@ ou encaminhar para um humano.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +17,7 @@ from app.core.config import settings
 from app.core.logging import get_logger, log_event
 from app.core.taxonomy import normalize
 from app.core.tenancy import require_company_id
+from app.llm.factory import get_llm_provider
 from app.llm.providers.openai_provider import OpenAIProvider
 from app.services.company_config_service import CompanyConfig, get_company_config
 from app.services.knowledge_retrieval_service import (
@@ -31,6 +33,19 @@ from app.services.style_service import (
 )
 
 logger = get_logger(__name__)
+
+
+def _catalog_price_label(item: dict[str, Any]) -> str:
+    price_range = str(item.get("price_range") or "").strip()
+    if price_range:
+        return price_range
+    value = item.get("price")
+    if value is None:
+        value = item.get("starting_price")
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        formatted = f"{float(value):,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+        return f"R$ {formatted}"
+    return "valor sob consulta"
 
 
 @dataclass(frozen=True)
@@ -97,7 +112,7 @@ def _fallback_business_reply(
     if normalized_classification == "lead_novo":
         first_item = items[0] if items else {}
         first_service = first_item.get("name", "nossos serviços")
-        first_price = first_item.get("price_range", "valor sob consulta")
+        first_price = _catalog_price_label(first_item)
 
         if not company_config.policy("allow_price_quotes", True):
             first_price = "valor sob consulta"
@@ -185,7 +200,7 @@ def generate_business_reply(
     retrieval_trace["model_ref"] = model_selection.model_ref
     retrieval_trace["model_status"] = model_selection.status
 
-    if settings.classification_provider != "openai":
+    if settings.classification_provider not in {"openai", "ollama"}:
         fallback = _fallback_business_reply(
             classification=classification,
             contact_name=contact_name,
@@ -194,7 +209,7 @@ def generate_business_reply(
         return {**fallback, "model_ref": None, "retrieval": retrieval_trace}
 
     try:
-        provider = OpenAIProvider()
+        provider = get_llm_provider(openai_factory=OpenAIProvider)
         reply = provider.generate_business_reply(
             classification=classification,
             message=message,
@@ -231,7 +246,7 @@ def generate_business_reply(
             logger,
             logging.WARNING,
             "reply.provider.fallback",
-            provider="openai",
+            provider=settings.classification_provider,
             error_type=type(exc).__name__,
             classification=classification,
             company_id=resolved_company_id,

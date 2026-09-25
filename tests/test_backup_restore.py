@@ -134,7 +134,7 @@ def test_tenant_configuration_tables_are_included() -> None:
 def test_backup_declares_its_format_version() -> None:
     payload = build_backup_payload()
 
-    assert payload["backup_format_version"] == BACKUP_FORMAT_VERSION == 3
+    assert payload["backup_format_version"] == BACKUP_FORMAT_VERSION == 4
     assert set(payload["tables"]) == set(BACKUP_TABLES)
     assert set(payload["schema_manifest"]) == set(BACKUP_TABLES)
     assert payload["content_checksum"]["algorithm"] == "sha256"
@@ -679,7 +679,7 @@ def test_backup_file_is_atomic_and_private(seeded_installation, tmp_path) -> Non
 
     assert written["output_path"] == str(destination.resolve())
     assert destination.stat().st_mode & 0o777 == 0o600
-    assert json.loads(destination.read_text(encoding="utf-8"))["backup_format_version"] == 3
+    assert json.loads(destination.read_text(encoding="utf-8"))["backup_format_version"] == 4
     assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
 
 

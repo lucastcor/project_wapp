@@ -1,5 +1,9 @@
 # Estado do projeto
 
+> **Frente de execução de 13/09/2026:** [piloto com pequenos clientes](piloto/INICIO.md), com [checkpoint atual](piloto/ESTADO.md). A revisão encontrou bloqueios conversacionais/transacionais apesar da suíte verde. O plano distingue correções a fazer, evidência local e homologação real. Os trechos abaixo permanecem como histórico e não substituem esse checkpoint.
+
+> Atualização de 08/09/2026: integração Qwen/Ollama, fila durável do webhook, configuração local/produção e readiness dos workers foram implementados. Veja o [guia atualizado](local_qwen.md). Os registros abaixo preservam o estado e as evidências da análise anterior.
+
 Onde o Project WAPP realmente está, o que sustenta cada afirmação, e o que
 ainda não foi provado. Escrito para quem chega agora e precisa distinguir
 "implementado" de "funcionando em produção" — a distância entre os dois é onde

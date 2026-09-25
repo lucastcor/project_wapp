@@ -61,10 +61,20 @@ def _fake_list_reminders(company_id=None):
 
 
 def _patch(monkeypatch, repo=None):
+    from app.services import company_config_service
+
     fake = repo or FakeRepository()
     monkeypatch.setattr(onboarding_service, "repository", fake)
     monkeypatch.setattr(onboarding_service, "save_company_context", _fake_save_context)
     monkeypatch.setattr(onboarding_service, "create_calendar_integration", _fake_create_calendar_integration)
+    # `setup_company` importa a publicação da versão dentro da função: sem este
+    # patch ela consultava o banco real, e o arquivo só passava quando outro
+    # teste já tinha criado a empresa com o mesmo id.
+    monkeypatch.setattr(
+        company_config_service,
+        "save_company_config",
+        lambda **kwargs: {"id": 1, "company_id": kwargs.get("company_id"), "version": 1, "status": "published"},
+    )
     return fake
 
 

@@ -1,3 +1,4 @@
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -5,18 +6,37 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.core.company_context import get_company_context
 from app.core.config import is_missing_or_placeholder, settings
+from app.core.logging import get_logger, log_event
 from app.services.automation_trigger_service import emit_appointment_booked
 from app.services.billing_service import (
     BillingLimitError,
     refund_usage_reservation,
     require_usage_capacity,
 )
+from app.services.company_config_service import (
+    get_company_config,
+    get_runtime_company_context,
+)
+from app.services.company_policy_service import (
+    BookingChangeDecision,
+    BookingRules,
+    build_effective_policy,
+    evaluate_booking_change,
+    resolve_effective_policy,
+)
 from app.services.reminder_service import schedule_booking_customer_reminders
+from app.storage.migrations_booking_capacity import (
+    BookingCapacityConflictError,
+    BookingResourceUnavailableError,
+)
 from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
+logger = get_logger(__name__)
+# Quem pede a mudança (A08): cliente e automação só seguem com `allowed`; o
+# operador é o humano que a política exige, então segue com `requires_human`.
+BOOKING_ACTORS = ("customer", "operator", "automation")
 CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar"
 DAY_SCHEDULE_KEYS = {
     0: ("monday", "segunda"),
@@ -58,6 +78,32 @@ class CalendarProviderError(Exception):
     pass
 
 
+class BookingConflictError(CalendarProviderError):
+    """O intervalo não está mais livre para o recurso.
+
+    Erro de negócio conhecido, não falha técnica nem resultado incerto: quem
+    conversa com o cliente explica e oferece alternativas (contrato P01, F04).
+    Subclasse de `CalendarProviderError` para os tratadores existentes.
+    """
+
+
+class BookingPolicyError(CalendarProviderError):
+    """Cancelamento/remarcação fora da política publicada da empresa (A08).
+
+    `outcome` é `requires_human` ou `denied`; `reason` vem de
+    `company_policy_service.evaluate_booking_change`.
+    """
+
+    def __init__(self, message: str, *, outcome: str, reason: str) -> None:
+        super().__init__(message)
+        self.outcome = outcome
+        self.reason = reason
+
+
+class BookingNotFoundError(CalendarProviderError):
+    """Agendamento inexistente no escopo da empresa informada."""
+
+
 @dataclass
 class BusyInterval:
     starts_at: datetime
@@ -74,13 +120,8 @@ def _has_real_provider_value(value: Any) -> bool:
 
 
 def _resolve_company_context(company_id: int | None) -> dict[str, Any]:
-    if company_id is None:
-        return get_company_context()
-
-    get_company = getattr(repository, "get_company", None)
-    company = get_company(company_id) if callable(get_company) else None
-    company_slug = company.get("slug") if company else None
-    return get_company_context(company_slug=company_slug)
+    # Fonte única de runtime (CONTRATOS, D12): versão publicada da empresa.
+    return get_runtime_company_context(company_id)
 
 
 def _get_company_timezone(
@@ -232,6 +273,18 @@ def _resolve_workday_windows(
             _parse_clock(settings.calendar_default_workday_end),
         )
     ]
+
+
+def resolve_workday_windows(
+    current_day: date,
+    company_context: dict[str, Any],
+) -> list[tuple[time, time]]:
+    """Janelas de atendimento do dia, no horário local da empresa.
+
+    Pública para que a política de fora do horário use exatamente a mesma
+    leitura de `business_hours` que a disponibilidade da agenda.
+    """
+    return _resolve_workday_windows(current_day, company_context)
 
 
 def _profile_enabled(profile: dict[str, Any]) -> bool:
@@ -473,12 +526,21 @@ def _get_local_busy_intervals(
     for booking in bookings:
         if int(booking.get("id") or 0) in ignored_booking_ids:
             continue
+        booking_timezone = str(booking.get("timezone") or settings.calendar_timezone)
         intervals.append(
             BusyInterval(
-                starts_at=_parse_iso_datetime(str(booking["starts_at"]), str(booking.get("timezone") or settings.calendar_timezone)),
-                ends_at=_parse_iso_datetime(str(booking["ends_at"]), str(booking.get("timezone") or settings.calendar_timezone)),
+                starts_at=_parse_iso_datetime(str(booking["starts_at"]), booking_timezone),
+                ends_at=_parse_iso_datetime(str(booking["ends_at"]), booking_timezone),
             )
         )
+        # Remarcação em andamento retém também o novo intervalo (070).
+        if booking.get("hold_starts_at") and booking.get("hold_ends_at"):
+            intervals.append(
+                BusyInterval(
+                    starts_at=_parse_iso_datetime(str(booking["hold_starts_at"]), booking_timezone),
+                    ends_at=_parse_iso_datetime(str(booking["hold_ends_at"]), booking_timezone),
+                )
+            )
     return intervals
 
 
@@ -573,6 +635,7 @@ class BaseCalendarProvider:
         ends_at: datetime,
         timezone_name: str,
         description: str | None = None,
+        event_key: str | None = None,
     ) -> str | None:
         return None
 
@@ -583,6 +646,13 @@ class BaseCalendarProvider:
     ) -> bool:
         return False
 
+    def find_external_event(self, *, event_key: str) -> tuple[bool | None, str | None]:
+        """Existe evento com a chave estável? (True/False/None = não dá para saber).
+
+        Provider sem agenda externa nunca cria evento, então a resposta é "não".
+        """
+        return False, None
+
     def update_external_event(
         self,
         *,
@@ -592,6 +662,7 @@ class BaseCalendarProvider:
         ends_at: datetime,
         timezone_name: str,
         description: str | None = None,
+        event_key: str | None = None,
     ) -> str | None:
         if external_event_id:
             return external_event_id
@@ -601,11 +672,44 @@ class BaseCalendarProvider:
             ends_at=ends_at,
             timezone_name=timezone_name,
             description=description,
+            event_key=event_key,
         )
 
 
 class MockCalendarProvider(BaseCalendarProvider):
     provider_name = "mock"
+
+
+class ExternalCalendarUncertainError(CalendarProviderError):
+    """Sem resposta da agenda externa: o efeito pode ter acontecido.
+
+    Diferente da recusa explícita (`CalendarProviderError`), a capacidade não é
+    devolvida e o resultado fica para reconciliação/revisão.
+    """
+
+
+# Marca privada gravada no evento do Google: um 409 ou uma busca pela chave
+# estável só vale como "nosso evento" se a marca bater (restore de backup ou
+# staging e produção no mesmo calendário podem repetir a chave).
+GOOGLE_EVENT_MARKER = "wappBookingKey"
+
+
+def _is_own_google_event(event: dict[str, Any], event_key: str) -> bool:
+    private = (event.get("extendedProperties") or {}).get("private") or {}
+    return str(private.get(GOOGLE_EVENT_MARKER) or "") == event_key
+
+
+def _google_http_status(exc: Exception) -> int:
+    return int(getattr(getattr(exc, "resp", None), "status", 0) or 0)
+
+
+def stable_event_key(company_id: int | None, booking_id: int) -> str:
+    """Identificador estável do evento externo de um booking (P04).
+
+    Google aceita IDs de 5 a 1024 caracteres em base32hex (0-9, a-v); o prefixo
+    e o separador usam só letras permitidas. O mesmo valor serve de UID CalDAV.
+    """
+    return f"ap{int(company_id or 0)}b{int(booking_id)}"
 
 
 class GoogleCalendarProvider(BaseCalendarProvider):
@@ -677,12 +781,21 @@ class GoogleCalendarProvider(BaseCalendarProvider):
             .execute()
         )
 
+        calendar_result = response.get("calendars", {}).get(calendar_id)
+        if not isinstance(calendar_result, dict):
+            raise CalendarProviderError("Google Calendar não devolveu o calendário consultado.")
+        if calendar_result.get("errors"):
+            # O endpoint freeBusy pode responder HTTP 200 e declarar a falha
+            # apenas neste campo (por exemplo notFound/internalError). Tratar
+            # como agenda vazia permitiria reservar por cima de ocupações.
+            raise CalendarProviderError("Google Calendar não conseguiu consultar a disponibilidade desta agenda.")
+
         intervals: list[BusyInterval] = [
             BusyInterval(
                 starts_at=_parse_iso_datetime(item["start"]),
                 ends_at=_parse_iso_datetime(item["end"]),
             )
-            for item in response.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+            for item in calendar_result.get("busy", [])
         ]
         return intervals
 
@@ -694,27 +807,44 @@ class GoogleCalendarProvider(BaseCalendarProvider):
         ends_at: datetime,
         timezone_name: str,
         description: str | None = None,
+        event_key: str | None = None,
     ) -> str | None:
+        from googleapiclient.errors import HttpError  # type: ignore
+
         service, calendar_id = self._get_google_service()
-        response = (
-            service.events()
-            .insert(
-                calendarId=calendar_id,
-                body={
-                    "summary": title,
-                    "description": description or "",
-                    "start": {
-                        "dateTime": starts_at.isoformat(),
-                        "timeZone": timezone_name,
-                    },
-                    "end": {
-                        "dateTime": ends_at.isoformat(),
-                        "timeZone": timezone_name,
-                    },
-                },
-            )
-            .execute()
-        )
+        body: dict[str, Any] = {
+            "summary": title,
+            "description": description or "",
+            "start": {
+                "dateTime": starts_at.isoformat(),
+                "timeZone": timezone_name,
+            },
+            "end": {
+                "dateTime": ends_at.isoformat(),
+                "timeZone": timezone_name,
+            },
+        }
+        if event_key:
+            # ID escolhido pelo cliente (documentação do Google Calendar): uma
+            # nova tentativa depois de resposta perdida recebe 409 em vez de
+            # criar um segundo evento.
+            body["id"] = event_key
+            body["extendedProperties"] = {"private": {GOOGLE_EVENT_MARKER: event_key}}
+        try:
+            response = service.events().insert(calendarId=calendar_id, body=body).execute()
+        except HttpError as exc:
+            if event_key and _google_http_status(exc) == 409:
+                existing = service.events().get(calendarId=calendar_id, eventId=event_key).execute()
+                if str(existing.get("status") or "") == "cancelled" or not _is_own_google_event(existing, event_key):
+                    # A chave existe, mas o evento não é desta reserva (ou foi
+                    # excluído): confirmar a reserva com ele seria falso.
+                    raise CalendarProviderError(
+                        "Google Calendar já tem um evento com este identificador que não pertence a esta reserva."
+                    ) from exc
+                return str(existing.get("id") or event_key)
+            raise CalendarProviderError(
+                f"Google Calendar recusou a criação do evento (HTTP {_google_http_status(exc)})."
+            ) from exc
         return str(response.get("id")) if response.get("id") else None
 
     def cancel_external_event(
@@ -722,9 +852,49 @@ class GoogleCalendarProvider(BaseCalendarProvider):
         *,
         external_event_id: str,
     ) -> bool:
+        """True quando o evento foi excluído agora; False quando já não existia."""
+        from googleapiclient.errors import HttpError  # type: ignore
+
         service, calendar_id = self._get_google_service()
-        service.events().delete(calendarId=calendar_id, eventId=external_event_id).execute()
+        try:
+            service.events().delete(calendarId=calendar_id, eventId=external_event_id).execute()
+        except HttpError as exc:
+            # 404/410 para o ID que nós gravamos = exclusão já realizada, desde
+            # que o calendário em si esteja acessível (o Google também responde
+            # 404 para calendário inexistente ou sem compartilhamento). Falta de
+            # permissão ou credencial (401/403) continua sendo erro.
+            if _google_http_status(exc) in {404, 410} and self._calendar_accessible(service, calendar_id):
+                return False
+            raise CalendarProviderError(
+                f"Google Calendar recusou a exclusão do evento (HTTP {_google_http_status(exc)})."
+            ) from exc
         return True
+
+    @staticmethod
+    def _calendar_accessible(service: Any, calendar_id: str) -> bool:
+        try:
+            service.calendars().get(calendarId=calendar_id).execute()
+        except Exception:
+            return False
+        return True
+
+    def find_external_event(self, *, event_key: str) -> tuple[bool | None, str | None]:
+        from googleapiclient.errors import HttpError  # type: ignore
+
+        service, calendar_id = self._get_google_service()
+        try:
+            event = service.events().get(calendarId=calendar_id, eventId=event_key).execute()
+        except HttpError as exc:
+            if _google_http_status(exc) in {404, 410} and self._calendar_accessible(service, calendar_id):
+                return False, None
+            return None, None
+        if not _is_own_google_event(event, event_key):
+            # Evento com a mesma chave criado por outro ambiente: nem confirma
+            # nem libera a reserva; fica para revisão.
+            return None, None
+        if str(event.get("status") or "") == "cancelled":
+            return False, None
+        return True, str(event.get("id") or event_key)
 
     def update_external_event(
         self,
@@ -735,7 +905,10 @@ class GoogleCalendarProvider(BaseCalendarProvider):
         ends_at: datetime,
         timezone_name: str,
         description: str | None = None,
+        event_key: str | None = None,
     ) -> str | None:
+        from googleapiclient.errors import HttpError  # type: ignore
+
         if not external_event_id:
             return self.create_external_event(
                 title=title,
@@ -743,29 +916,39 @@ class GoogleCalendarProvider(BaseCalendarProvider):
                 ends_at=ends_at,
                 timezone_name=timezone_name,
                 description=description,
+                event_key=event_key,
             )
 
         service, calendar_id = self._get_google_service()
-        response = (
-            service.events()
-            .patch(
-                calendarId=calendar_id,
-                eventId=external_event_id,
-                body={
-                    "summary": title,
-                    "description": description or "",
-                    "start": {
-                        "dateTime": starts_at.isoformat(),
-                        "timeZone": timezone_name,
+        try:
+            response = (
+                service.events()
+                .patch(
+                    calendarId=calendar_id,
+                    eventId=external_event_id,
+                    body={
+                        "summary": title,
+                        "description": description or "",
+                        "start": {
+                            "dateTime": starts_at.isoformat(),
+                            "timeZone": timezone_name,
+                        },
+                        "end": {
+                            "dateTime": ends_at.isoformat(),
+                            "timeZone": timezone_name,
+                        },
                     },
-                    "end": {
-                        "dateTime": ends_at.isoformat(),
-                        "timeZone": timezone_name,
-                    },
-                },
+                )
+                .execute()
             )
-            .execute()
-        )
+        except HttpError as exc:
+            status = _google_http_status(exc)
+            if 400 <= status < 500:
+                # Recusa explícita: o evento não mudou.
+                raise CalendarProviderError(
+                    f"Google Calendar recusou a alteração do evento (HTTP {status})."
+                ) from exc
+            raise
         return str(response.get("id") or external_event_id)
 
 
@@ -839,9 +1022,10 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
         ends_at: datetime,
         timezone_name: str,
         description: str | None = None,
+        event_key: str | None = None,
     ) -> str | None:
         calendar = self._get_calendar()
-        uid = str(uuid.uuid4())
+        uid = event_key or str(uuid.uuid4())
         ical = "\r\n".join(
             [
                 "BEGIN:VCALENDAR",
@@ -901,6 +1085,18 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
         event.delete()
         return True
 
+    def find_external_event(self, *, event_key: str) -> tuple[bool | None, str | None]:
+        # CalDAV não distingue com segurança "não existe" de falha de busca:
+        # ausência vira "não sei" e a reserva fica para revisão, nunca liberada.
+        try:
+            calendar = self._get_calendar()
+            event = calendar.object_by_uid(event_key)
+        except Exception:
+            return None, None
+        if not event:
+            return None, None
+        return True, str(getattr(event, "url", event_key))
+
     def update_external_event(
         self,
         *,
@@ -910,6 +1106,7 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
         ends_at: datetime,
         timezone_name: str,
         description: str | None = None,
+        event_key: str | None = None,
     ) -> str | None:
         if not external_event_id:
             return self.create_external_event(
@@ -918,6 +1115,7 @@ class CalDAVCalendarProvider(BaseCalendarProvider):
                 ends_at=ends_at,
                 timezone_name=timezone_name,
                 description=description,
+                event_key=event_key,
             )
 
         calendar = self._get_calendar()
@@ -970,16 +1168,139 @@ def list_supported_calendar_providers() -> list[dict[str, Any]]:
     ]
 
 
+# Chaves de configuração que podem aparecer inteiras no painel.
+_DISPLAY_CONFIG_KEYS = frozenset({"calendar_name"})
+
+
+def _mask_config_value(value: str) -> str:
+    return "*" * len(value) if len(value) <= 4 else "*" * (len(value) - 4) + value[-4:]
+
+
+def public_calendar_integration(integration: dict[str, Any]) -> dict[str, Any]:
+    """Integração como pode sair pela API: sem credencial, identificadores mascarados.
+
+    `config` guarda `client_secret`, `refresh_token` e senha CalDAV. Quem precisa
+    do valor completo são os providers, que usam a integração interna; o painel
+    só precisa saber se cada credencial existe.
+    """
+    from app.tools.portability_security import is_sensitive_key
+
+    public = {key: value for key, value in integration.items() if key != "config"}
+    raw_config = integration.get("config")
+    safe_config: dict[str, Any] = {}
+    for key, value in (raw_config if isinstance(raw_config, dict) else {}).items():
+        name = str(key)
+        if name.endswith("_present") or isinstance(value, bool) or value is None:
+            safe_config[name] = value
+        elif is_sensitive_key(name):
+            safe_config[f"{name}_present"] = bool(value)
+        elif name in _DISPLAY_CONFIG_KEYS:
+            safe_config[name] = value
+        else:
+            safe_config[name] = _mask_config_value(str(value))
+    public["config"] = safe_config
+    if public.get("external_calendar_id"):
+        public["external_calendar_id"] = _mask_config_value(str(public["external_calendar_id"]))
+    return public
+
+
 def get_calendar_profile(company_id: int | None = None) -> dict[str, Any]:
     company_context = _resolve_company_context(company_id)
     integration = _resolve_calendar_integration(company_id=company_id)
     provider = _get_provider(integration)
     readiness = provider.readiness()
     return {
-        "integration": integration,
+        # Leitura de viewer: nunca devolver a configuração com credenciais.
+        "integration": public_calendar_integration(integration),
         "supported_providers": list_supported_calendar_providers(),
         "provider_readiness": readiness,
         "scheduling_profiles": _list_scheduling_profiles(company_context),
+    }
+
+
+def check_calendar_connection(company_id: int | None = None) -> dict[str, Any]:
+    """Exercise the configured calendar with a read-only availability query.
+
+    ``readiness()`` deliberately remains cheap and only checks configuration.
+    This explicit operator action proves that credentials can reach the remote
+    calendar without creating, changing, or deleting an event.
+    """
+    integration = _resolve_calendar_integration(company_id=company_id)
+    provider = _get_provider(integration)
+    readiness = provider.readiness()
+    provider_name = str(readiness.get("provider") or integration.get("provider") or "mock")
+    checked_at = datetime.now(UTC).isoformat()
+
+    if provider_name == "mock":
+        return {
+            "provider": provider_name,
+            "configured": True,
+            "connected": True,
+            "mode": "internal",
+            "checked_at": checked_at,
+            "details": "Agenda interna pronta; nenhuma conexão externa é necessária.",
+        }
+
+    if not readiness.get("ready"):
+        return {
+            "provider": provider_name,
+            "configured": False,
+            "connected": False,
+            "mode": "external",
+            "checked_at": checked_at,
+            "error_kind": "configuration",
+            "details": "A integração externa ainda não tem todas as credenciais necessárias.",
+        }
+
+    window_start = datetime.now(UTC)
+    try:
+        # A menor consulta útil confirma autenticação, calendário e permissão de
+        # leitura. Nenhum evento é criado durante o diagnóstico.
+        provider.list_busy_intervals(window_start, window_start + timedelta(minutes=1))
+    except CalendarProviderError as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.connection_check.failed",
+            company_id=company_id,
+            provider=provider_name,
+            error_type=type(exc).__name__,
+        )
+        return {
+            "provider": provider_name,
+            "configured": True,
+            "connected": False,
+            "mode": "external",
+            "checked_at": checked_at,
+            "error_kind": "provider",
+            "details": "A agenda externa recusou ou não concluiu a consulta de leitura.",
+        }
+    except Exception as exc:  # pragma: no cover - provider/network defensive boundary
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.connection_check.failed",
+            company_id=company_id,
+            provider=provider_name,
+            error_type=type(exc).__name__,
+        )
+        return {
+            "provider": provider_name,
+            "configured": True,
+            "connected": False,
+            "mode": "external",
+            "checked_at": checked_at,
+            "error_kind": "unavailable",
+            "details": "Não foi possível consultar a agenda externa agora.",
+        }
+
+    return {
+        "provider": provider_name,
+        "configured": True,
+        "connected": True,
+        "mode": "external",
+        "checked_at": checked_at,
+        "details": "Conexão e permissão de leitura confirmadas; nenhum evento foi alterado.",
     }
 
 
@@ -1253,12 +1574,12 @@ def create_calendar_booking(
         ignore_booking_ids={ignore_booking_id} if ignore_booking_id is not None else None,
     )
     if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in local_conflicts):
-        raise CalendarProviderError("O horário solicitado conflita com um agendamento já existente.")
+        raise BookingConflictError("O horário solicitado conflita com um agendamento já existente.")
 
     if ignore_booking_id is None:
         provider_conflicts = provider.list_busy_intervals(starts_at_dt, ends_at_dt)
         if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in provider_conflicts):
-            raise CalendarProviderError("O horário solicitado conflita com um evento já existente no calendário externo.")
+            raise BookingConflictError("O horário solicitado conflita com um evento já existente no calendário externo.")
 
     billing_decision: dict[str, Any] | None = None
     if company_id is not None:
@@ -1270,41 +1591,103 @@ def create_calendar_booking(
         except BillingLimitError as exc:
             raise CalendarProviderError(str(exc)) from exc
 
+    booking_confirmed = False
     try:
-        external_event_id = provider.create_external_event(
-            title=title,
-            starts_at=starts_at_dt,
-            ends_at=ends_at_dt,
-            timezone_name=timezone_value,
-            description=description,
-        )
-        booking_id = repository.create_appointment_booking(
-            company_id=company_id,
-            contact_id=contact_id,
-            integration_id=integration.get("integration_id"),
-            provider=str(integration["provider"]),
+        # Capacidade primeiro (070): a linha `pending` ocupa o intervalo no
+        # recurso antes do efeito externo, numa transação curta que já terminou
+        # quando a chamada de rede começa. Duas confirmações simultâneas não
+        # passam ambas: a guarda do banco recusa a segunda.
+        try:
+            booking_id = repository.create_appointment_booking(
+                company_id=company_id,
+                contact_id=contact_id,
+                integration_id=integration.get("integration_id"),
+                provider=str(integration["provider"]),
+                external_event_id=None,
+                scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
+                customer_profile=customer_profile,
+                title=title,
+                description=description,
+                starts_at=_to_utc_iso(starts_at_dt),
+                ends_at=_to_utc_iso(ends_at_dt),
+                timezone=timezone_value,
+                status="pending",
+            )
+        except BookingCapacityConflictError as exc:
+            raise _capacity_conflict(exc) from exc
+
+        try:
+            external_event_id = provider.create_external_event(
+                title=title,
+                starts_at=starts_at_dt,
+                ends_at=ends_at_dt,
+                timezone_name=timezone_value,
+                description=description,
+                event_key=stable_event_key(company_id, booking_id),
+            )
+        except CalendarProviderError:
+            # Recusa explícita do provider: nenhum evento foi criado.
+            _release_reservation(booking_id, company_id=company_id)
+            raise
+        except Exception as exc:
+            # Sem resposta (timeout, rede): o evento pode existir com a chave
+            # estável. A vaga não é devolvida a outro cliente; a reserva
+            # `pending` fica para a reconciliação e a operação para revisão.
+            log_event(
+                logger,
+                logging.WARNING,
+                "calendar.booking.external_create_uncertain",
+                booking_id=booking_id,
+                error_type=type(exc).__name__,
+            )
+            raise ExternalCalendarUncertainError(
+                "Não foi possível confirmar a criação do evento na agenda externa; o agendamento ficou em verificação."
+            ) from exc
+
+        if not repository.confirm_appointment_booking_reservation(
+            booking_id,
             external_event_id=external_event_id,
-            scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
-            customer_profile=customer_profile,
-            title=title,
-            description=description,
-            starts_at=_to_utc_iso(starts_at_dt),
-            ends_at=_to_utc_iso(ends_at_dt),
-            timezone=timezone_value,
-            status="confirmed",
-        )
-        booking = next(
-            (
-                item
-                for item in repository.get_appointment_bookings(company_id=company_id)
-                if int(item["id"]) == booking_id
-            ),
-            None,
-        )
+            company_id=company_id,
+        ):
+            # Reserva alterada por outro caminho durante a chamada externa (ex.:
+            # cancelada enquanto o evento era criado). Se ela já não existe ou
+            # foi cancelada, o evento recém-criado é órfão e sai da agenda.
+            compensated = _compensate_orphan_event(
+                provider,
+                booking_id=booking_id,
+                company_id=company_id,
+                external_event_id=external_event_id,
+            )
+            log_event(
+                logger,
+                logging.WARNING,
+                "calendar.booking.reservation_changed_during_sync",
+                booking_id=booking_id,
+                external_event_created=bool(external_event_id),
+                orphan_event_removed=compensated,
+            )
+            raise CalendarProviderError(
+                "A reserva foi alterada durante a sincronização com a agenda; revise o agendamento."
+            )
+        booking_confirmed = True
+        booking = repository.get_appointment_booking(booking_id, company_id=company_id)
         if not booking:
             raise CalendarProviderError("Booking não encontrado após criação.")
 
-        scheduled_reminders = schedule_booking_customer_reminders(booking)
+        # Passos derivados de um booking já confirmado não desfazem nem negam a
+        # reserva: falha em lembrete ou gatilho fica registrada, e o cliente
+        # recebe a confirmação verdadeira (sem estorno de uso indevido).
+        try:
+            scheduled_reminders = schedule_booking_customer_reminders(booking)
+        except Exception as exc:
+            scheduled_reminders = []
+            log_event(
+                logger,
+                logging.WARNING,
+                "calendar.booking.reminders_failed_after_confirmation",
+                booking_id=booking_id,
+                error_type=type(exc).__name__,
+            )
         # `trigger.appointmentBooked` está na paleta do editor. Sem esta
         # emissão, um fluxo publicado com esse gatilho nunca dispararia — o
         # produto ofereceria um gatilho morto.
@@ -1313,11 +1696,20 @@ def create_calendar_booking(
         # aconteceu, e `emit_event` é idempotente por `event_key`, então uma
         # reentrega encontra o evento existente em vez de inscrever de novo.
         if company_id is not None:
-            emit_appointment_booked(
-                company_id=int(company_id),
-                appointment_id=booking_id,
-                contact_id=contact_id,
-            )
+            try:
+                emit_appointment_booked(
+                    company_id=int(company_id),
+                    appointment_id=booking_id,
+                    contact_id=contact_id,
+                )
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "calendar.booking.trigger_failed_after_confirmation",
+                    booking_id=booking_id,
+                    error_type=type(exc).__name__,
+                )
         return {
             **booking,
             "provider_readiness": readiness,
@@ -1325,7 +1717,7 @@ def create_calendar_booking(
             "scheduling_profile": scheduling_profile,
         }
     except Exception:
-        if company_id is not None and billing_decision is not None:
+        if company_id is not None and billing_decision is not None and not booking_confirmed:
             refund_usage_reservation(
                 company_id=int(company_id),
                 decision=billing_decision,
@@ -1340,7 +1732,11 @@ def _sync_booking_cancellation(
     integration: dict[str, Any],
 ) -> dict[str, Any]:
     external_event_id = str(booking.get("external_event_id") or "").strip()
-    if not external_event_id or str(integration.get("provider") or "mock") == "mock":
+    provider_name = str(integration.get("provider") or "mock")
+    unresolved_pending = (
+        not external_event_id and provider_name != "mock" and str(booking.get("status") or "") == "pending"
+    )
+    if (not external_event_id and not unresolved_pending) or provider_name == "mock":
         return {
             "attempted": False,
             "status": "not_required",
@@ -1352,25 +1748,243 @@ def _sync_booking_cancellation(
     if not readiness["ready"]:
         raise CalendarProviderError(str(readiness["details"]))
 
-    provider.cancel_external_event(external_event_id=external_event_id)
+    if unresolved_pending:
+        # Reserva cuja criação ficou sem resposta: o evento pode existir com a
+        # chave estável. Cancelar só localmente deixaria o horário ocupado na
+        # agenda externa para sempre (a reconciliação só olha `pending`).
+        exists, found_event_id = provider.find_external_event(
+            event_key=stable_event_key(booking.get("company_id"), int(booking["id"]))
+        )
+        if exists is None:
+            raise ExternalCalendarUncertainError(
+                "A reserva ainda está em verificação com a agenda externa; tente cancelar novamente em alguns minutos."
+            )
+        if not exists or not found_event_id:
+            return {
+                "attempted": True,
+                "status": "not_found",
+                "provider": integration.get("provider"),
+                "external_event_id": None,
+            }
+        external_event_id = found_event_id
+
+    removed_now = provider.cancel_external_event(external_event_id=external_event_id)
     return {
         "attempted": True,
-        "status": "cancelled",
+        "status": "cancelled" if removed_now else "already_absent",
         "provider": integration.get("provider"),
         "external_event_id": external_event_id,
     }
+
+
+def _compensate_orphan_event(
+    provider: BaseCalendarProvider,
+    *,
+    booking_id: int,
+    company_id: int | None,
+    external_event_id: str | None,
+) -> bool:
+    """Remove o evento criado para uma reserva que deixou de existir durante a chamada."""
+    if not external_event_id:
+        return False
+    try:
+        current = repository.get_appointment_booking(booking_id, company_id=company_id)
+        if current is not None and str(current.get("status") or "") != "cancelled":
+            # Confirmada por outro caminho (reconciliação): o evento é dela.
+            return False
+        provider.cancel_external_event(external_event_id=external_event_id)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.booking.orphan_event_compensation_failed",
+            booking_id=booking_id,
+            error_type=type(exc).__name__,
+        )
+        return False
+    return True
+
+
+def _same_integration(booking: dict[str, Any], integration: dict[str, Any]) -> bool:
+    """A integração atual é a mesma que criou a reserva?"""
+    if str(booking.get("provider") or "") != str(integration.get("provider") or ""):
+        return False
+    booking_integration = booking.get("integration_id")
+    current_integration = integration.get("integration_id")
+    if booking_integration is None or current_integration is None:
+        return booking_integration == current_integration
+    return int(booking_integration) == int(current_integration)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def reconcile_pending_reservations(*, older_than_minutes: int = 15, limit: int = 50) -> list[dict[str, Any]]:
+    """Resolve reservas `pending` que ficaram sem confirmação (P04).
+
+    Evento externo existente com a chave estável → confirma a reserva (a verdade
+    é a agenda externa; a operação segue em revisão para avisar o cliente).
+    Evento inexistente com certeza → libera a vaga. Resposta incerta → mantém.
+    """
+    threshold = _utcnow() - timedelta(minutes=max(1, older_than_minutes))
+    results: list[dict[str, Any]] = []
+    for booking in repository.get_stale_pending_bookings(created_before=threshold, limit=limit):
+        booking_id = int(booking["id"])
+        company_id = booking.get("company_id")
+        try:
+            integration = _resolve_calendar_integration(company_id=company_id)
+            if not _same_integration(booking, integration):
+                # A integração mudou ou foi desativada: perguntar a outra agenda
+                # (ou ao mock, que sempre responde "não existe") liberaria a vaga
+                # de um evento que pode existir na agenda original.
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "calendar.booking.pending_reconciliation_integration_changed",
+                    booking_id=booking_id,
+                )
+                results.append({"booking_id": booking_id, "action": "pending_needs_review"})
+                continue
+            provider = _get_provider(integration)
+            exists, external_event_id = provider.find_external_event(
+                event_key=stable_event_key(company_id, booking_id)
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "calendar.booking.pending_reconciliation_failed",
+                booking_id=booking_id,
+                error_type=type(exc).__name__,
+            )
+            continue
+        if exists is True:
+            if repository.confirm_appointment_booking_reservation(
+                booking_id,
+                external_event_id=external_event_id,
+                company_id=company_id,
+            ):
+                confirmed = repository.get_appointment_booking(booking_id, company_id=company_id)
+                if confirmed:
+                    try:
+                        schedule_booking_customer_reminders(confirmed)
+                    except Exception as exc:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "calendar.booking.reconciled_reminders_failed",
+                            booking_id=booking_id,
+                            error_type=type(exc).__name__,
+                        )
+                results.append({"booking_id": booking_id, "action": "pending_confirmed_from_external"})
+        elif exists is False:
+            if repository.release_appointment_booking_reservation(booking_id, company_id=company_id):
+                results.append({"booking_id": booking_id, "action": "pending_released"})
+        else:
+            log_event(
+                logger,
+                logging.WARNING,
+                "calendar.booking.pending_reconciliation_unknown",
+                booking_id=booking_id,
+            )
+            results.append({"booking_id": booking_id, "action": "pending_needs_review"})
+    return results
+
+
+def _capacity_conflict(exc: BookingCapacityConflictError) -> BookingConflictError:
+    if isinstance(exc, BookingResourceUnavailableError):
+        return BookingConflictError(str(exc))
+    return BookingConflictError("O horário solicitado conflita com um agendamento já existente.")
+
+
+def _release_reservation(booking_id: int, *, company_id: int | None) -> None:
+    """Libera a capacidade reservada quando o efeito externo falhou.
+
+    Falha ao liberar não substitui o erro original do provider; a reserva
+    `pending` remanescente fica para a reconciliação (P04).
+    """
+    try:
+        repository.release_appointment_booking_reservation(booking_id, company_id=company_id)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.booking.reservation_release_failed",
+            booking_id=booking_id,
+            error_type=type(exc).__name__,
+        )
+
+
+def _release_hold(booking_id: int, *, company_id: int | None) -> None:
+    try:
+        repository.clear_appointment_booking_hold(booking_id, company_id=company_id)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.booking.hold_release_failed",
+            booking_id=booking_id,
+            error_type=type(exc).__name__,
+        )
+
+
+def _load_booking_rules(company_id: int | None) -> BookingRules:
+    """Regras de cancelamento/remarcação da política publicada da empresa."""
+    if company_id is None:
+        return build_effective_policy(context=None, policies=None).booking_rules
+    return resolve_effective_policy(get_company_config(int(company_id))).booking_rules
+
+
+def _enforce_booking_change_policy(
+    booking: dict[str, Any],
+    *,
+    change: str,
+    actor: str,
+) -> BookingChangeDecision:
+    """A08: aplica a política publicada antes de qualquer efeito.
+
+    `customer`/`automation` seguem só com `allowed`; `operator` também segue
+    com `requires_human` (é o humano exigido); ninguém segue com `denied`.
+    """
+    if actor not in BOOKING_ACTORS:
+        raise CalendarProviderError(f"actor must be one of: {', '.join(BOOKING_ACTORS)}.")
+    rules = _load_booking_rules(booking.get("company_id"))
+    rule = rules.cancellation if change == "cancellation" else rules.reschedule
+    starts_at = _parse_iso_datetime(
+        str(booking["starts_at"]),
+        str(booking.get("timezone") or settings.calendar_timezone),
+    )
+    decision = evaluate_booking_change(rule, starts_at=starts_at, now=_utcnow())
+    if decision.outcome == "allowed":
+        return decision
+    if decision.outcome == "requires_human" and actor == "operator":
+        return decision
+    label = "Cancelamento" if change == "cancellation" else "Remarcação"
+    message = (
+        f"{label} fora da política da empresa; encaminhe para atendimento humano."
+        if decision.outcome == "requires_human"
+        else f"{label} não permitido pela política da empresa."
+    )
+    raise BookingPolicyError(message, outcome=decision.outcome, reason=decision.reason)
+
+
+def _policy_decision_payload(decision: BookingChangeDecision, actor: str) -> dict[str, str]:
+    return {"outcome": decision.outcome, "reason": decision.reason, "actor": actor}
 
 
 def cancel_calendar_booking(
     *,
     booking_id: int,
     company_id: int | None = None,
+    actor: str = "customer",
 ) -> dict[str, Any]:
     booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
-        raise CalendarProviderError("Booking not found.")
+        raise BookingNotFoundError("Booking not found.")
     if str(booking.get("status") or "") not in {"confirmed", "pending"}:
         raise CalendarProviderError("Only confirmed or pending bookings can be cancelled.")
+    policy_decision = _enforce_booking_change_policy(booking, change="cancellation", actor=actor)
 
     booking_company_id = booking.get("company_id")
     integration = _resolve_calendar_integration(company_id=booking_company_id)
@@ -1397,6 +2011,7 @@ def cancel_calendar_booking(
         ),
         "cancelled_reminders": cancelled_reminders,
         "external_sync": external_sync,
+        "policy_decision": _policy_decision_payload(policy_decision, actor),
     }
 
 
@@ -1412,12 +2027,14 @@ def reschedule_calendar_booking(
     customer_profile: str | None = None,
     request_context: str | None = None,
     company_id: int | None = None,
+    actor: str = "customer",
 ) -> dict[str, Any]:
     booking = repository.get_appointment_booking(booking_id, company_id=company_id)
     if not booking:
-        raise CalendarProviderError("Booking not found.")
+        raise BookingNotFoundError("Booking not found.")
     if str(booking.get("status") or "") not in {"confirmed", "pending"}:
         raise CalendarProviderError("Only confirmed or pending bookings can be rescheduled.")
+    policy_decision = _enforce_booking_change_policy(booking, change="reschedule", actor=actor)
 
     company_id = booking.get("company_id")
     company_context = _resolve_company_context(company_id)
@@ -1449,6 +2066,16 @@ def reschedule_calendar_booking(
     readiness = provider.readiness()
     if not readiness["ready"] and integration["provider"] != "mock":
         raise CalendarProviderError(str(readiness["details"]))
+    if (
+        str(booking.get("status") or "") == "pending"
+        and not str(booking.get("external_event_id") or "").strip()
+        and str(integration.get("provider") or "mock") != "mock"
+    ):
+        # Criação ainda sem resposta: remarcar criaria um segundo evento ao lado
+        # do que pode existir com a chave estável. Espera a reconciliação.
+        raise ExternalCalendarUncertainError(
+            "O agendamento ainda está em confirmação com a agenda externa; tente remarcar em alguns minutos."
+        )
 
     local_conflicts = _get_local_busy_intervals(
         company_id,
@@ -1457,28 +2084,97 @@ def reschedule_calendar_booking(
         ignore_booking_ids={booking_id},
     )
     if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in local_conflicts):
-        raise CalendarProviderError("O horário solicitado conflita com um agendamento já existente.")
+        raise BookingConflictError("O horário solicitado conflita com um agendamento já existente.")
 
-    external_event_id = provider.update_external_event(
-        external_event_id=str(booking.get("external_event_id") or "").strip() or None,
-        title=resolved_title,
-        starts_at=starts_at_dt,
-        ends_at=ends_at_dt,
-        timezone_name=resolved_timezone_name,
-        description=str(resolved_description) if resolved_description is not None else None,
-    )
-    repository.update_appointment_booking_schedule(
-        booking_id,
-        starts_at=_to_utc_iso(starts_at_dt),
-        ends_at=_to_utc_iso(ends_at_dt),
-        timezone=resolved_timezone_name,
-        external_event_id=external_event_id,
-        scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
-        customer_profile=str(resolved_customer_profile) if resolved_customer_profile is not None else None,
-        title=resolved_title,
-        description=str(resolved_description) if resolved_description is not None else None,
-        company_id=company_id,
-    )
+    if str(integration.get("provider") or "mock") != "mock":
+        # A07: a oferta de horário pode ter ficado velha — alguém pode ter
+        # marcado algo direto na agenda externa. O próprio evento do booking
+        # aparece como ocupado e é descontado pelo intervalo atual.
+        booking_timezone = str(booking.get("timezone") or resolved_timezone_name)
+        own_start = _parse_iso_datetime(str(booking["starts_at"]), booking_timezone)
+        own_end = _parse_iso_datetime(str(booking["ends_at"]), booking_timezone)
+        external_busy = [
+            item
+            for item in provider.list_busy_intervals(starts_at_dt, ends_at_dt)
+            if not (item.starts_at == own_start and item.ends_at == own_end)
+        ]
+        if any(_intervals_overlap(starts_at_dt, ends_at_dt, item.starts_at, item.ends_at) for item in external_busy):
+            raise BookingConflictError("O horário solicitado conflita com um evento já existente no calendário externo.")
+
+    # Mesma guarda da criação (070): o novo intervalo é retido na própria linha
+    # antes do efeito externo, sem soltar o atual. Se o provider falhar, o hold
+    # sai e a reserva original fica intacta.
+    try:
+        held = repository.hold_appointment_booking_interval(
+            booking_id,
+            hold_starts_at=_to_utc_iso(starts_at_dt),
+            hold_ends_at=_to_utc_iso(ends_at_dt),
+            company_id=company_id,
+        )
+    except BookingCapacityConflictError as exc:
+        raise _capacity_conflict(exc) from exc
+    if not held:
+        raise BookingConflictError(
+            "O agendamento foi alterado por outra operação em andamento; tente novamente."
+        )
+
+    try:
+        external_event_id = provider.update_external_event(
+            external_event_id=str(booking.get("external_event_id") or "").strip() or None,
+            title=resolved_title,
+            starts_at=starts_at_dt,
+            ends_at=ends_at_dt,
+            timezone_name=resolved_timezone_name,
+            description=str(resolved_description) if resolved_description is not None else None,
+            event_key=stable_event_key(company_id, booking_id),
+        )
+    except CalendarProviderError:
+        # Recusa explícita: o evento externo não mudou; a reserva original fica.
+        _release_hold(booking_id, company_id=company_id)
+        raise
+    except Exception as exc:
+        # Sem resposta: o PATCH pode ter sido aplicado. O hold continua retendo
+        # o novo intervalo (ninguém o recebe) e o resultado vai para revisão;
+        # aparece no resumo operacional como remarcação em aberto.
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.booking.external_update_uncertain",
+            booking_id=booking_id,
+            error_type=type(exc).__name__,
+        )
+        raise ExternalCalendarUncertainError(
+            "Não foi possível confirmar a remarcação na agenda externa; o agendamento ficou em verificação."
+        ) from exc
+    try:
+        schedule_updated = repository.update_appointment_booking_schedule(
+            booking_id,
+            starts_at=_to_utc_iso(starts_at_dt),
+            ends_at=_to_utc_iso(ends_at_dt),
+            timezone=resolved_timezone_name,
+            external_event_id=external_event_id,
+            scheduling_profile_key=scheduling_profile.get("key") if scheduling_profile else None,
+            customer_profile=str(resolved_customer_profile) if resolved_customer_profile is not None else None,
+            title=resolved_title,
+            description=str(resolved_description) if resolved_description is not None else None,
+            company_id=company_id,
+        )
+    except BookingCapacityConflictError as exc:
+        raise _capacity_conflict(exc) from exc
+    if not schedule_updated:
+        # Cancelado ou alterado por outro caminho durante a chamada externa: não
+        # grava o novo horário nem agenda lembretes. O evento externo pode ter
+        # mudado — resultado incerto, vai para revisão/reconciliação.
+        log_event(
+            logger,
+            logging.WARNING,
+            "calendar.booking.reschedule_target_changed",
+            booking_id=booking_id,
+            external_event_updated=bool(external_event_id),
+        )
+        raise CalendarProviderError(
+            "O agendamento foi alterado por outra operação durante a remarcação; revise o agendamento."
+        )
     cancelled_reminders = repository.cancel_customer_reminders_for_booking(
         booking_id,
         company_id=company_id,
@@ -1493,6 +2189,7 @@ def reschedule_calendar_booking(
         "scheduled_reminders": scheduled_reminders,
         "cancelled_reminders": cancelled_reminders,
         "scheduling_profile": scheduling_profile,
+        "policy_decision": _policy_decision_payload(policy_decision, actor),
         "external_sync": {
             "attempted": bool(str(booking.get("external_event_id") or "").strip() or external_event_id),
             "status": "updated" if external_event_id else "local_only",
@@ -1527,11 +2224,15 @@ def create_calendar_integration(
     )
     if not integration:
         raise CalendarProviderError("Calendar integration not found after creation.")
-    return integration
+    # A resposta de criação vai para a API e para o resultado do onboarding.
+    return public_calendar_integration(integration)
 
 
 def get_calendar_integrations(company_id: int | None = None) -> list[dict[str, Any]]:
-    return repository.get_calendar_integrations(company_id=company_id)
+    return [
+        public_calendar_integration(integration)
+        for integration in repository.get_calendar_integrations(company_id=company_id)
+    ]
 
 
 def get_calendar_bookings(company_id: int | None = None) -> list[dict[str, Any]]:

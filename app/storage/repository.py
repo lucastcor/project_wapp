@@ -4,7 +4,8 @@ import inspect
 import json
 import re
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -16,6 +17,14 @@ from app.storage.db import (
     get_connection,
     get_database_backend,
     is_unique_violation,
+)
+from app.storage.migrations_booking_capacity import (
+    DEFAULT_RESOURCE_KEY,
+    DEFAULT_RESOURCE_LABEL,
+    RESOURCE_KEY_PATTERN,
+    BookingCapacityConflictError,
+    BookingResourceUnavailableError,
+    is_booking_capacity_violation,
 )
 
 PLACEHOLDER_COMPANY_SLUGS = {
@@ -60,6 +69,12 @@ def _is_active_phone_number_conflict(error: BaseException) -> bool:
 ALWAYS_TRUE_CONDITION = "1 = 1"
 # Bare column, or `alias.column`. Anything else is rejected outright.
 _SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def _iso_timestamp(moment: datetime) -> str:
+    """Fixed-width UTC text for SQLite ordering and PostgreSQL parity."""
+    normalized = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    return normalized.isoformat(timespec="microseconds")
 
 
 def _optional_equals(column: str, value: Any) -> tuple[str, tuple[Any, ...]]:
@@ -896,6 +911,36 @@ class RuntimeRepository:
 
         return [dict(row) for row in rows]
 
+    def get_latest_message_with_reply_source(
+        self,
+        contact_id: str,
+        *,
+        company_id: int,
+        reply_source: str,
+    ) -> dict[str, Any] | None:
+        """Última mensagem do contato respondida por uma origem específica.
+
+        Usada para não repetir avisos automáticos (ex.: fora do horário) a
+        cada nova mensagem do mesmo cliente.
+        """
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, contact_id, company_id, reply_source, action, created_at
+            FROM messages
+            WHERE company_id = ?
+              AND contact_id = ?
+              AND reply_source = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (company_id, contact_id, reply_source),
+        )
+        row = cursor.fetchone()
+        connection.close()
+        return dict(row) if row else None
+
     def get_contact(
         self,
         contact_id: str,
@@ -1318,6 +1363,31 @@ class RuntimeRepository:
 
         return int(pending_question_id)
 
+    def has_open_pending_question(
+        self,
+        contact_id: str,
+        *,
+        company_id: int,
+        question_type: str,
+    ) -> bool:
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT 1
+            FROM pending_questions
+            WHERE company_id = ?
+              AND contact_id = ?
+              AND question_type = ?
+              AND status = 'pending'
+            LIMIT 1
+            """,
+            (company_id, contact_id, question_type),
+        )
+        row = cursor.fetchone()
+        connection.close()
+        return row is not None
+
     def get_pending_questions(
         self,
         *,
@@ -1730,7 +1800,7 @@ class RuntimeRepository:
                 source_conversation_id,
                 source_candidate_id,
                 approved_by,
-                datetime.now(UTC).isoformat() if approved_by else None,
+                _iso_timestamp(datetime.now(UTC)) if approved_by else None,
                 int(pii_scrubbed),
             ),
         )
@@ -2193,6 +2263,7 @@ class RuntimeRepository:
         pending_question_id: int | None = None,
         status: str = "pending",
         company_id: int | None = None,
+        template_parameters: list[str] | None = None,
     ) -> int:
         connection = get_connection()
         cursor = connection.cursor()
@@ -2205,11 +2276,21 @@ class RuntimeRepository:
                 pending_question_id,
                 message,
                 source,
-                status
+                status,
+                template_parameters_json
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (contact_id, company_id, pending_question_id, message, source, status),
+            (
+                contact_id,
+                company_id,
+                pending_question_id,
+                message,
+                source,
+                status,
+                # Parâmetros do template usados só fora da janela de 24 h (071).
+                json.dumps(template_parameters, ensure_ascii=False) if template_parameters is not None else None,
+            ),
         )
 
         outbound_message_id = cursor.lastrowid
@@ -2248,7 +2329,10 @@ class RuntimeRepository:
                 provider_response_json,
                 failed_at,
                 created_at,
-                sent_at
+                sent_at,
+                template_parameters_json,
+                delivery_status,
+                delivery_updated_at
             FROM outbound_messages
             WHERE {company_id_condition}
             ORDER BY id DESC
@@ -2292,7 +2376,10 @@ class RuntimeRepository:
                 provider_response_json,
                 failed_at,
                 created_at,
-                sent_at
+                sent_at,
+                template_parameters_json,
+                delivery_status,
+                delivery_updated_at
             FROM outbound_messages
             WHERE id = ?
               AND {company_id_condition}
@@ -2392,12 +2479,12 @@ class RuntimeRepository:
                 (
                     channel,
                     max(1, max_attempts),
-                    now.isoformat(),
+                    _iso_timestamp(now),
                     claim_token,
                     outbound_message_id,
                     *company_params,
-                    now.isoformat(),
-                    stale_before.isoformat(),
+                    _iso_timestamp(now),
+                    _iso_timestamp(stale_before),
                 ),
             )
             if cursor.rowcount != 1:
@@ -2477,8 +2564,8 @@ class RuntimeRepository:
                 (
                     lease_name,
                     owner_token,
-                    expires_at.isoformat(),
-                    now.isoformat(),
+                    _iso_timestamp(expires_at),
+                    _iso_timestamp(now),
                     owner_token,
                 ),
             )
@@ -3470,51 +3557,380 @@ class RuntimeRepository:
         customer_profile: str | None = None,
         description: str | None = None,
         status: str = "confirmed",
+        resource_id: int | None = None,
     ) -> int:
-        connection = get_connection()
-        cursor = connection.cursor()
+        """Grava o agendamento; a linha ocupa capacidade no recurso (070).
 
+        Agendamento de empresa sem `resource_id` vai para o recurso `default`
+        da empresa, criado na mesma transação se ainda não existir. Sobreposição
+        ativa no mesmo recurso levanta `BookingCapacityConflictError`, vinda da
+        guarda do banco — não de uma leitura prévia que outra conexão invalida.
+        """
+        with self._booking_capacity_transaction() as cursor:
+            resolved_resource_id = self._resolve_booking_resource_id(
+                cursor,
+                company_id=company_id,
+                resource_id=resource_id,
+            )
+            # Serializa por (empresa, recurso) antes do INSERT: sem o lock, duas
+            # inserções conflitantes podem terminar em deadlock (40P01) em vez
+            # da violação da guarda, e o cliente não recebe "horário ocupado".
+            self._lock_booking_capacity(cursor, company_id=company_id, resource_id=resolved_resource_id)
+            cursor.execute(
+                """
+                INSERT INTO appointment_bookings (
+                    company_id,
+                    contact_id,
+                    integration_id,
+                    resource_id,
+                    provider,
+                    external_event_id,
+                    scheduling_profile_key,
+                    customer_profile,
+                    title,
+                    description,
+                    starts_at,
+                    ends_at,
+                    timezone,
+                    status,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    company_id,
+                    contact_id,
+                    integration_id,
+                    resolved_resource_id,
+                    provider,
+                    external_event_id,
+                    scheduling_profile_key,
+                    customer_profile,
+                    title,
+                    description,
+                    starts_at,
+                    ends_at,
+                    timezone,
+                    status,
+                ),
+            )
+            booking_id = cursor.lastrowid
+        return int(booking_id)
+
+    @classmethod
+    @contextmanager
+    def _booking_capacity_transaction(
+        cls,
+        *,
+        lock_booking_id: int | None = None,
+        company_id: int | None = None,
+    ) -> Iterator[Any]:
+        """Transação de escrita em agendamento sob a guarda de capacidade.
+
+        SQLite toma o lock de escrita antes da primeira leitura (como
+        `init_db`). No PostgreSQL, `lock_booking_id` serializa a escrita pelo
+        recurso do agendamento (ver `_lock_booking_capacity`). A violação da
+        guarda vira `BookingCapacityConflictError`; qualquer outra falha de
+        integridade continua propagando como está.
+        """
+        try:
+            with db_transaction() as connection:
+                cursor = connection.cursor()
+                if get_database_backend() == "sqlite":
+                    cursor.execute("BEGIN IMMEDIATE")
+                elif lock_booking_id is not None:
+                    company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+                    cursor.execute(
+                        f"""
+                        SELECT company_id, resource_id
+                        FROM appointment_bookings
+                        WHERE id = ?
+                          AND {company_id_condition}
+                        """,
+                        (lock_booking_id, *company_id_params),
+                    )
+                    row = cursor.fetchone()
+                    if row is not None:
+                        cls._lock_booking_capacity(
+                            cursor,
+                            company_id=dict(row)["company_id"],
+                            resource_id=dict(row)["resource_id"],
+                        )
+                yield cursor
+        except Exception as exc:
+            if is_booking_capacity_violation(exc):
+                raise BookingCapacityConflictError(
+                    "O intervalo já está ocupado por outro agendamento no mesmo recurso."
+                ) from exc
+            raise
+
+    @staticmethod
+    def _lock_booking_capacity(cursor: Any, *, company_id: int | None, resource_id: int | None) -> None:
+        """Serializa escritas de capacidade por (empresa, recurso) no PostgreSQL.
+
+        A constraint de exclusão é a garantia; o lock só torna o resultado
+        determinístico. Sem ele, inserções conflitantes simultâneas esperam
+        uma pela outra dentro da checagem de exclusão e o PostgreSQL aborta
+        uma por deadlock (40P01) em vez de devolver a violação da guarda. A
+        transação é curta e nunca abrange chamada de rede.
+        """
+        if company_id is None or resource_id is None or get_database_backend() != "postgres":
+            return
+        cursor.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+            (f"booking_capacity:{int(company_id)}:{int(resource_id)}",),
+        )
+        cursor.fetchone()
+
+    @staticmethod
+    def _ensure_default_resource_row(cursor: Any, company_id: int) -> dict[str, Any]:
         cursor.execute(
             """
-            INSERT INTO appointment_bookings (
-                company_id,
-                contact_id,
-                integration_id,
-                provider,
-                external_event_id,
-                scheduling_profile_key,
-                customer_profile,
-                title,
-                description,
-                starts_at,
-                ends_at,
-                timezone,
-                status,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO booking_resources (company_id, resource_key, label, capacity, active, updated_at)
+            VALUES (?, ?, ?, 1, 1, CURRENT_TIMESTAMP)
+            ON CONFLICT (company_id, resource_key) DO NOTHING
             """,
-            (
-                company_id,
-                contact_id,
-                integration_id,
-                provider,
-                external_event_id,
-                scheduling_profile_key,
-                customer_profile,
-                title,
-                description,
-                starts_at,
-                ends_at,
-                timezone,
-                status,
-            ),
+            (company_id, DEFAULT_RESOURCE_KEY, DEFAULT_RESOURCE_LABEL),
         )
+        cursor.execute(
+            """
+            SELECT id, company_id, resource_key, label, capacity, active, created_at, updated_at
+            FROM booking_resources
+            WHERE company_id = ?
+              AND resource_key = ?
+            """,
+            (company_id, DEFAULT_RESOURCE_KEY),
+        )
+        return dict(cursor.fetchone())
 
-        booking_id = cursor.lastrowid
-        connection.commit()
+    @classmethod
+    def _resolve_booking_resource_id(
+        cls,
+        cursor: Any,
+        *,
+        company_id: int | None,
+        resource_id: int | None,
+    ) -> int | None:
+        if company_id is None:
+            if resource_id is not None:
+                raise BookingResourceUnavailableError("Recurso reservável exige empresa.")
+            return None
+        if resource_id is None:
+            resource = cls._ensure_default_resource_row(cursor, int(company_id))
+        else:
+            cursor.execute(
+                "SELECT id, active FROM booking_resources WHERE id = ? AND company_id = ?",
+                (int(resource_id), int(company_id)),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise BookingResourceUnavailableError("Recurso não encontrado para a empresa.")
+            resource = dict(row)
+        if not int(resource["active"]):
+            raise BookingResourceUnavailableError("Recurso inativo não aceita novos agendamentos.")
+        return int(resource["id"])
+
+    def ensure_default_booking_resource(self, company_id: int) -> dict[str, Any]:
+        """Recurso `default` (capacidade 1) da empresa, criado se não existir."""
+        with self._booking_capacity_transaction() as cursor:
+            return self._ensure_default_resource_row(cursor, int(company_id))
+
+    def create_booking_resource(
+        self,
+        *,
+        company_id: int,
+        resource_key: str,
+        label: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_key = str(resource_key or "").strip().lower()
+        if not RESOURCE_KEY_PATTERN.fullmatch(normalized_key):
+            raise ValueError("resource_key must match [a-z0-9][a-z0-9_-]{0,63}.")
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                INSERT INTO booking_resources (company_id, resource_key, label, capacity, active, updated_at)
+                VALUES (?, ?, ?, 1, 1, CURRENT_TIMESTAMP)
+                """,
+                (int(company_id), normalized_key, label),
+            )
+        resource = self.get_booking_resource(company_id=int(company_id), resource_key=normalized_key)
+        if resource is None:
+            raise RuntimeError("Booking resource not found after creation.")
+        return resource
+
+    def get_booking_resource(self, *, company_id: int, resource_key: str) -> dict[str, Any] | None:
+        with db_session() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT id, company_id, resource_key, label, capacity, active, created_at, updated_at
+                FROM booking_resources
+                WHERE company_id = ?
+                  AND resource_key = ?
+                """,
+                (int(company_id), str(resource_key)),
+            )
+            row = cursor.fetchone()
+        return dict(row) if row else None
+
+    def list_booking_resources(self, *, company_id: int) -> list[dict[str, Any]]:
+        with db_session() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                SELECT id, company_id, resource_key, label, capacity, active, created_at, updated_at
+                FROM booking_resources
+                WHERE company_id = ?
+                ORDER BY resource_key ASC, id ASC
+                """,
+                (int(company_id),),
+            )
+            rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    def set_booking_resource_active(self, *, company_id: int, resource_key: str, active: bool) -> bool:
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                """
+                UPDATE booking_resources
+                SET active = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE company_id = ?
+                  AND resource_key = ?
+                """,
+                (1 if active else 0, int(company_id), str(resource_key)),
+            )
+            return int(cursor.rowcount) == 1
+
+    def confirm_appointment_booking_reservation(
+        self,
+        booking_id: int,
+        *,
+        external_event_id: str | None,
+        company_id: int | None = None,
+    ) -> bool:
+        """Reserva `pending` → `confirmed` depois do efeito externo (compare-and-set)."""
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        with self._booking_capacity_transaction(lock_booking_id=booking_id, company_id=company_id) as cursor:
+            cursor.execute(
+                f"""
+                UPDATE appointment_bookings
+                SET status = 'confirmed',
+                    external_event_id = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status = 'pending'
+                  AND {company_id_condition}
+                """,
+                (external_event_id, booking_id, *company_id_params),
+            )
+            return int(cursor.rowcount) == 1
+
+    def get_stale_pending_bookings(
+        self,
+        *,
+        created_before: datetime,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Reservas `pending` sem evento externo gravado, criadas antes do limite."""
+        if created_before.tzinfo is None:
+            raise ValueError("created_before must be timezone-aware")
+        # Formato aceito pelos dois bancos: SQLite compara com o texto de
+        # CURRENT_TIMESTAMP (UTC, sem "T"); PostgreSQL lê o offset explícito.
+        threshold = created_before.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S") + "+00:00"
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT id, company_id, contact_id, provider, integration_id, starts_at, ends_at, timezone, status, created_at
+            FROM appointment_bookings
+            WHERE status = 'pending'
+              AND external_event_id IS NULL
+              AND created_at <= ?
+            ORDER BY created_at ASC, id ASC
+            LIMIT ?
+            """,
+            (threshold, max(1, min(int(limit), 500))),
+        )
+        rows = cursor.fetchall()
         connection.close()
-        return int(booking_id)
+        return [dict(row) for row in rows]
+
+    def release_appointment_booking_reservation(
+        self,
+        booking_id: int,
+        *,
+        company_id: int | None = None,
+    ) -> bool:
+        """Libera a capacidade de uma reserva cujo efeito externo não aconteceu.
+
+        Só remove a linha ainda `pending` e sem evento externo: nada que já foi
+        confirmado ou sincronizado some por este caminho.
+        """
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        with db_transaction() as connection:
+            cursor = connection.cursor()
+            cursor.execute(
+                f"""
+                DELETE FROM appointment_bookings
+                WHERE id = ?
+                  AND status = 'pending'
+                  AND external_event_id IS NULL
+                  AND {company_id_condition}
+                """,
+                (booking_id, *company_id_params),
+            )
+            return int(cursor.rowcount) == 1
+
+    def hold_appointment_booking_interval(
+        self,
+        booking_id: int,
+        *,
+        hold_starts_at: str,
+        hold_ends_at: str,
+        company_id: int | None = None,
+    ) -> bool:
+        """Retém o novo intervalo de uma remarcação sem soltar o atual.
+
+        Enquanto o hold existe, a linha ocupa os dois intervalos no recurso; a
+        guarda recusa o hold se o novo intervalo estiver ocupado por outra
+        linha. Devolve False se o agendamento não está ativo ou já tem hold.
+        """
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        with self._booking_capacity_transaction(lock_booking_id=booking_id, company_id=company_id) as cursor:
+            cursor.execute(
+                f"""
+                UPDATE appointment_bookings
+                SET hold_starts_at = ?,
+                    hold_ends_at = ?
+                WHERE id = ?
+                  AND status IN ('confirmed', 'pending')
+                  AND hold_starts_at IS NULL
+                  AND {company_id_condition}
+                """,
+                (hold_starts_at, hold_ends_at, booking_id, *company_id_params),
+            )
+            return int(cursor.rowcount) == 1
+
+    def clear_appointment_booking_hold(
+        self,
+        booking_id: int,
+        *,
+        company_id: int | None = None,
+    ) -> None:
+        company_id_condition, company_id_params = _optional_equals("company_id", company_id)
+        with self._booking_capacity_transaction(lock_booking_id=booking_id, company_id=company_id) as cursor:
+            cursor.execute(
+                f"""
+                UPDATE appointment_bookings
+                SET hold_starts_at = NULL,
+                    hold_ends_at = NULL
+                WHERE id = ?
+                  AND {company_id_condition}
+                """,
+                (booking_id, *company_id_params),
+            )
 
     def get_appointment_bookings(
         self,
@@ -3546,7 +3962,10 @@ class RuntimeRepository:
                 timezone,
                 status,
                 created_at,
-                updated_at
+                updated_at,
+                resource_id,
+                hold_starts_at,
+                hold_ends_at
             FROM appointment_bookings
             WHERE {company_id_condition}
               AND {contact_id_condition}
@@ -3588,7 +4007,10 @@ class RuntimeRepository:
                 timezone,
                 status,
                 created_at,
-                updated_at
+                updated_at,
+                resource_id,
+                hold_starts_at,
+                hold_ends_at
             FROM appointment_bookings
             WHERE id = ?
               AND {company_id_condition}
@@ -3628,15 +4050,20 @@ class RuntimeRepository:
                 timezone,
                 status,
                 created_at,
-                updated_at
+                updated_at,
+                resource_id,
+                hold_starts_at,
+                hold_ends_at
             FROM appointment_bookings
             WHERE {company_id_condition}
               AND status IN ('confirmed', 'pending')
-              AND starts_at < ?
-              AND ends_at > ?
+              AND (
+                  (starts_at < ? AND ends_at > ?)
+                  OR (hold_starts_at IS NOT NULL AND hold_starts_at < ? AND hold_ends_at > ?)
+              )
             ORDER BY starts_at ASC, id ASC
             """,
-            (*company_id_params, ends_at, starts_at),
+            (*company_id_params, ends_at, starts_at, ends_at, starts_at),
         )
 
         rows = cursor.fetchall()
@@ -3650,24 +4077,21 @@ class RuntimeRepository:
         *,
         company_id: int | None = None,
     ) -> None:
-        connection = get_connection()
-        cursor = connection.cursor()
-
+        # Reativar um agendamento (cancelled -> confirmed) passa pela mesma
+        # guarda de capacidade da criação.
         company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-        cursor.execute(
-            f"""
-            UPDATE appointment_bookings
-            SET
-                status = ?,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-              AND {company_id_condition}
-            """,
-            (status, booking_id, *company_id_params),
-        )
-
-        connection.commit()
-        connection.close()
+        with self._booking_capacity_transaction() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE appointment_bookings
+                SET
+                    status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND {company_id_condition}
+                """,
+                (status, booking_id, *company_id_params),
+            )
 
     def update_appointment_booking_schedule(
         self,
@@ -3682,32 +4106,37 @@ class RuntimeRepository:
         title: str | None = None,
         description: str | None = None,
         company_id: int | None = None,
-    ) -> None:
-        connection = get_connection()
-        cursor = connection.cursor()
-
+    ) -> bool:
+        # O novo horário vira definitivo e o hold da remarcação sai no mesmo
+        # UPDATE, sob a guarda de capacidade. Compare-and-set: só aplica em
+        # agendamento ainda ativo e com o hold desta remarcação — um
+        # cancelamento concorrente durante a chamada ao provider não é
+        # sobrescrito com o novo horário.
         company_id_condition, company_id_params = _optional_equals("company_id", company_id)
-        cursor.execute(
-            f"""
-            UPDATE appointment_bookings
-            SET
-                starts_at = ?,
-                ends_at = ?,
-                timezone = ?,
-                external_event_id = ?,
-                scheduling_profile_key = ?,
-                customer_profile = ?,
-                title = COALESCE(?, title),
-                description = COALESCE(?, description),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-              AND {company_id_condition}
-            """,
-            (starts_at, ends_at, timezone, external_event_id, scheduling_profile_key, customer_profile, title, description, booking_id, *company_id_params),
-        )
-
-        connection.commit()
-        connection.close()
+        with self._booking_capacity_transaction(lock_booking_id=booking_id, company_id=company_id) as cursor:
+            cursor.execute(
+                f"""
+                UPDATE appointment_bookings
+                SET
+                    starts_at = ?,
+                    ends_at = ?,
+                    timezone = ?,
+                    external_event_id = ?,
+                    scheduling_profile_key = ?,
+                    customer_profile = ?,
+                    title = COALESCE(?, title),
+                    description = COALESCE(?, description),
+                    hold_starts_at = NULL,
+                    hold_ends_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                  AND status IN ('confirmed', 'pending')
+                  AND hold_starts_at IS NOT NULL
+                  AND {company_id_condition}
+                """,
+                (starts_at, ends_at, timezone, external_event_id, scheduling_profile_key, customer_profile, title, description, booking_id, *company_id_params),
+            )
+            return int(cursor.rowcount) == 1
 
     def get_active_conversation_flow(
         self,
@@ -4052,9 +4481,10 @@ class RuntimeRepository:
         claim_ttl_seconds: int = 300,
     ) -> dict[str, Any] | None:
         now = datetime.now(UTC)
-        stale_before = (
+        stale_before_at = (
             now - timedelta(seconds=max(30, claim_ttl_seconds))
-        ).isoformat()
+        )
+        stale_before = _iso_timestamp(stale_before_at)
         company_condition, company_params = _optional_equals("company_id", company_id)
         audience_condition, audience_params = _optional_equals("audience", audience)
         lock_clause = " FOR UPDATE SKIP LOCKED" if get_database_backend() == "postgres" else ""
@@ -4108,7 +4538,7 @@ class RuntimeRepository:
                       )
                   )
                 """,
-                (now.isoformat(), claim_token, reminder_id, stale_before),
+                (_iso_timestamp(now), claim_token, reminder_id, stale_before),
             )
             if cursor.rowcount != 1:
                 return None
@@ -4132,6 +4562,7 @@ class RuntimeRepository:
         channel: str,
         message: str,
         source: str,
+        template_parameters: list[str] | None = None,
     ) -> int:
         """Atomically create one outbound and close one reminder claim."""
         with db_transaction() as connection:
@@ -4157,9 +4588,10 @@ class RuntimeRepository:
                     message,
                     source,
                     status,
-                    channel
+                    channel,
+                    template_parameters_json
                 )
-                VALUES (?, ?, ?, ?, 'pending', ?)
+                VALUES (?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     reminder["contact_id"],
@@ -4167,6 +4599,7 @@ class RuntimeRepository:
                     message,
                     source,
                     channel,
+                    json.dumps(template_parameters, ensure_ascii=False) if template_parameters is not None else None,
                 ),
             )
             outbound_message_id = int(cursor.lastrowid)
@@ -4530,6 +4963,45 @@ class RuntimeRepository:
 
         connection.commit()
         connection.close()
+
+    def get_cancelled_future_bookings_without_offers(
+        self,
+        reference_time: str,
+        *,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Vagas canceladas futuras, sem oferta, em empresa com fila ativa.
+
+        Alimenta a recuperação de ofertas adiadas quando o encaixe falhou logo
+        após o cancelamento.
+        """
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            SELECT booking.id, booking.company_id
+            FROM appointment_bookings AS booking
+            WHERE booking.status = 'cancelled'
+              AND booking.company_id IS NOT NULL
+              AND booking.starts_at > ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM appointment_queue_offers AS offer
+                  WHERE offer.company_id = booking.company_id
+                    AND offer.released_booking_id = booking.id
+              )
+              AND EXISTS (
+                  SELECT 1 FROM appointment_queue_entries AS entry
+                  WHERE entry.company_id = booking.company_id
+                    AND entry.status = 'active'
+              )
+            ORDER BY booking.starts_at ASC, booking.id ASC
+            LIMIT ?
+            """,
+            (reference_time, max(1, min(int(limit), 500))),
+        )
+        rows = cursor.fetchall()
+        connection.close()
+        return [dict(row) for row in rows]
 
     def create_appointment_queue_offer(
         self,
@@ -5380,10 +5852,11 @@ class RuntimeRepository:
         payload_hash: str,
         processing_timeout_seconds: int = 300,
     ) -> dict[str, Any]:
-        stale_before = (
+        stale_before_at = (
             datetime.now(UTC)
             - timedelta(seconds=max(30, processing_timeout_seconds))
-        ).isoformat()
+        )
+        stale_before = _iso_timestamp(stale_before_at)
         with db_transaction() as connection:
             cursor = connection.cursor()
             cursor.execute(

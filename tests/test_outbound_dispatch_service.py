@@ -5,6 +5,13 @@ from app.services.outbound_dispatch_service import (
     dispatch_outbound_message,
     dispatch_pending_outbound_messages,
 )
+from app.services.whatsapp_delivery_policy import DeliveryDecision
+
+
+def _inside_service_window(outbound_message, *, now):
+    # Estes testes cobrem o encanamento do provider; janela, template e
+    # opt-out têm testes próprios em test_whatsapp_channel_policy.py.
+    return DeliveryDecision("text", "service_followup", "within_service_window")
 
 
 class FakeRepository:
@@ -184,6 +191,7 @@ def test_dispatch_outbound_message_with_whatsapp_provider(monkeypatch) -> None:
     monkeypatch.setattr(settings, "outbound_provider", "whatsapp")
     monkeypatch.setattr(settings, "outbound_default_channel", "whatsapp")
     monkeypatch.setattr(outbound_dispatch_service, "WhatsAppProvider", FakeWhatsAppProvider)
+    monkeypatch.setattr(outbound_dispatch_service, "decide_whatsapp_delivery", _inside_service_window)
 
     result = dispatch_outbound_message(outbound_message_id=1, channel="whatsapp")
 
@@ -212,6 +220,7 @@ def test_dispatch_outbound_message_raises_when_whatsapp_provider_fails(monkeypat
     monkeypatch.setattr(settings, "outbound_provider", "whatsapp")
     monkeypatch.setattr(settings, "outbound_default_channel", "whatsapp")
     monkeypatch.setattr(outbound_dispatch_service, "WhatsAppProvider", BrokenWhatsAppProvider)
+    monkeypatch.setattr(outbound_dispatch_service, "decide_whatsapp_delivery", _inside_service_window)
 
     try:
         dispatch_outbound_message(outbound_message_id=1, channel="whatsapp")

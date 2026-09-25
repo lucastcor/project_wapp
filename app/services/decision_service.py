@@ -1,5 +1,7 @@
 from typing import TypedDict
 
+from app.services.company_policy_service import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy
+
 
 class MessageDecision(TypedDict):
     auto_reply: bool
@@ -7,7 +9,22 @@ class MessageDecision(TypedDict):
     priority: str
 
 
-def decide_message_action(classification: str, confidence: float) -> MessageDecision:
+_HANDOFF_PRIORITY = {"financeiro": "high"}
+
+
+def decide_message_action(
+    classification: str,
+    confidence: float,
+    autonomy: AutonomyPolicy | None = None,
+) -> MessageDecision:
+    """Ação para uma mensagem fora de fluxo ativo.
+
+    `autonomy` vem da política publicada da empresa; sem ela vale o default
+    documentado, que reproduz o comportamento anterior à política tipada.
+    """
+    policy = autonomy or DEFAULT_AUTONOMY_POLICY
+
+    # Restrição fixa: spam nunca recebe resposta, qualquer que seja a política.
     if classification == "spam":
         return {
             "auto_reply": False,
@@ -15,28 +32,21 @@ def decide_message_action(classification: str, confidence: float) -> MessageDeci
             "priority": "low",
         }
 
-    if classification == "financeiro":
+    if classification in policy.handoff_intents:
         return {
             "auto_reply": False,
             "action": "handoff_human",
-            "priority": "high",
+            "priority": _HANDOFF_PRIORITY.get(classification, "medium"),
         }
 
-    if classification == "fornecedor":
-        return {
-            "auto_reply": False,
-            "action": "handoff_human",
-            "priority": "medium",
-        }
-
-    if classification == "indefinido" or confidence < 0.60:
+    if policy.is_low_confidence(classification, confidence):
         return {
             "auto_reply": False,
             "action": "review",
             "priority": "medium",
         }
 
-    if classification in {"lead_novo", "cliente_existente", "suporte"}:
+    if classification in policy.auto_reply_intents:
         return {
             "auto_reply": True,
             "action": "auto_reply",
@@ -48,13 +58,6 @@ def decide_message_action(classification: str, confidence: float) -> MessageDeci
             "auto_reply": True,
             "action": "workflow",
             "priority": "high",
-        }
-
-    if classification == "lembrete":
-        return {
-            "auto_reply": False,
-            "action": "review",
-            "priority": "medium",
         }
 
     return {

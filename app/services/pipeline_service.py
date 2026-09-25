@@ -3,6 +3,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.logging import get_logger, log_event
+from app.llm.factory import get_llm_provider
 from app.llm.providers.openai_provider import OpenAIProvider
 
 VALID_PIPELINE_STAGES = {
@@ -67,7 +68,7 @@ def infer_pipeline_state(
     latest_message: str,
     latest_classification: str,
 ) -> dict[str, Any]:
-    if settings.classification_provider != "openai":
+    if settings.classification_provider not in {"openai", "ollama"}:
         return _fallback_pipeline_state(
             conversation_summary=conversation_summary,
             latest_message=latest_message,
@@ -75,7 +76,7 @@ def infer_pipeline_state(
         )
 
     try:
-        provider = OpenAIProvider()
+        provider = get_llm_provider(openai_factory=OpenAIProvider)
         result = provider.infer_pipeline_state(
             conversation_summary=conversation_summary,
             latest_message=latest_message,
@@ -105,7 +106,7 @@ def infer_pipeline_state(
             logger,
             logging.WARNING,
             "pipeline.provider.fallback",
-            provider="openai",
+            provider=settings.classification_provider,
             error_type=type(exc).__name__,
         )
         return _fallback_pipeline_state(

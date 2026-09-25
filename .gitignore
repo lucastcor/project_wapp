@@ -37,3 +37,6 @@ node_modules/
 # Versioná-lo faria toda alteração de frontend aparecer como um diff binário
 # gigante e permitiria que o bundle divergisse do código-fonte sem ninguém ver.
 app/platform/automations/
+
+!.env.production.example
+runtime/

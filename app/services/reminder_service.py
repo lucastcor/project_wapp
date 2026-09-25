@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from app.core.company_context import get_company_context
 from app.core.config import settings
+from app.services.company_config_service import get_runtime_company_context
 from app.services.outbound_dispatch_service import (
     OutboundDispatchError,
     dispatch_outbound_message,
@@ -20,13 +20,8 @@ class ReminderServiceError(Exception):
 
 
 def _resolve_company_context(company_id: int | None) -> dict[str, Any]:
-    if company_id is None:
-        return get_company_context()
-
-    get_company = getattr(repository, "get_company", None)
-    company = get_company(company_id) if callable(get_company) else None
-    company_slug = company.get("slug") if company else None
-    return get_company_context(company_slug=company_slug)
+    # Fonte única de runtime (CONTRATOS, D12): versão publicada da empresa.
+    return get_runtime_company_context(company_id)
 
 
 def _get_timezone(company_context: dict[str, Any]) -> ZoneInfo:
@@ -97,6 +92,16 @@ def _build_outbound_message(reminder: dict[str, Any]) -> str:
     if summary:
         return summary
     return _normalize_text(str(reminder.get("reminder_text") or "Lembrete"))
+
+
+def reminder_template_parameters(reminder: dict[str, Any]) -> list[str]:
+    """Parâmetro único do template de lembrete: o texto em uma linha (071).
+
+    Fora da janela de 24 h o WhatsApp exige template aprovado; parâmetro com
+    quebra de linha é recusado pela Meta, então o texto é achatado aqui.
+    """
+    text = " ".join(_build_outbound_message(reminder).split())
+    return [text[:1024]] if text else []
 
 
 def _resolve_reminder_channel(
@@ -262,6 +267,7 @@ def dispatch_due_reminders(
                     channel=resolved_channel,
                     message=_build_outbound_message(reminder),
                     source=f"reminder_{reminder.get('audience') or 'generic'}",
+                    template_parameters=reminder_template_parameters(reminder),
                 )
             except Exception as exc:
                 attempt_count = int(reminder.get("attempt_count") or 1)
@@ -332,6 +338,7 @@ def dispatch_due_reminders(
             message=_build_outbound_message(reminder),
             source=f"reminder_{reminder.get('audience') or 'generic'}",
             status="pending",
+            template_parameters=reminder_template_parameters(reminder),
         )
         repository.mark_customer_reminder_sent(
             int(reminder["id"]),

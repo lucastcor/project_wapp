@@ -23,6 +23,10 @@ SUPERADMIN: Final = "superadmin"
 
 # (HTTP method, route path) -> minimum required role.
 ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
+    ("POST", "/admin/inbound/jobs/{job_id}/resolve"): OPERATOR,
+    # Posse humana da conversa (P06): quem atende assume e devolve.
+    ("POST", "/admin/conversations/{contact_id}/take"): OPERATOR,
+    ("POST", "/admin/conversations/{contact_id}/release"): OPERATOR,
     # Automation Studio.
     #
     # Autoria (criar, editar, publicar, ativar) exige superadmin: publicar põe
@@ -62,6 +66,10 @@ ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
     # verificável por uma lista de exceções sai mais caro que o incômodo.
     ("POST", "/admin/channel-bindings"): SUPERADMIN,
     ("DELETE", "/admin/channel-bindings/{binding_id}"): SUPERADMIN,
+    # Canal WhatsApp (P07): cadastrar template aprovado é configuração da
+    # empresa; registrar consentimento de um contato é operação do dia a dia.
+    ("PUT", "/admin/whatsapp/templates"): SUPERADMIN,
+    ("PUT", "/admin/whatsapp/contacts/{contact_id}/consents/{purpose}"): OPERATOR,
     ("POST", "/admin/company-config/bootstrap"): SUPERADMIN,
     ("POST", "/admin/company-config/publish"): SUPERADMIN,
     ("POST", "/admin/company-config/versions"): SUPERADMIN,
@@ -89,8 +97,10 @@ ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
     ("PUT", "/admin/company-context"): SUPERADMIN,
     ("POST", "/admin/onboarding/setup"): SUPERADMIN,
     ("POST", "/admin/calendar/integrations"): SUPERADMIN,
+    ("POST", "/admin/calendar/test-connection"): SUPERADMIN,
     ("PUT", "/admin/whatsapp/bindings"): SUPERADMIN,
     ("POST", "/admin/whatsapp/bindings/{binding_id}/state"): SUPERADMIN,
+    ("POST", "/admin/whatsapp/test-connection"): SUPERADMIN,
     # Billing administration (tenant-owner billing is not implemented yet)
     ("POST", "/admin/billing/trial"): SUPERADMIN,
     ("POST", "/admin/billing/activate"): SUPERADMIN,

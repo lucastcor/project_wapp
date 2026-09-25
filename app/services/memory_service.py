@@ -2,6 +2,7 @@ import logging
 
 from app.core.config import settings
 from app.core.logging import get_logger, log_event
+from app.llm.factory import get_llm_provider
 from app.llm.providers.openai_provider import OpenAIProvider
 
 MAX_SUMMARY_LENGTH = 800
@@ -38,8 +39,10 @@ def update_conversation_summary(
     latest_message: str,
     latest_classification: str,
     latest_reply: str | None = None,
+    *,
+    allow_model: bool = True,
 ) -> str:
-    if settings.classification_provider != "openai":
+    if not allow_model or settings.classification_provider not in {"openai", "ollama"}:
         return _fallback_update_conversation_summary(
             previous_summary=previous_summary,
             latest_message=latest_message,
@@ -48,7 +51,7 @@ def update_conversation_summary(
         )
 
     try:
-        provider = OpenAIProvider()
+        provider = get_llm_provider(openai_factory=OpenAIProvider)
         summary = provider.generate_conversation_summary(
             previous_summary=previous_summary,
             latest_message=latest_message,
@@ -61,7 +64,7 @@ def update_conversation_summary(
             logger,
             logging.WARNING,
             "memory.provider.fallback",
-            provider="openai",
+            provider=settings.classification_provider,
             error_type=type(exc).__name__,
         )
         return _fallback_update_conversation_summary(

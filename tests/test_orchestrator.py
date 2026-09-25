@@ -74,11 +74,12 @@ class FakeRepository:
         self.updated_contact_memory = kwargs
 
 
-def test_process_incoming_message_propagates_company_scope(monkeypatch) -> None:
+def test_process_incoming_message_propagates_company_scope(monkeypatch, global_company_runtime) -> None:
     fake_repository = FakeRepository()
     captured_reply_kwargs: dict = {}
 
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    monkeypatch.setattr(orchestrator, "resolve_company_runtime", global_company_runtime())
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",
@@ -96,7 +97,7 @@ def test_process_incoming_message_propagates_company_scope(monkeypatch) -> None:
     monkeypatch.setattr(
         orchestrator,
         "decide_message_action",
-        lambda classification, confidence: {
+        lambda classification, confidence, autonomy=None: {
             "auto_reply": True,
             "action": "auto_reply",
             "priority": "high",

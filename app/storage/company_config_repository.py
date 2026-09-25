@@ -201,6 +201,54 @@ def get_published_context(*, company_id: int) -> dict[str, Any] | None:
     )
 
 
+def get_published_marker(*, company_id: int) -> str | None:
+    """Identidade barata da versão publicada (`id:content_hash`).
+
+    Permite validar o cache de configuração a cada leitura sem desserializar
+    o contexto: outro processo que publicou uma versão é percebido na próxima
+    mensagem, e não depois de um TTL.
+    """
+    resolved_company_id = require_company_id(company_id, context="company context read")
+    row = fetch_one(
+        """
+        SELECT id, content_hash
+        FROM company_context_versions
+        WHERE company_id = ?
+          AND status = ?
+        ORDER BY version DESC
+        LIMIT 1
+        """,
+        (resolved_company_id, STATUS_PUBLISHED),
+    )
+    if not row:
+        return None
+    return f"{int(row['id'])}:{row.get('content_hash') or ''}"
+
+
+def list_companies_with_newer_legacy_context() -> list[int]:
+    """Empresas cuja linha legada foi editada depois da versão publicada.
+
+    Até P01 o orquestrador e a agenda liam `company_contexts`; agora leem a
+    versão publicada. Uma edição legada posterior à publicação deixaria a
+    empresa atendendo com a versão antiga sem aviso — o readiness mostra.
+    """
+    rows = fetch_all(
+        """
+        SELECT DISTINCT legacy.company_id AS company_id
+        FROM company_contexts legacy
+        JOIN company_context_versions published
+          ON published.company_id = legacy.company_id
+         AND published.status = ?
+        WHERE legacy.company_id IS NOT NULL
+          AND published.published_at IS NOT NULL
+          AND legacy.updated_at > published.published_at
+        ORDER BY legacy.company_id
+        """,
+        (STATUS_PUBLISHED,),
+    )
+    return [int(row["company_id"]) for row in rows]
+
+
 def get_latest_context(*, company_id: int) -> dict[str, Any] | None:
     resolved_company_id = require_company_id(company_id, context="company context read")
     return _deserialize(

@@ -44,22 +44,22 @@ def resolve_reply_model(*, company_id: int) -> ModelSelection:
         return ModelSelection(
             model_ref=str(active_model["model_ref"]),
             status="company_active",
-            reply_source="openai_finetuned",
+            reply_source="ollama_company_model" if settings.classification_provider == "ollama" else "openai_finetuned",
             company_model_id=int(active_model["id"]),
         )
 
-    if settings.use_finetuned_model_for_replies and (settings.openai_finetuned_model or "").strip():
+    if settings.classification_provider != "ollama" and settings.use_finetuned_model_for_replies and (settings.openai_finetuned_model or "").strip():
         return ModelSelection(
             model_ref=str(settings.openai_finetuned_model).strip(),
             status="global_finetuned_fallback",
-            reply_source="openai_finetuned",
+            reply_source="ollama_company_model" if settings.classification_provider == "ollama" else "openai_finetuned",
             company_model_id=None,
         )
 
     return ModelSelection(
-        model_ref=settings.openai_model,
+        model_ref=settings.ollama_model if settings.classification_provider == "ollama" else settings.openai_model,
         status="base_model",
-        reply_source="openai",
+        reply_source=settings.classification_provider,
         company_model_id=None,
     )
 

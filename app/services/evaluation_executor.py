@@ -140,14 +140,14 @@ def build_model_backed_executor(
         )
 
     resolved_provider = (provider or settings.classification_provider or "").strip().lower()
-    if resolved_provider != "openai":
+    if resolved_provider not in {"openai", "ollama"}:
         raise EvaluationExecutorError(
             f"No model-backed executor is implemented for provider '{resolved_provider}'."
         )
 
-    from app.llm.providers.openai_provider import OpenAIProvider
+    from app.llm.factory import get_llm_provider
 
-    llm_provider = OpenAIProvider()
+    llm_provider = get_llm_provider(provider=resolved_provider)
 
     def generate(request: Any) -> Any:
         case = request.case
@@ -169,7 +169,7 @@ def build_model_backed_executor(
         return EvaluationResponse(reply=str(reply or ""))
 
     attestation = ExecutionAttestation(
-        executor_kind=EXECUTOR_KIND_OPENAI,
+        executor_kind="ollama_chat" if resolved_provider == "ollama" else EXECUTOR_KIND_OPENAI,
         provider=resolved_provider,
         model_ref=resolved_model_ref,
         prompt_contract_version=PROMPT_CONTRACT_VERSION,

@@ -1,6 +1,8 @@
 import hashlib
 import hmac
+import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main as main_module
@@ -230,225 +232,57 @@ def test_incoming_message_rate_limited(monkeypatch) -> None:
     clear_rate_limit_counters()
 
 
-def test_whatsapp_webhook(monkeypatch) -> None:
-    class FakeRepository:
-        def __init__(self) -> None:
-            self.receipts_started: list[dict] = []
-            self.completed_receipts: list[dict] = []
-            self.failed_receipts: list[dict] = []
+def test_whatsapp_webhook(monkeypatch, company_factory) -> None:
+    from uuid import uuid4
 
-        def begin_inbound_message_processing(self, **kwargs):
-            self.receipts_started.append(kwargs)
-            return "started"
-
-        def mark_inbound_message_processing_completed(self, **kwargs):
-            self.completed_receipts.append(kwargs)
-
-        def mark_inbound_message_processing_failed(self, **kwargs):
-            self.failed_receipts.append(kwargs)
-
-        def create_outbound_message(self, **kwargs):
-            return 123
-
-    fake_repository = FakeRepository()
+    from app.services import inbound_service
+    from app.storage.inbound_repository import list_jobs
+    company_id = company_factory()
     enable_normalized_ingress(monkeypatch)
-    monkeypatch.setattr(routes, "repository", fake_repository)
-    monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None, company_id=None: {
-        "outbound_message_id": outbound_message_id,
-        "delivery_status": "sent",
-        "provider_message_id": "wamid.test.123",
-        "provider_response": {"messages": [{"id": "wamid.test.123"}]},
-    })
-    monkeypatch.setattr(routes, "process_whatsapp_webhook", lambda **kwargs: {
-        "contact_id": kwargs["from_number"],
-        "company_id": 1,
-        "company_slug": "default",
-        "classification": "lead_novo",
-        "classification_reason": "Interesse comercial claro.",
-        "classification_confidence": 0.91,
-        "reply": "Recebi sua mensagem.",
-        "source": "openai",
-        "auto_reply": True,
-        "action": "auto_reply",
-        "priority": "high",
-        "pipeline_stage": "novo_lead",
-        "next_action": "Entender necessidade.",
-        "lead_temperature": "warm",
-        "handoff_required": False,
-        "pending_question_id": None,
-        "question_type": None,
-    })
-
-    payload = {
-        "event": "message.received",
-        "from_number": "5511999999999",
-        "from_name": "Cliente Teste",
-        "text": "Olá",
-        "provider_message_id": "wamid.normalized.123",
-    }
-    response = client.post("/webhooks/whatsapp", json=payload, headers=NORMALIZED_INGRESS_HEADERS)
-
+    monkeypatch.setattr(inbound_service, "process_whatsapp_webhook", lambda **_: pytest.fail("HTTP must only enqueue"))
+    message_id = uuid4().hex
+    response = client.post("/webhooks/whatsapp", params={"company_id": company_id},
+        json={"event": "message.received", "from_number": "5511999999999", "text": "Olá", "provider_message_id": message_id},
+        headers=NORMALIZED_INGRESS_HEADERS)
     assert response.status_code == 200
-    data = response.json()
-    assert data["contact_id"] == "5511999999999"
-    assert data["reply"] == "Recebi sua mensagem."
-    assert data["provider_message_id"] == "wamid.normalized.123"
-    assert data["auto_reply_dispatch"]["delivery_status"] == "sent"
-    assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.normalized.123"
-    assert fake_repository.completed_receipts == [
-        {
-            "provider": "whatsapp",
-            "provider_message_id": "wamid.normalized.123",
-            "company_id": None,
-        }
-    ]
-    assert fake_repository.failed_receipts == []
+    assert response.json()["queued_count"] == 1
+    assert response.json()["processed"] is False
+    assert list_jobs(company_id)[0]["status"] == "pending"
     assert response.headers["X-Request-ID"]
 
 
-def test_whatsapp_webhook_accepts_meta_payload_and_dispatches_auto_reply(monkeypatch) -> None:
-    class FakeRepository:
-        def __init__(self) -> None:
-            self.created_messages: list[dict] = []
-            self.receipts_started: list[dict] = []
-            self.completed_receipts: list[dict] = []
+def test_whatsapp_webhook_accepts_meta_payload_and_queues_auto_reply(monkeypatch, company_factory) -> None:
+    from uuid import uuid4
 
-        def begin_inbound_message_processing(self, **kwargs):
-            self.receipts_started.append(kwargs)
-            return "started"
-
-        def mark_inbound_message_processing_completed(self, **kwargs):
-            self.completed_receipts.append(kwargs)
-
-        def mark_inbound_message_processing_failed(self, **kwargs):
-            raise AssertionError("Receipt should not be marked as failed on successful processing.")
-
-        def create_outbound_message(self, **kwargs):
-            self.created_messages.append(kwargs)
-            return 321
-
-        def get_whatsapp_binding_by_phone_number_id(self, phone_number_id, *, active_only=True):
-            if phone_number_id != "111222333444555":
-                return None
-            return {
-                "id": 1,
-                "company_id": 1,
-                "company_slug": "default",
-                "company_active": 1,
-                "phone_number_id": phone_number_id,
-            }
-
-    fake_repository = FakeRepository()
-    monkeypatch.setattr(routes, "repository", fake_repository)
-    monkeypatch.setattr(settings, "whatsapp_app_secret", "meta-app-secret")
-    monkeypatch.setattr(routes, "dispatch_outbound_message", lambda outbound_message_id, channel=None, company_id=None: {
-        "outbound_message_id": outbound_message_id,
-        "delivery_status": "sent",
-        "provider_message_id": "wamid.test.999",
-        "provider_response": {"messages": [{"id": "wamid.test.999"}]},
-    })
-    monkeypatch.setattr(routes, "process_whatsapp_webhook", lambda **kwargs: {
-        "contact_id": kwargs["from_number"],
-        "company_id": 1,
-        "company_slug": "default",
-        "classification": "lead_novo",
-        "classification_reason": "Interesse comercial claro.",
-        "classification_confidence": 0.93,
-        "reply": "Claro, posso te ajudar.",
-        "source": "openai",
-        "auto_reply": True,
-        "action": "auto_reply",
-        "priority": "high",
-        "pipeline_stage": "novo_lead",
-        "next_action": "Qualificar demanda.",
-        "lead_temperature": "warm",
-        "handoff_required": False,
-        "pending_question_id": None,
-        "question_type": None,
-    })
-
-    raw_payload = (
-        b'{"object":"whatsapp_business_account","entry":[{"changes":[{"value":{"metadata":{"display_phone_number":"5511888887777","phone_number_id":"111222333444555"},"contacts":[{"wa_id":"5511999999999","profile":{"name":"Cliente Meta"}}],"messages":[{"id":"wamid.inbound.123","from":"5511999999999","type":"text","text":{"body":"Oi, gostaria de agendar"}}]}}]}]}'
-    )
-    signature = hmac.new(
-        b"meta-app-secret",
-        msg=raw_payload,
-        digestmod=hashlib.sha256,
-    ).hexdigest()
-    response = client.post(
-        "/webhooks/whatsapp",
-        content=raw_payload,
-        headers={
-            "Content-Type": "application/json",
-            "X-Hub-Signature-256": f"sha256={signature}",
-        },
-    )
-
+    from app.storage.inbound_repository import list_jobs
+    cid = company_factory()
+    monkeypatch.setattr(settings, "whatsapp_app_secret", "test-secret")
+    monkeypatch.setattr(routes, "_resolve_meta_company", lambda _: {"company_id": cid, "company_slug": None})
+    payload = {"object": "whatsapp_business_account", "entry": [{"changes": [{"value": {
+        "metadata": {"phone_number_id": "bound"}, "messages": [{"id": uuid4().hex, "from": "5511999999999", "type": "text", "text": {"body": "Olá"}}]
+    }}]}]}
+    raw = json.dumps(payload).encode()
+    signature = hmac.new(b"test-secret", raw, hashlib.sha256).hexdigest()
+    response = client.post("/webhooks/whatsapp", content=raw, headers={"X-Hub-Signature-256": "sha256="+signature})
     assert response.status_code == 200
-    data = response.json()
-    assert data["payload_mode"] == "meta"
-    assert data["provider_message_id"] == "wamid.inbound.123"
-    assert data["auto_reply_dispatch"]["delivery_status"] == "sent"
-    assert fake_repository.created_messages[0]["source"] == "whatsapp_auto_reply"
-    assert fake_repository.created_messages[0]["contact_id"] == "5511999999999"
-    assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.inbound.123"
-    # The tenant resolved from the signed payload's phone_number_id binding must
-    # flow into the idempotency receipt, not stay unscoped.
-    assert fake_repository.completed_receipts == [
-        {
-            "provider": "whatsapp",
-            "provider_message_id": "wamid.inbound.123",
-            "company_id": 1,
-        }
-    ]
-    assert fake_repository.receipts_started[0]["company_id"] == 1
+    assert response.json()["payload_mode"] == "meta"
+    assert list_jobs(cid)[0]["outbound_message_id"] is None
 
 
-def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch) -> None:
-    class FakeRepository:
-        def __init__(self) -> None:
-            self.receipts_started: list[dict] = []
+def test_whatsapp_webhook_ignores_duplicate_provider_message_id(monkeypatch, company_factory) -> None:
+    from uuid import uuid4
 
-        def begin_inbound_message_processing(self, **kwargs):
-            self.receipts_started.append(kwargs)
-            return "completed"
-
-        def mark_inbound_message_processing_completed(self, **kwargs):
-            raise AssertionError("Duplicate payload should not be marked as completed again.")
-
-        def mark_inbound_message_processing_failed(self, **kwargs):
-            raise AssertionError("Duplicate payload should not be marked as failed.")
-
-        def create_outbound_message(self, **kwargs):
-            raise AssertionError("Duplicate payload should not enqueue outbound messages.")
-
-    fake_repository = FakeRepository()
+    from app.storage.inbound_repository import list_jobs
+    cid = company_factory()
     enable_normalized_ingress(monkeypatch)
-    monkeypatch.setattr(routes, "repository", fake_repository)
-    monkeypatch.setattr(
-        routes,
-        "process_whatsapp_webhook",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("Duplicate payload should not be processed.")),
-    )
-
-    payload = {
-        "event": "message.received",
-        "from_number": "5511999999999",
-        "from_name": "Cliente Teste",
-        "text": "Olá",
-        "provider_message_id": "wamid.normalized.duplicate",
-    }
-    response = client.post("/webhooks/whatsapp", json=payload, headers=NORMALIZED_INGRESS_HEADERS)
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "processed": False,
-        "reason": "duplicate_provider_message_id",
-        "duplicate_status": "completed",
-        "payload_mode": "normalized",
-        "provider_message_id": "wamid.normalized.duplicate",
-    }
-    assert fake_repository.receipts_started[0]["provider_message_id"] == "wamid.normalized.duplicate"
+    payload = {"event": "message.received", "from_number": "5511999999999", "text": "Olá", "provider_message_id": uuid4().hex}
+    first = client.post("/webhooks/whatsapp", json=payload, params={"company_id": cid}, headers=NORMALIZED_INGRESS_HEADERS)
+    second = client.post("/webhooks/whatsapp", json=payload, params={"company_id": cid}, headers=NORMALIZED_INGRESS_HEADERS)
+    assert first.status_code == second.status_code == 200
+    assert first.json()["queued_count"] == 1
+    assert second.json()["queued_count"] == 0
+    assert second.json()["jobs"][0]["duplicate"] is True
+    assert len(list_jobs(cid)) == 1
 
 
 def test_whatsapp_webhook_ignores_non_message_meta_events(monkeypatch) -> None:

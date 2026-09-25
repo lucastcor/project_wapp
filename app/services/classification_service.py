@@ -3,6 +3,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.logging import get_logger, log_event
+from app.llm.factory import get_llm_provider
 from app.llm.providers.openai_provider import OpenAIProvider
 
 logger = get_logger(__name__)
@@ -67,11 +68,11 @@ def fallback_classification(message: str) -> dict[str, Any]:
 
 
 def classify_message(message: str) -> dict[str, Any]:
-    if settings.classification_provider != "openai":
+    if settings.classification_provider not in {"openai", "ollama"}:
         return fallback_classification(message)
 
     try:
-        provider = OpenAIProvider()
+        provider = get_llm_provider(openai_factory=OpenAIProvider)
         result = provider.classify_message(message)
 
         return {
@@ -84,7 +85,7 @@ def classify_message(message: str) -> dict[str, Any]:
             logger,
             logging.WARNING,
             "classification.provider.fallback",
-            provider="openai",
+            provider=settings.classification_provider,
             error_type=type(exc).__name__,
         )
         return fallback_classification(message)

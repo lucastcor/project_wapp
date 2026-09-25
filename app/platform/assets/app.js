@@ -112,6 +112,9 @@ const NAV_ITEMS = [
     icon: "flow",
     href: "/platform/automations",
   },
+  { key: "operations", label: "Operação", caption: "Revisões, conversas com humano e alertas", icon: "bell" },
+  { key: "policy", label: "Política", caption: "Mensagens, regras de agenda e versões", icon: "tag" },
+  { key: "channel", label: "Canal WhatsApp", caption: "Templates aprovados e consentimento", icon: "send" },
   { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
   { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
   { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
@@ -160,6 +163,21 @@ const root = document.getElementById("platform-root")
 
 const state = {
   view: "dashboard",
+  operations: null,
+  opsConfirm: null,
+  opsBusy: false,
+  opsTakeDraft: { contact_id: "", reason: "" },
+  policy: null,
+  policyConfirm: null,
+  policyBusy: false,
+  channel: null,
+  channelContact: null,
+  channelBusy: false,
+  channelDraft: null,
+  connectionTestBusy: null,
+  calendarConnectionTest: null,
+  whatsappConnectionTest: null,
+  bookingCancelConfirm: null,
   loading: false,
   loadingMessage: "",
   settingsOpen: false,
@@ -251,7 +269,9 @@ const state = {
     mode: "month",
     monthCursor: (() => {
       const now = new Date()
-      return new Date(now.getFullYear(), now.getMonth(), 1).toISOString().slice(0, 10)
+      // Chave local: `toISOString()` converte a meia-noite local para UTC e, em
+      // fuso adiantado, cai no último dia do mês anterior.
+      return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`
     })(),
     selectedDay: null,
   },
@@ -342,14 +362,20 @@ function persistConfig() {
   window.localStorage.setItem(STORAGE_KEY, JSON.stringify(state.config))
 }
 
+// Data no fuso de quem opera: `toISOString()` é UTC e, em Brasília depois das
+// 21 h, "hoje" viraria amanhã.
+function localDateKey(value) {
+  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`
+}
+
 function todayString() {
-  return new Date().toISOString().slice(0, 10)
+  return localDateKey(new Date())
 }
 
 function offsetDateString(days) {
   const value = new Date()
   value.setDate(value.getDate() + days)
-  return value.toISOString().slice(0, 10)
+  return localDateKey(value)
 }
 
 function escapeHtml(value) {
@@ -636,12 +662,19 @@ async function loadCompanies(force = false) {
   }
 }
 
+function hasPlatformScope() {
+  // Sessão de identidade é sempre de empresa; readiness e perfil de sistema
+  // (infraestrutura) só existem para a credencial de plataforma (break-glass).
+  return Boolean(state.session) && state.session.auth_mode !== "identity"
+}
+
 async function loadDashboardData() {
   await loadCompanies()
+  const platformScope = hasPlatformScope()
   const [observabilitySummary, readiness, systemProfile, onboarding] = await Promise.all([
     apiRequest("/admin/observability/summary", { params: getAdminCompanyParams() }),
-    apiRequest("/admin/system/readiness"),
-    apiRequest("/admin/system/profile"),
+    platformScope ? apiRequest("/admin/system/readiness") : Promise.resolve(null),
+    platformScope ? apiRequest("/admin/system/profile") : Promise.resolve(null),
     apiRequest("/admin/system/onboarding", {
       params: getCompanyParams(),
     }),
@@ -755,6 +788,53 @@ async function loadAgendaData() {
   state.calendarTimeline = calendarTimeline
 }
 
+async function loadOperationsData() {
+  if (!state.config.companyId) {
+    state.operations = null
+    return
+  }
+  const params = getAdminCompanyParams()
+  const [summary, review, ownership] = await Promise.all([
+    apiRequest("/admin/operations/summary", { params }),
+    apiRequest("/admin/inbound/jobs", { params: { ...params, status: "review", limit: 50 } }),
+    apiRequest("/admin/conversations/ownership", { params }),
+  ])
+  state.operations = {
+    companyId: state.config.companyId,
+    summary: summary || {},
+    reviewJobs: Array.isArray(review?.jobs) ? review.jobs : [],
+    humanOwned: Array.isArray(ownership?.conversations) ? ownership.conversations : [],
+  }
+}
+
+const POLICY_EDITABLE_SECTIONS = ["conversation", "booking_rules", "confirmation", "channel"]
+
+function clonePolicySections(policies) {
+  const source = policies || {}
+  return JSON.parse(JSON.stringify(Object.fromEntries(POLICY_EDITABLE_SECTIONS.map((key) => [key, source[key] || {}]))))
+}
+
+async function loadPolicyData() {
+  if (!state.config.companyId) {
+    state.policy = null
+    return
+  }
+  const params = getAdminCompanyParams()
+  const [config, versions] = await Promise.all([
+    apiRequest("/admin/company-config", { params }),
+    apiRequest("/admin/company-config/versions", { params }),
+  ])
+  state.policy = {
+    companyId: state.config.companyId,
+    config: config || {},
+    versions: Array.isArray(versions) ? versions : [],
+    draft: clonePolicySections(config?.policies),
+    changeNote: "",
+    error: "",
+  }
+  state.policyConfirm = null
+}
+
 async function loadContactsData() {
   const params = {
     ...getAdminCompanyParams(),
@@ -840,6 +920,15 @@ async function _doRefreshCurrentView({ silent = false } = {}) {
     } else if (state.view === "agenda") {
       await loadCompanies()
       await loadAgendaData()
+    } else if (state.view === "operations") {
+      await loadCompanies()
+      await loadOperationsData()
+    } else if (state.view === "policy") {
+      await loadCompanies()
+      await loadPolicyData()
+    } else if (state.view === "channel") {
+      await loadCompanies()
+      await loadChannelData()
     } else if (state.view === "contacts") {
       await loadCompanies()
       await loadContactsData()
@@ -879,6 +968,9 @@ function viewLoadingLabel(view) {
   if (view === "studio") return "Abrindo ambiente de simulação..."
   if (view === "flows") return "Montando playbooks e respostas aprovadas..."
   if (view === "agenda") return "Buscando agenda e fila de prioridade..."
+  if (view === "operations") return "Buscando revisões, conversas com humano e alertas..."
+  if (view === "policy") return "Carregando política e histórico de versões..."
+  if (view === "channel") return "Carregando templates do WhatsApp..."
   if (view === "contacts") return "Buscando contatos..."
   if (view === "training") return "Montando operação de curadoria..."
   if (view === "team") return "Carregando equipe e permissões..."
@@ -893,6 +985,9 @@ function getReadinessTone(status) {
 
 function renderReadinessPill() {
   const readiness = state.readiness
+  if (!readiness && state.session && !hasPlatformScope()) {
+    return '<span class="pill"><strong>Readiness</strong>visível para a plataforma</span>'
+  }
   if (!readiness) {
     return '<span class="pill"><span class="loader"></span><strong>Readiness</strong> sincronizando</span>'
   }
@@ -951,6 +1046,9 @@ function renderViewTitle() {
   if (state.view === "studio") return "Bot Studio para testar conversa real antes de publicar"
   if (state.view === "flows") return "Flow Studio para lapidar regras, playbooks e respostas"
   if (state.view === "agenda") return "Agenda Console com controle manual e visão operacional"
+  if (state.view === "operations") return "Operação — o que precisa de atenção agora"
+  if (state.view === "policy") return "Política da empresa — como o bot fala e o que ele permite"
+  if (state.view === "channel") return "Canal WhatsApp — templates aprovados e consentimento"
   if (state.view === "contacts") return "Contacts Desk para decidir com contexto e precisão"
   if (state.view === "training") return "Training Ops para curar base histórica com segurança"
   if (state.view === "team") return "Equipe — acessos, papéis e convites"
@@ -965,6 +1063,9 @@ function renderViewCopy() {
   if (state.view === "studio") return "Simule cliente, operador e fluxos de agendamento na mesma interface."
   if (state.view === "flows") return "Desenhe a experiência do bot, organize pipelines e promova mensagens aprovadas."
   if (state.view === "agenda") return "Monitore disponibilidade, bookings, remanejamento e ajustes manuais."
+  if (state.view === "operations") return "Mensagens em revisão, conversas assumidas por pessoas, envios com falha e saúde do worker."
+  if (state.view === "policy") return "Edite mensagens e regras de cancelamento, publique uma versão nova ou volte para uma anterior."
+  if (state.view === "channel") return "Veja o que pode sair depois de 24 h sem o cliente escrever, cadastre templates aprovados e registre consentimento."
   if (state.view === "contacts") return "Enriqueça customer_profile, organize notas e desambiguação de atendimento."
   if (state.view === "training") return "Importe CRM, faça dry-run, acompanhe o dataset e acione fine-tuning."
   if (state.view === "team") return "Convide colaboradores e controle permissões por empresa com segurança."
@@ -1049,6 +1150,9 @@ function renderDashboardView() {
   const warnings = readiness?.checks?.filter((check) => check.status !== "pass").slice(0, 5) || []
   const runtimeBackend = state.systemProfile?.database?.runtime?.backend || "—"
   const companyCount = state.companies.length
+  // Sessão de empresa não recebe readiness de infraestrutura: os cards não
+  // podem afirmar bloqueio nem ausência de alerta com base em dado que não veio.
+  const platformScope = hasPlatformScope()
 
   return `
     <section class="hero">
@@ -1078,21 +1182,36 @@ function renderDashboardView() {
             <h3 class="card-title">Postura operacional</h3>
             <p class="card-copy">Readiness, ambiente ativo e situação do onboarding.</p>
           </div>
-          <span class="tag ${getReadinessTone(readiness?.overall_status)}">${escapeHtml(readiness?.overall_status || "sem dados")}</span>
+          ${
+            platformScope
+              ? `<span class="tag ${getReadinessTone(readiness?.overall_status)}">${escapeHtml(readiness?.overall_status || "sem dados")}</span>`
+              : '<span class="tag">empresa</span>'
+          }
         </div>
         <div class="timeline">
-          <div class="timeline-item">
-            <strong>Runtime</strong>
-            <p>Backend atual: ${escapeHtml(runtimeBackend)}.</p>
-          </div>
-          <div class="timeline-item">
-            <strong>Pilot ready</strong>
-            <p>${readiness?.pilot_ready ? "Sim, a base de produto já sustenta piloto." : "Ainda existem bloqueios para piloto consistente."}</p>
-          </div>
-          <div class="timeline-item">
-            <strong>Scale ready</strong>
-            <p>${readiness?.scale_ready ? "Pronto para operação mais dura." : "Ainda exige endurecimento adicional para escala."}</p>
-          </div>
+          ${
+            platformScope
+              ? `
+                <div class="timeline-item">
+                  <strong>Runtime</strong>
+                  <p>Backend atual: ${escapeHtml(runtimeBackend)}.</p>
+                </div>
+                <div class="timeline-item">
+                  <strong>Pilot ready</strong>
+                  <p>${readiness?.pilot_ready ? "Sim, a base de produto já sustenta piloto." : "Ainda existem bloqueios para piloto consistente."}</p>
+                </div>
+                <div class="timeline-item">
+                  <strong>Scale ready</strong>
+                  <p>${readiness?.scale_ready ? "Pronto para operação mais dura." : "Ainda exige endurecimento adicional para escala."}</p>
+                </div>
+              `
+              : `
+                <div class="timeline-item">
+                  <strong>Infraestrutura</strong>
+                  <p>Readiness de servidor, banco e integrações é acompanhado pela equipe da plataforma.</p>
+                </div>
+              `
+          }
           <div class="timeline-item">
             <strong>Onboarding</strong>
             <p>Status atual do escopo selecionado: ${escapeHtml(onboarding?.overall_status || "sem dados")}.</p>
@@ -1108,7 +1227,19 @@ function renderDashboardView() {
           </div>
         </div>
         ${
-          warnings.length
+          !platformScope
+            ? `
+              <div class="timeline">
+                <div class="timeline-item">
+                  <strong>Operação da empresa</strong>
+                  <p>Mensagens em revisão, conversas com humano e envios com falha ficam na tela Operação.</p>
+                </div>
+              </div>
+              <div class="hero-actions">
+                <button class="button" data-jump-view="operations">Abrir Operação</button>
+              </div>
+            `
+            : warnings.length
             ? `
               <div class="timeline">
                 ${warnings
@@ -1730,12 +1861,17 @@ function renderOnboardingSuccess() {
             </div>
           </div>
           <div class="timeline">
-            ${nextSteps.map(s => `
+            ${nextSteps.map(s => {
+              // Atalho só para tela existente no painel (P07).
+              const hasView = s.view && NAV_ITEMS.some((item) => item.key === s.view && !item.href)
+              return `
               <div class="timeline-item">
                 <strong>${escapeHtml(s.title)}</strong>
                 <p>${escapeHtml(s.description)}</p>
+                ${hasView ? `<button class="button-ghost" type="button" data-jump-view="${escapeHtml(s.view)}">Abrir</button>` : ""}
               </div>
-            `).join("")}
+            `
+            }).join("")}
           </div>
         </article>
       </section>
@@ -2563,7 +2699,13 @@ const WEEKDAY_NAMES_PT = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"]
 function parseDateKey(value) {
   if (!value) return null
   try {
-    const d = new Date(value)
+    const text = String(value)
+    // ECMAScript interpreta YYYY-MM-DD como UTC. Em fusos a oeste de
+    // Greenwich, "2026-09-01" virava 31/08 e o calendário abria um mês antes.
+    const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text)
+    const d = dateOnly
+      ? new Date(Number(dateOnly[1]), Number(dateOnly[2]) - 1, Number(dateOnly[3]))
+      : new Date(text)
     if (Number.isNaN(d.getTime())) return null
     return d
   } catch (_) { return null }
@@ -3091,12 +3233,92 @@ function renderManualBookingModal() {
   `
 }
 
+// Estado verdadeiro da reserva (P07): o card não oferece ação que o backend
+// recusaria, e diz por quê.
+function describeBookingState(booking) {
+  const status = String(booking.status || "")
+  if (status === "cancelled") {
+    return { key: "cancelled", label: "Cancelado", tone: "tag-danger", detail: "Horário liberado.", actionable: false }
+  }
+  if (booking.hold_starts_at) {
+    return {
+      key: "rescheduling",
+      label: "Remarcação em verificação",
+      tone: "tag-warn",
+      detail: `A agenda externa não confirmou a mudança para ${formatDateTime(booking.hold_starts_at)}. O novo horário fica retido até a equipe verificar em Operação.`,
+      actionable: false,
+    }
+  }
+  if (status === "pending") {
+    const external = String(booking.provider || "mock") !== "mock" && !booking.external_event_id
+    return {
+      key: "syncing",
+      label: external ? "Sincronizando com a agenda externa" : "Em confirmação",
+      tone: "tag-warn",
+      detail: external
+        ? "A criação do evento ficou sem resposta. A vaga está reservada e a verificação é automática; cancelar ou remarcar só depois disso."
+        : "Reserva registrada aguardando confirmação.",
+      actionable: false,
+    }
+  }
+  if (status === "confirmed") {
+    return { key: "confirmed", label: "Confirmado", tone: "tag-success", detail: "", actionable: true }
+  }
+  return { key: status || "unknown", label: status || "Sem status", tone: "", detail: "", actionable: false }
+}
+
+const CALENDAR_PROVIDER_LABELS = { mock: "Agenda interna", google_calendar: "Google Calendar", caldav: "CalDAV" }
+
+// Integração de agenda da empresa (P07): distingue agenda interna de agenda
+// externa e mostra a prontidão informada pelo provider — nunca a configuração,
+// que pode conter credenciais.
+function renderCalendarIntegrationCard(profile) {
+  const integration = profile.integration || {}
+  const readiness = profile.provider_readiness || {}
+  const provider = String(integration.provider || readiness.provider || "mock")
+  const internal = provider === "mock"
+  const ready = Boolean(readiness.ready)
+  const label = CALENDAR_PROVIDER_LABELS[provider] || provider
+  const tone = internal ? "" : ready ? "tag-success" : "tag-danger"
+  const status = internal ? "Sem sincronização externa" : ready ? "Credenciais encontradas" : "Configuração incompleta"
+  const explanation = internal
+    ? "As reservas ficam só nesta plataforma: nenhuma agenda externa é consultada nem alterada."
+    : ready
+      ? "Criar, remarcar e cancelar também alteram eventos nesta agenda externa, e horários ocupados nela são respeitados."
+      : "Enquanto a configuração estiver incompleta, criar ou remarcar reservas falha em vez de ficar só na plataforma."
+  const test = state.calendarConnectionTest && String(state.calendarConnectionTest.companyId) === String(state.config.companyId)
+    ? state.calendarConnectionTest
+    : null
+  const testing = state.connectionTestBusy === "calendar"
+  const canTest = currentAdminRole() === "superadmin"
+  return `
+    <section class="card" data-calendar-integration="${escapeHtml(provider)}">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Integração de agenda: ${escapeHtml(label)}</h3>
+          <p class="card-copy">${escapeHtml(explanation)}</p>
+        </div>
+        <span class="tag ${tone}">${escapeHtml(status)}</span>
+      </div>
+      ${!internal && readiness.details ? `<p class="subtle">${escapeHtml(readiness.details)}</p>` : ""}
+      <div class="hero-actions">
+        ${canTest ? `<button class="button-ghost" type="button" data-test-calendar-connection ${testing ? "disabled" : ""}>${testing ? "Testando…" : internal ? "Verificar agenda interna" : "Testar conexão"}</button>` : ""}
+        ${test ? `<span class="tag ${test.connected ? "tag-success" : "tag-danger"}">${escapeHtml(test.connected ? "Conexão confirmada" : "Falha na conexão")}</span>` : ""}
+      </div>
+      ${test ? `<p class="subtle">${escapeHtml(test.details || "Diagnóstico concluído.")} Verificado em ${escapeHtml(formatDateTime(test.checked_at))}.</p>` : ""}
+    </section>
+  `
+}
+
 function renderAgendaView() {
   const context = ensureSchedulingPolicy(state.companyContext || {})
   state.companyContext = context
   const profile = state.calendarProfile || {}
   const integration = profile.integration || {}
   const bookings = state.calendarBookings || []
+  // O histórico abaixo mantém cancelados, mas a grade representa ocupação
+  // atual: horário cancelado não pode continuar parecendo reservado.
+  const activeCalendarBookings = bookings.filter((booking) => ["confirmed", "pending"].includes(String(booking.status || "").toLowerCase()))
   const queueEntries = state.queueEntries || []
   const queueOffers = state.queueOffers || []
   const timeline = state.calendarTimeline
@@ -3121,6 +3343,8 @@ function renderAgendaView() {
       ${renderMetricCard("Fila ativa", formatNumber(queueEntries.length), "Clientes esperando encaixe ou antecipação.", "warm", "clock")}
     </section>
 
+    ${renderCalendarIntegrationCard(profile)}
+
     <section class="card">
       <div class="section-header">
         <div>
@@ -3130,7 +3354,7 @@ function renderAgendaView() {
         <span class="tag">${escapeHtml(timeline?.timezone || "America/Sao_Paulo")}</span>
       </div>
       ${state.agendaCalendar.mode === "month"
-        ? renderMonthCalendar(bookings)
+        ? renderMonthCalendar(activeCalendarBookings)
         : `<div class="calendar-month-toolbar">
              <div class="calendar-month-nav"><strong class="calendar-month-label">Semana atual</strong></div>
              <div class="segmented">
@@ -3274,11 +3498,22 @@ function renderAgendaView() {
             bookings.length
               ? bookings
                   .map(
-                    (booking) => `
-                      <article class="booking-card">
-                        <strong>${escapeHtml(booking.title || "Agendamento")}</strong>
+                    (booking) => {
+                      const bookingState = describeBookingState(booking)
+                      const confirmingCancel = String(state.bookingCancelConfirm) === String(booking.id)
+                      return `
+                      <article class="booking-card" data-booking-state="${escapeHtml(bookingState.key)}" data-booking-id="${booking.id}">
+                        <div class="booking-head">
+                          <strong>${escapeHtml(booking.title || "Agendamento")}</strong>
+                          <span class="tag ${bookingState.tone}">${escapeHtml(bookingState.label)}</span>
+                        </div>
                         <p>${escapeHtml(formatDateTime(booking.starts_at))} até ${escapeHtml(formatDateTime(booking.ends_at))}</p>
                         <p>Contato: ${escapeHtml(booking.contact_id || "—")} · Perfil: ${escapeHtml(booking.customer_profile || "—")} · Scheduling profile: ${escapeHtml(booking.scheduling_profile_key || "—")}</p>
+                        ${bookingState.detail ? `<p class="booking-state-detail">${escapeHtml(bookingState.detail)}</p>` : ""}
+                        ${
+                          !bookingState.actionable
+                            ? ""
+                            : `
                         <form class="form-grid" data-reschedule-form="${booking.id}" style="margin-top: 12px;">
                           <div class="form-grid-two">
                             <div class="field">
@@ -3302,11 +3537,25 @@ function renderAgendaView() {
                           </div>
                           <div class="inline-actions">
                             <button class="button-ghost" type="submit">Reagendar</button>
-                            <button class="button-danger" type="button" data-cancel-booking="${booking.id}">Cancelar</button>
+                            ${
+                              confirmingCancel
+                                ? `
+                                  <button class="button-danger" type="button" data-cancel-booking-confirm="${booking.id}">Confirmar cancelamento</button>
+                                  <button class="button-ghost" type="button" data-cancel-booking-abort>Manter reserva</button>
+                                `
+                                : `<button class="button-danger" type="button" data-cancel-booking="${booking.id}">Cancelar</button>`
+                            }
                           </div>
-                        </form>
+                          ${
+                            confirmingCancel
+                              ? '<p class="ops-confirm-note">O horário é liberado e a fila de encaixe pode oferecê-lo a outro cliente. O cliente não é avisado automaticamente.</p>'
+                              : ""
+                          }
+                        </form>`
+                        }
                       </article>
                     `
+                    }
                   )
                   .join("")
               : '<div class="empty-state">Nenhum booking encontrado para o escopo atual.</div>'
@@ -3791,12 +4040,1011 @@ function renderTeamView() {
   `
 }
 
+// ── Operação (P06/P07): revisões, posse humana e alertas ──────────────
+
+const OPS_ALERT_LABELS = {
+  inbound_review_open: "Mensagens aguardando revisão",
+  inbound_backlog_stale: "Fila de entrada atrasada",
+  inbound_worker_down: "Worker de entrada parado com mensagens esperando",
+  outbound_dead_letters: "Envios que falharam definitivamente",
+  booking_operations_need_attention: "Operações de agenda em revisão ou presas em execução",
+  booking_reservations_pending: "Reservas aguardando confirmação da agenda externa",
+  booking_reschedule_holds_open: "Remarcações sem confirmação da agenda externa",
+  whatsapp_template_missing: "Mensagens agendadas sem template aprovado (não saem depois de 24 h)",
+}
+
+const OPS_REVIEW_REASONS = {
+  worker_lease_expired_result_uncertain: "Processamento interrompido; o resultado pode ter sido aplicado",
+  legacy_processing_result_uncertain: "Mensagem processada pela versão anterior; resultado incerto",
+  dispatch_retry_exhausted: "A resposta não pôde ser enviada após várias tentativas",
+  StuckOutboundDispatchError: "Envio travado; a mensagem pode ter saído",
+  OutboundDispatchError: "Envio com resultado incerto; a mensagem pode ter saído",
+  LeaseLostError: "Outro processamento assumiu a mensagem",
+}
+
+const OPS_DEAD_LETTER_LABELS = {
+  "blocked:outside_window_no_template": "Fora da janela de 24 h e sem template aprovado",
+  "blocked:opted_out": "Contato pediu para não receber mensagens",
+  "blocked:no_consent": "Sem consentimento para esta finalidade",
+  "blocked:consent_required": "Sem consentimento para esta finalidade",
+  "blocked:human_owned": "Conversa com humano: envio automático suspenso",
+  unclassified: "Falha sem classificação",
+}
+
+function currentAdminRole() {
+  const membership = getCurrentIdentityMembership()
+  if (membership) {
+    return { owner: "superadmin", admin: "superadmin", operator: "operator", viewer: "viewer" }[membership.role] || "viewer"
+  }
+  return state.session?.role || "viewer"
+}
+
+function canOperateCurrentCompany() {
+  return ["operator", "superadmin"].includes(currentAdminRole())
+}
+
+function formatAgeSeconds(seconds) {
+  const value = Number(seconds) || 0
+  if (value < 90) return `${value} s`
+  if (value < 5400) return `${Math.round(value / 60)} min`
+  return `${Math.round(value / 3600)} h`
+}
+
+function describeOpsAlert(alert) {
+  if (Array.isArray(alert.purposes)) return `${alert.purposes.map(channelPurposeLabel).join(", ")} · cadastre em Canal WhatsApp`
+  if (alert.oldest_age_seconds != null) return `mais antiga há ${formatAgeSeconds(alert.oldest_age_seconds)}`
+  if (alert.backlog != null) return `${formatNumber(alert.backlog)} mensagem(ns) esperando`
+  if (alert.review != null) return `${formatNumber(alert.review)} em revisão · ${formatNumber(alert.executing || 0)} em execução`
+  if (alert.count != null) return `${formatNumber(alert.count)} item(ns)`
+  return ""
+}
+
+function describeReviewReason(lastError) {
+  const code = String(lastError || "")
+  return OPS_REVIEW_REASONS[code] || (code ? `Erro inesperado (${code})` : "Motivo não registrado")
+}
+
+function renderOpsReviewItem(job, canOperate) {
+  const confirming = state.opsConfirm === `resolve:${job.id}`
+  const busy = state.opsBusy ? "disabled" : ""
+  const actions = !canOperate
+    ? ""
+    : confirming
+      ? `
+        <div class="ops-actions">
+          <button class="button-danger" type="button" data-ops-resolve-confirm="${escapeHtml(String(job.id))}" ${busy}>Confirmar: tratado manualmente</button>
+          <button class="button-ghost" type="button" data-ops-cancel>Cancelar</button>
+          <p class="ops-confirm-note">Nada é reenviado nem refeito. Confirme só depois de verificar a agenda e responder o cliente.</p>
+        </div>
+      `
+      : `
+        <div class="ops-actions">
+          ${job.contact_id ? `<button class="button-ghost" type="button" data-ops-take="${escapeHtml(job.contact_id)}" ${busy}>Assumir conversa</button>` : ""}
+          <button class="button-ghost" type="button" data-ops-resolve="${escapeHtml(String(job.id))}" ${busy}>Marcar como tratado</button>
+        </div>
+      `
+  return `
+    <article class="queue-item ops-item">
+      <div class="ops-item-head">
+        <strong>Mensagem #${escapeHtml(String(job.id))}</strong>
+        <span class="tag tag-warn">Revisão</span>
+      </div>
+      <p>Contato ${escapeHtml(job.contact_id || "—")} · recebida ${escapeHtml(formatDateTime(job.created_at))}</p>
+      <p>${escapeHtml(describeReviewReason(job.last_error))}</p>
+      ${actions}
+    </article>
+  `
+}
+
+function renderOpsOwnedItem(conversation, canOperate, isCompanyAdmin) {
+  const mine = Number(conversation.owner_user_id) === Number(state.session?.user_id)
+  const busy = state.opsBusy ? "disabled" : ""
+  let action = ""
+  if (canOperate && mine) {
+    action = `<button class="button-ghost" type="button" data-ops-release="${escapeHtml(conversation.contact_id)}" ${busy}>Devolver ao bot</button>`
+  } else if (isCompanyAdmin) {
+    action = `<button class="button-ghost" type="button" data-ops-release="${escapeHtml(conversation.contact_id)}" data-ops-force="1" ${busy}>Devolver ao bot (admin)</button>`
+  } else {
+    action = '<span class="subtle">Com outro operador</span>'
+  }
+  return `
+    <article class="queue-item ops-item">
+      <div class="ops-item-head">
+        <strong>${escapeHtml(conversation.contact_id)}</strong>
+        <span class="tag">${mine ? "Com você" : `Operador #${escapeHtml(String(conversation.owner_user_id ?? "—"))}`}</span>
+      </div>
+      <p>Assumida ${escapeHtml(formatDateTime(conversation.taken_at))}${conversation.reason ? ` · ${escapeHtml(conversation.reason)}` : ""}</p>
+      <p>O bot não responde este contato até a devolução.</p>
+      <div class="ops-actions">${action}</div>
+    </article>
+  `
+}
+
+function renderOperationsView() {
+  const company = getSelectedCompany()
+  if (!company || !state.config.companyId) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Operação</span>
+        <h2 class="hero-title">Selecione uma empresa para ver a operação.</h2>
+        <p class="hero-copy">Revisões, conversas e alertas são sempre isolados por empresa.</p>
+      </section>
+    `
+  }
+  const ops = state.operations
+  if (!ops || String(ops.companyId) !== String(state.config.companyId)) {
+    return `<section class="card">${renderSkeleton(4)}</section>`
+  }
+
+  const summary = ops.summary || {}
+  const inbound = summary.inbound || {}
+  const alerts = Array.isArray(summary.alerts) ? summary.alerts : []
+  const deadLetters = Object.entries(summary.outbound?.dead_letters_by_code || {})
+  const canOperate = canOperateCurrentCompany()
+  const isCompanyAdmin = currentAdminRole() === "superadmin"
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">Operação · ${escapeHtml(company.name)}</span>
+      <h2 class="hero-title">${alerts.length ? `${formatNumber(alerts.length)} ponto(s) pedem atenção.` : "Nada pede atenção agora."}</h2>
+      <p class="hero-copy">
+        Mensagens com resultado incerto ficam em revisão e bloqueiam só a conversa do contato.
+        Assuma a conversa para responder pessoalmente; o bot volta quando você devolver.
+      </p>
+      <div class="hero-actions">
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
+        ${canOperate ? "" : '<span class="tag">Somente leitura</span>'}
+      </div>
+    </section>
+
+    <section class="grid-three">
+      ${renderMetricCard("Em revisão", formatNumber(inbound.by_status?.review || 0), "Mensagens aguardando decisão humana.", (inbound.by_status?.review || 0) ? "warm" : "default", "handoff")}
+      ${renderMetricCard("Com humano", formatNumber(summary.human_owned_conversations || 0), "Conversas em que o bot está pausado.", "default", "contacts")}
+      ${renderMetricCard("Worker de entrada", inbound.worker_alive ? "Ativo" : "Parado", `${formatNumber(inbound.backlog || 0)} na fila${inbound.oldest_active_age_seconds != null ? ` · mais antiga há ${formatAgeSeconds(inbound.oldest_active_age_seconds)}` : ""}.`, inbound.worker_alive ? "default" : "warm", "clock")}
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Alertas</h3>
+          <p class="card-copy">Contagens desta empresa, sem conteúdo de mensagens.</p>
+        </div>
+      </div>
+      <div class="ops-list">
+        ${
+          alerts.length
+            ? alerts
+                .map(
+                  (alert) => `
+                    <div class="ops-alert">
+                      <strong>${escapeHtml(OPS_ALERT_LABELS[alert.code] || alert.code)}</strong>
+                      <span class="subtle">${escapeHtml(describeOpsAlert(alert))}</span>
+                    </div>
+                  `
+                )
+                .join("")
+            : renderEmptyState("check", "Sem alertas", "Fila, envios e agenda estão em dia para esta empresa.")
+        }
+      </div>
+    </section>
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Revisão de mensagens</h3>
+            <p class="card-copy">As mais recentes primeiro. Marcar como tratado não reenvia nada.</p>
+          </div>
+        </div>
+        <div class="ops-list">
+          ${
+            ops.reviewJobs.length
+              ? ops.reviewJobs.map((job) => renderOpsReviewItem(job, canOperate)).join("")
+              : renderEmptyState("check", "Nenhuma mensagem em revisão", "Quando um resultado for incerto, ele aparece aqui.")
+          }
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Conversas com humano</h3>
+            <p class="card-copy">Enquanto uma pessoa atende, o bot só registra as mensagens do cliente.</p>
+          </div>
+        </div>
+        ${
+          canOperate
+            ? `
+              <form id="operations-take-form" class="form-grid">
+                <div class="field">
+                  <label for="ops-take-contact">Telefone do contato</label>
+                  <input id="ops-take-contact" name="contact_id" required inputmode="tel" autocomplete="off" placeholder="5511999999999" value="${escapeHtml(state.opsTakeDraft.contact_id)}" />
+                </div>
+                <div class="field">
+                  <label for="ops-take-reason">Motivo (opcional)</label>
+                  <input id="ops-take-reason" name="reason" maxlength="200" autocomplete="off" placeholder="Cliente pediu atendente" value="${escapeHtml(state.opsTakeDraft.reason)}" />
+                </div>
+                <div class="toolbar-row">
+                  <button class="button" type="submit" ${state.opsBusy ? "disabled" : ""}>Assumir conversa</button>
+                </div>
+              </form>
+            `
+            : ""
+        }
+        <div class="ops-list">
+          ${
+            ops.humanOwned.length
+              ? ops.humanOwned.map((conversation) => renderOpsOwnedItem(conversation, canOperate, isCompanyAdmin)).join("")
+              : renderEmptyState("contacts", "Nenhuma conversa com humano", "Todas as conversas estão com o bot.")
+          }
+        </div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Envios com falha</h3>
+          <p class="card-copy">Mensagens que não serão reenviadas automaticamente, agrupadas pelo motivo.</p>
+        </div>
+      </div>
+      <div class="ops-list">
+        ${
+          deadLetters.length
+            ? deadLetters
+                .map(
+                  ([code, count]) => `
+                    <div class="ops-alert">
+                      <strong>${escapeHtml(OPS_DEAD_LETTER_LABELS[code] || code)}</strong>
+                      <span class="subtle">${formatNumber(count)} envio(s)</span>
+                    </div>
+                  `
+                )
+                .join("")
+            : renderEmptyState("send", "Nenhum envio com falha", "As respostas e lembretes recentes foram entregues ao provedor.")
+        }
+      </div>
+    </section>
+  `
+}
+
+// ── Política da empresa (P01/P07): editar, validar, publicar e voltar ──
+
+const POLICY_STATUS_LABELS = {
+  published: "publicada",
+  draft: "rascunho",
+  archived: "arquivada",
+  superseded: "substituída",
+  unversioned: "sem versão",
+}
+
+// Mesmos limites de app/services/company_policy_service.py.
+const POLICY_LIMITS = { messageLength: 1000, minNoticeMax: 43200, ttlMin: 1, ttlMax: 1440 }
+
+const POLICY_MESSAGE_FIELDS = [
+  ["greeting_message", "Saudação", "Enviada quando o cliente só cumprimenta. Use {company_name} para o nome da empresa.", true],
+  ["clarification_message", "Pedido de esclarecimento", "Quando o bot não entende a mensagem.", false],
+  ["handoff_notice_message", "Aviso de encaminhamento", "Quando a conversa vai para a equipe.", true],
+  ["after_hours_message", "Fora do horário", "Usada no modo \"só avisar\" fora do horário de atendimento.", true],
+  ["unsupported_content_message", "Conteúdo não suportado", "Áudio, imagem ou outro formato que o bot não lê.", false],
+  ["opt_out_confirmation_message", "Confirmação de SAIR", "Quando o cliente pede para não receber avisos.", false],
+  ["opt_in_confirmation_message", "Confirmação de VOLTAR", "Quando o cliente volta a receber avisos.", false],
+]
+
+function renderPolicyMessage(template, companyName) {
+  return String(template || "").split("{company_name}").join(companyName || "")
+}
+
+function policyFieldId(pathValue) {
+  return `policy-${pathValue.split(".").join("-")}`
+}
+
+function setPolicyValue(target, pathValue, value) {
+  const keys = pathValue.split(".")
+  const last = keys.pop()
+  const parent = keys.reduce((node, key) => {
+    if (node[key] == null || typeof node[key] !== "object") node[key] = {}
+    return node[key]
+  }, target)
+  parent[last] = value
+}
+
+function validatePolicyDraft(draft) {
+  const conversation = draft.conversation || {}
+  for (const [key, label] of POLICY_MESSAGE_FIELDS) {
+    const value = conversation[key]
+    if (typeof value !== "string" || !value.trim()) return `${label}: o texto não pode ficar vazio.`
+    if (value.length > POLICY_LIMITS.messageLength) return `${label}: no máximo ${POLICY_LIMITS.messageLength} caracteres.`
+  }
+  if (!["continue", "notice_only"].includes(conversation.after_hours_mode)) {
+    return "Fora do horário: escolha uma opção válida."
+  }
+  for (const [key, label] of [["cancellation", "Cancelamento"], ["reschedule", "Remarcação"]]) {
+    const rule = draft.booking_rules?.[key] || {}
+    const minutes = rule.min_notice_minutes
+    if (!Number.isInteger(minutes) || minutes < 0 || minutes > POLICY_LIMITS.minNoticeMax) {
+      return `${label}: a antecedência mínima deve ser um inteiro entre 0 e ${POLICY_LIMITS.minNoticeMax} minutos.`
+    }
+    if (!["handoff", "deny"].includes(rule.outside_window)) return `${label}: escolha o que fazer fora da regra.`
+  }
+  const ttl = draft.confirmation?.proposal_ttl_minutes
+  if (!Number.isInteger(ttl) || ttl < POLICY_LIMITS.ttlMin || ttl > POLICY_LIMITS.ttlMax) {
+    return `Validade da proposta: um inteiro entre ${POLICY_LIMITS.ttlMin} e ${POLICY_LIMITS.ttlMax} minutos.`
+  }
+  if (!/^[a-z]{2,3}(_[A-Z]{2})?$/.test(String(draft.channel?.template_language || ""))) {
+    return "Idioma dos templates: use o código da Meta, ex.: pt_BR."
+  }
+  return ""
+}
+
+function renderPolicyMessageField(conversation, field, disabled, companyName) {
+  const [key, label, hint, withPreview] = field
+  const pathValue = `conversation.${key}`
+  const value = conversation[key] || ""
+  return `
+    <div class="field">
+      <label for="${policyFieldId(pathValue)}">${escapeHtml(label)}</label>
+      <textarea id="${policyFieldId(pathValue)}" rows="3" maxlength="${POLICY_LIMITS.messageLength}" data-policy-path="${pathValue}" ${disabled}>${escapeHtml(value)}</textarea>
+      <small>${escapeHtml(hint)}</small>
+      ${
+        withPreview
+          ? `<p class="policy-preview"><span>Prévia sintética — nada é enviado:</span> <em data-policy-preview="${pathValue}">${escapeHtml(renderPolicyMessage(value, companyName))}</em></p>`
+          : ""
+      }
+    </div>
+  `
+}
+
+function renderPolicyRule(key, label, verb, rule, disabled) {
+  const base = `booking_rules.${key}`
+  return `
+    <div class="policy-rule">
+      <strong>${escapeHtml(label)}</strong>
+      <label class="team-active-toggle">
+        <input type="checkbox" data-policy-path="${base}.allowed" ${rule.allowed ? "checked" : ""} ${disabled} />
+        <span>Cliente pode ${verb} pelo WhatsApp</span>
+      </label>
+      <div class="field">
+        <label for="${policyFieldId(`${base}.min_notice_minutes`)}">Antecedência mínima (minutos)</label>
+        <input id="${policyFieldId(`${base}.min_notice_minutes`)}" type="number" min="0" max="${POLICY_LIMITS.minNoticeMax}" step="1" inputmode="numeric"
+          data-policy-path="${base}.min_notice_minutes" data-policy-type="int" value="${escapeHtml(String(rule.min_notice_minutes ?? 0))}" ${disabled} />
+        <small>Ex.: 1440 = até 24 horas antes do horário. 0 = até o início.</small>
+      </div>
+      <div class="field">
+        <label for="${policyFieldId(`${base}.outside_window`)}">Fora dessa regra</label>
+        <select id="${policyFieldId(`${base}.outside_window`)}" data-policy-path="${base}.outside_window" ${disabled}>
+          <option value="handoff" ${rule.outside_window === "handoff" ? "selected" : ""}>Encaminhar para a equipe decidir</option>
+          <option value="deny" ${rule.outside_window === "deny" ? "selected" : ""}>Recusar e explicar ao cliente</option>
+        </select>
+      </div>
+    </div>
+  `
+}
+
+function renderPolicyVersionRow(version, config, canPublish) {
+  const currentVersion = Number(config.version || 0)
+  const isCurrent = version.status === "published" && Number(version.version) === currentVersion
+  const verb = Number(version.version) < currentVersion ? "Voltar para esta versão" : "Publicar esta versão"
+  const busy = state.policyBusy ? "disabled" : ""
+  let action = ""
+  if (isCurrent) {
+    action = '<span class="tag tag-success">Em uso</span>'
+  } else if (canPublish && state.policyConfirm === String(version.id)) {
+    action = `
+      <button class="button-danger" type="button" data-policy-publish-confirm="${escapeHtml(String(version.id))}" ${busy}>Confirmar: ${escapeHtml(verb.toLowerCase())}</button>
+      <button class="button-ghost" type="button" data-policy-cancel>Cancelar</button>
+      <p class="ops-confirm-note">O bot passa a usar esta versão a partir da próxima mensagem.</p>
+    `
+  } else if (canPublish) {
+    action = `<button class="button-ghost" type="button" data-policy-publish-version="${escapeHtml(String(version.id))}" ${busy}>${escapeHtml(verb)}</button>`
+  }
+  return `
+    <article class="queue-item ops-item">
+      <div class="ops-item-head">
+        <strong>Versão ${escapeHtml(String(version.version))}</strong>
+        <span class="tag">${escapeHtml(POLICY_STATUS_LABELS[version.status] || version.status || "—")}</span>
+      </div>
+      <p>${escapeHtml(version.author || "—")} · criada ${escapeHtml(formatDateTime(version.created_at))}${version.published_at ? ` · publicada ${escapeHtml(formatDateTime(version.published_at))}` : ""}</p>
+      ${version.change_note ? `<p>${escapeHtml(version.change_note)}</p>` : ""}
+      ${action ? `<div class="ops-actions">${action}</div>` : ""}
+    </article>
+  `
+}
+
+function renderPolicyView() {
+  const company = getSelectedCompany()
+  if (!company || !state.config.companyId) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Política</span>
+        <h2 class="hero-title">Selecione uma empresa para ver a política.</h2>
+        <p class="hero-copy">Mensagens, regras e versões são sempre de uma empresa.</p>
+      </section>
+    `
+  }
+  const policy = state.policy
+  if (!policy || String(policy.companyId) !== String(state.config.companyId)) {
+    return `<section class="card">${renderSkeleton(4)}</section>`
+  }
+
+  const config = policy.config
+  const draft = policy.draft
+  const conversation = draft.conversation || {}
+  const versioned = config.version != null && config.status !== "unversioned"
+  const canPublish = versioned && currentAdminRole() === "superadmin"
+  const disabled = canPublish ? "" : "disabled"
+  const busy = state.policyBusy ? "disabled" : ""
+  const companyName = config.company_name || company.name
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">Política · ${escapeHtml(companyName)}</span>
+      <h2 class="hero-title">${
+        versioned
+          ? `Versão ${escapeHtml(String(config.version))} · ${escapeHtml(POLICY_STATUS_LABELS[config.status] || config.status || "—")}`
+          : "Esta empresa ainda não tem configuração publicada."
+      }</h2>
+      <p class="hero-copy">${
+        versioned
+          ? "Cada publicação cria uma versão nova; as anteriores ficam no histórico e podem voltar a valer."
+          : "O que aparece abaixo é o modelo padrão e não vale em produção. Conclua o Setup Wizard para publicar a primeira versão da empresa."
+      }</p>
+      <div class="hero-actions">
+        ${versioned ? "" : '<button class="button" data-jump-view="onboarding">Abrir Setup Wizard</button>'}
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
+        ${versioned && !canPublish ? '<span class="tag">Somente administradores da empresa publicam</span>' : ""}
+      </div>
+    </section>
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Mensagens da conversa</h3>
+            <p class="card-copy">Textos fixos que o bot usa sem consultar o modelo.</p>
+          </div>
+        </div>
+        <div class="policy-toggles">
+          <label class="team-active-toggle">
+            <input type="checkbox" data-policy-path="conversation.greeting_enabled" ${conversation.greeting_enabled ? "checked" : ""} ${disabled} />
+            <span>Responder saudação simples</span>
+          </label>
+          <label class="team-active-toggle">
+            <input type="checkbox" data-policy-path="conversation.handoff_notice_enabled" ${conversation.handoff_notice_enabled ? "checked" : ""} ${disabled} />
+            <span>Avisar o cliente ao encaminhar</span>
+          </label>
+        </div>
+        <div class="policy-fields">
+          <div class="field">
+            <label for="policy-conversation-after_hours_mode">Fora do horário de atendimento</label>
+            <select id="policy-conversation-after_hours_mode" data-policy-path="conversation.after_hours_mode" ${disabled}>
+              <option value="continue" ${conversation.after_hours_mode === "continue" ? "selected" : ""}>Continuar atendendo normalmente</option>
+              <option value="notice_only" ${conversation.after_hours_mode === "notice_only" ? "selected" : ""}>Só avisar e registrar para a equipe</option>
+            </select>
+          </div>
+          ${POLICY_MESSAGE_FIELDS.map((field) => renderPolicyMessageField(conversation, field, disabled, companyName)).join("")}
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Cancelamento e remarcação</h3>
+            <p class="card-copy">Valem para o cliente e para automações; o operador pode agir quando a regra encaminha.</p>
+          </div>
+        </div>
+        ${renderPolicyRule("cancellation", "Cancelamento", "cancelar", draft.booking_rules?.cancellation || {}, disabled)}
+        ${renderPolicyRule("reschedule", "Remarcação", "remarcar", draft.booking_rules?.reschedule || {}, disabled)}
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Confirmação e canal</h3>
+            <p class="card-copy">Quanto tempo um "sim" vale e o idioma dos templates aprovados.</p>
+          </div>
+        </div>
+        <div class="policy-fields">
+          <div class="field">
+            <label for="policy-confirmation-proposal_ttl_minutes">Validade da proposta (minutos)</label>
+            <input id="policy-confirmation-proposal_ttl_minutes" type="number" min="${POLICY_LIMITS.ttlMin}" max="${POLICY_LIMITS.ttlMax}" step="1" inputmode="numeric"
+              data-policy-path="confirmation.proposal_ttl_minutes" data-policy-type="int" value="${escapeHtml(String(draft.confirmation?.proposal_ttl_minutes ?? 30))}" ${disabled} />
+            <small>Depois disso, um "sim" atrasado não confirma nada e o bot pergunta de novo.</small>
+          </div>
+          <div class="field">
+            <label for="policy-channel-template_language">Idioma dos templates WhatsApp</label>
+            <input id="policy-channel-template_language" maxlength="6" autocomplete="off" data-policy-path="channel.template_language" value="${escapeHtml(String(draft.channel?.template_language || ""))}" ${disabled} />
+            <small>Código da Meta, ex.: pt_BR.</small>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Publicar</h3>
+          <p class="card-copy">Os valores são conferidos aqui e de novo no servidor antes de gravar.</p>
+        </div>
+      </div>
+      ${
+        canPublish
+          ? `
+            <div class="field">
+              <label for="policy-change-note">O que mudou (aparece no histórico)</label>
+              <input id="policy-change-note" maxlength="200" autocomplete="off" placeholder="Ex.: cancelamento só até 24 h antes" value="${escapeHtml(policy.changeNote || "")}" />
+            </div>
+            ${policy.error ? `<p class="policy-error" role="alert">${escapeHtml(policy.error)}</p>` : ""}
+            <div class="toolbar-row">
+              <button class="button-ghost" type="button" data-policy-save="draft" ${busy}>Salvar rascunho</button>
+              <button class="button" type="button" data-policy-save="publish" ${busy}>Publicar agora</button>
+            </div>
+          `
+          : `<p class="subtle">${versioned ? "Sem permissão de publicação nesta empresa." : "Publique a primeira versão pelo Setup Wizard."}</p>`
+      }
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Histórico de versões</h3>
+          <p class="card-copy">Mais recentes primeiro. Rascunhos só valem depois de publicados.</p>
+        </div>
+      </div>
+      <div class="ops-list">
+        ${
+          policy.versions.length
+            ? policy.versions.map((version) => renderPolicyVersionRow(version, config, canPublish)).join("")
+            : renderEmptyState("tag", "Nenhuma versão ainda", "A primeira versão nasce ao concluir o Setup Wizard.")
+        }
+      </div>
+    </section>
+  `
+}
+
+async function savePolicyVersion(publish) {
+  const policy = state.policy
+  if (!policy || state.policyBusy) return
+  const error = validatePolicyDraft(policy.draft)
+  if (error) {
+    policy.error = error
+    pushToast(error, "error")
+    renderApp()
+    return
+  }
+  policy.error = ""
+  // Envia a política inteira: seções não editadas aqui mantêm o valor atual
+  // em vez de voltar ao padrão do segmento.
+  const body = {
+    context: policy.config.context || {},
+    capabilities: policy.config.capabilities || null,
+    policies: { ...(policy.config.policies || {}), ...JSON.parse(JSON.stringify(policy.draft)) },
+    change_note: (policy.changeNote || "").trim() || null,
+    publish,
+  }
+  state.policyBusy = true
+  renderApp()
+  try {
+    const stored = await apiRequest("/admin/company-config/versions", {
+      method: "POST",
+      params: getAdminCompanyParams(),
+      body,
+    })
+    pushToast(publish ? `Versão ${stored.version} publicada.` : `Rascunho salvo como versão ${stored.version}.`, "success")
+  } catch (requestError) {
+    const message = summarizeError(requestError)
+    policy.error = message
+    pushToast(message, "error")
+    state.policyBusy = false
+    renderApp()
+    return
+  }
+  state.policyBusy = false
+  await refreshCurrentView({ silent: true })
+}
+
+async function publishPolicyVersion(versionId) {
+  if (state.policyBusy) return
+  state.policyBusy = true
+  renderApp()
+  try {
+    const stored = await apiRequest("/admin/company-config/publish", {
+      method: "POST",
+      params: getAdminCompanyParams(),
+      body: { version_id: Number(versionId) },
+    })
+    pushToast(`Versão ${stored.version} publicada.`, "success")
+  } catch (requestError) {
+    pushToast(summarizeError(requestError), "error")
+  } finally {
+    state.policyBusy = false
+    state.policyConfirm = null
+  }
+  await refreshCurrentView({ silent: true })
+}
+
+// ── Canal WhatsApp (P05/P07): templates aprovados e consentimento ─────
+
+const CHANNEL_PURPOSES = [
+  ["reminders", "Lembrete de agendamento", "Enviado antes do horário marcado. O template recebe 1 variável: o texto do lembrete."],
+  ["queue_offers", "Oferta de vaga da fila", "Vaga liberada oferecida a quem espera. O template recebe 2 variáveis: serviço e data/hora."],
+  ["service_followup", "Retorno da equipe", "Mensagem da equipe depois de 24 h sem o cliente escrever."],
+  ["automation", "Automações", "Mensagens enviadas por fluxos do Automation Studio."],
+  ["internal_notice", "Aviso interno", "Aviso para a própria equipe."],
+  ["marketing", "Marketing", "Só sai para contatos com consentimento de marketing registrado."],
+]
+
+// Variáveis que o sistema realmente preenche hoje (reminder_service e fila).
+const CHANNEL_EXPECTED_PARAMETERS = { reminders: 1, queue_offers: 2 }
+
+const TEMPLATE_STATUS_LABELS = {
+  approved: "Aprovado",
+  pending: "Em análise na Meta",
+  rejected: "Rejeitado",
+  paused: "Pausado",
+  disabled: "Desativado",
+}
+
+const CONSENT_STATUS_LABELS = { granted: "Concedido", revoked: "Revogado" }
+
+function channelPurposeLabel(purpose) {
+  const found = CHANNEL_PURPOSES.find(([key]) => key === purpose)
+  return found ? found[1] : purpose
+}
+
+async function loadChannelData() {
+  if (!state.config.companyId) {
+    state.channel = null
+    return
+  }
+  const params = getAdminCompanyParams()
+  const [response, status] = await Promise.all([
+    apiRequest("/admin/whatsapp/templates", { params }),
+    // Mesma fonte canônica usada pelo webhook e pelo envio em produção.
+    apiRequest("/admin/whatsapp/channel-status", { params }).catch(() => null),
+  ])
+  state.channel = {
+    companyId: state.config.companyId,
+    language: response?.language_code || "pt_BR",
+    templates: Array.isArray(response?.templates) ? response.templates : [],
+    status,
+  }
+  if (state.channelContact && String(state.channelContact.companyId) !== String(state.config.companyId)) {
+    state.channelContact = null
+  }
+}
+
+function renderChannelTemplateRow([purpose, label, hint], templatesByPurpose) {
+  const template = templatesByPurpose[purpose]
+  const active = template && Number(template.active) === 1
+  const ready = active && template.status === "approved"
+  const tone = ready ? "tag-success" : template ? "tag-warn" : "tag-danger"
+  const statusText = ready
+    ? "Pronto"
+    : template
+      ? active
+        ? TEMPLATE_STATUS_LABELS[template.status] || template.status
+        : "Inativo"
+      : "Faltando"
+  return `
+    <div class="ops-alert" data-channel-purpose="${purpose}">
+      <div class="channel-purpose-copy">
+        <strong>${escapeHtml(label)}</strong>
+        <span class="subtle">${
+          template
+            ? `${escapeHtml(template.name)} · ${escapeHtml(template.language_code)} · ${formatNumber(template.parameter_count)} variável(is)`
+            : escapeHtml(hint)
+        }</span>
+      </div>
+      <span class="tag ${tone}">${escapeHtml(statusText)}</span>
+    </div>
+  `
+}
+
+function renderChannelContact(contact, canOperate) {
+  if (!contact) return ""
+  const busy = state.channelBusy ? "disabled" : ""
+  return `
+    <div class="channel-contact">
+      <h4 class="card-title">Consentimento de ${escapeHtml(contact.contact_id)}</h4>
+      <p class="subtle">${
+        contact.opted_out_at
+          ? `Pediu SAIR em ${escapeHtml(formatDateTime(contact.opted_out_at))}: não recebe lembretes nem avisos até escrever VOLTAR.`
+          : "Não pediu SAIR: recebe lembretes e avisos permitidos."
+      }${contact.last_inbound_at ? ` Última mensagem do cliente: ${escapeHtml(formatDateTime(contact.last_inbound_at))}.` : ""}</p>
+      ${
+        canOperate
+          ? `
+            <div class="field">
+              <label for="channel-consent-evidence">Evidência do consentimento (opcional)</label>
+              <input id="channel-consent-evidence" maxlength="200" autocomplete="off" placeholder="Ex.: formulário assinado em 10/09" />
+            </div>
+          `
+          : ""
+      }
+      <div class="ops-list">
+        ${CHANNEL_PURPOSES.map(([purpose, label]) => {
+          const status = contact.consents?.[purpose] || null
+          const tone = status === "granted" ? "tag-success" : status === "revoked" ? "tag-danger" : ""
+          return `
+            <article class="queue-item ops-item" data-consent-row="${purpose}">
+              <div class="ops-item-head">
+                <strong>${escapeHtml(label)}</strong>
+                <span class="tag ${tone}">${escapeHtml(CONSENT_STATUS_LABELS[status] || "Sem registro")}</span>
+              </div>
+              ${
+                canOperate
+                  ? `
+                    <div class="ops-actions">
+                      <button class="button-ghost" type="button" data-consent-purpose="${purpose}" data-consent-status="granted" ${busy}>Registrar consentimento</button>
+                      <button class="button-ghost" type="button" data-consent-purpose="${purpose}" data-consent-status="revoked" ${busy}>Registrar revogação</button>
+                    </div>
+                  `
+                  : ""
+              }
+            </article>
+          `
+        }).join("")}
+      </div>
+    </div>
+  `
+}
+
+function renderChannelBindingStatus(status) {
+  if (status === null) {
+    return '<p class="subtle">Não foi possível carregar o vínculo do número agora.</p>'
+  }
+  if (!status?.binding) {
+    return `
+      <div class="empty-state" data-channel-binding-empty>
+        ${escapeHtml(status?.details || "Nenhum número vinculado: mensagens recebidas no WhatsApp não chegam a esta empresa.")}
+        O vínculo é feito por um administrador com o identificador do número na Meta.
+      </div>
+    `
+  }
+  const binding = status.binding
+  return `
+    <div class="ops-list">
+      <div class="ops-alert" data-channel-binding="${escapeHtml(String(binding.id))}">
+        <div class="channel-purpose-copy">
+          <strong>${escapeHtml(binding.display_phone_number || "WhatsApp")}</strong>
+          <span class="subtle">Identificador canônico ${escapeHtml(binding.phone_number_id || "—")} · desde ${escapeHtml(formatDateTime(binding.created_at))}</span>
+        </div>
+        <span class="tag ${binding.active ? "tag-success" : "tag-danger"}">${binding.active ? "Ativo" : "Inativo"}</span>
+      </div>
+    </div>
+  `
+}
+
+function renderChannelView() {
+  const company = getSelectedCompany()
+  if (!company || !state.config.companyId) {
+    return `
+      <section class="hero">
+        <span class="brand-eyebrow">Canal WhatsApp</span>
+        <h2 class="hero-title">Selecione uma empresa para ver o canal.</h2>
+        <p class="hero-copy">Templates e consentimentos são sempre de uma empresa.</p>
+      </section>
+    `
+  }
+  const channel = state.channel
+  if (!channel || String(channel.companyId) !== String(state.config.companyId)) {
+    return `<section class="card">${renderSkeleton(4)}</section>`
+  }
+
+  const isCompanyAdmin = currentAdminRole() === "superadmin"
+  const canOperate = canOperateCurrentCompany()
+  const busy = state.channelBusy ? "disabled" : ""
+  const status = channel.status
+  const test = state.whatsappConnectionTest && String(state.whatsappConnectionTest.companyId) === String(state.config.companyId)
+    ? state.whatsappConnectionTest
+    : null
+  const testing = state.connectionTestBusy === "whatsapp"
+  const templatesByPurpose = Object.fromEntries(
+    channel.templates
+      .filter((template) => template.language_code === channel.language)
+      .map((template) => [template.purpose, template])
+  )
+  const missingInUse = ["reminders", "queue_offers"].filter((purpose) => {
+    const template = templatesByPurpose[purpose]
+    return !(template && template.status === "approved" && Number(template.active) === 1)
+  })
+  const contact =
+    state.channelContact && String(state.channelContact.companyId) === String(state.config.companyId)
+      ? state.channelContact
+      : null
+  // O formulário é redesenhado a cada render (aviso, SSE): os valores vêm do estado.
+  const draft = state.channelDraft || {
+    purpose: "reminders",
+    name: "",
+    language_code: channel.language,
+    category: "utility",
+    status: "approved",
+    parameter_count: "1",
+    active: true,
+  }
+
+  return `
+    <section class="hero">
+      <span class="brand-eyebrow">Canal WhatsApp · ${escapeHtml(company.name)}</span>
+      <h2 class="hero-title">${
+        missingInUse.length
+          ? "Há mensagens que não vão sair depois de 24 h sem o cliente escrever."
+          : "Lembretes e ofertas de vaga têm template aprovado."
+      }</h2>
+      <p class="hero-copy">
+        Depois de 24 h sem mensagem do cliente, o WhatsApp só entrega template aprovado pela Meta.
+        Cadastre aqui o nome e o idioma exatamente como aprovados no WhatsApp Manager — este painel não envia template para aprovação.
+      </p>
+      <div class="hero-actions">
+        <span class="tag">Idioma da política: ${escapeHtml(channel.language)}</span>
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
+        ${canOperate ? "" : '<span class="tag">Somente leitura</span>'}
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Número WhatsApp da empresa</h3>
+          <p class="card-copy">Este é o vínculo canônico usado pelo webhook e pelo envio. Identificadores e telefone aparecem mascarados.</p>
+        </div>
+        <span class="tag ${status?.ready ? "tag-success" : "tag-danger"}">${status?.ready ? "Canal configurado" : "Configuração incompleta"}</span>
+      </div>
+      ${renderChannelBindingStatus(status)}
+      ${status ? `<p class="subtle">${escapeHtml(status.details || "")}</p>` : ""}
+      <div class="hero-actions">
+        ${isCompanyAdmin ? `<button class="button-ghost" type="button" data-test-whatsapp-connection ${testing ? "disabled" : ""}>${testing ? "Testando…" : "Testar conexão com a Meta"}</button>` : ""}
+        ${test ? `<span class="tag ${test.connected ? "tag-success" : "tag-danger"}">${escapeHtml(test.connected ? "Conexão confirmada" : "Falha na conexão")}</span>` : ""}
+      </div>
+      ${test ? `<p class="subtle">${escapeHtml(test.details || "Diagnóstico concluído.")} Verificado em ${escapeHtml(formatDateTime(test.checked_at))}.</p>` : ""}
+    </section>
+
+    <section class="grid-two">
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Situação por finalidade</h3>
+            <p class="card-copy">Templates no idioma ${escapeHtml(channel.language)} usados quando a janela de 24 h fechou.</p>
+          </div>
+        </div>
+        <div class="ops-list">
+          ${CHANNEL_PURPOSES.map((purpose) => renderChannelTemplateRow(purpose, templatesByPurpose)).join("")}
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Cadastrar ou atualizar template</h3>
+            <p class="card-copy">Um template por finalidade e idioma: salvar de novo atualiza o existente.</p>
+          </div>
+        </div>
+        ${
+          isCompanyAdmin
+            ? `
+              <form id="channel-template-form" class="form-grid">
+                <div class="field">
+                  <label for="channel-template-purpose">Finalidade</label>
+                  <select id="channel-template-purpose" name="purpose">
+                    ${CHANNEL_PURPOSES.map(([key, label]) => `<option value="${key}" ${draft.purpose === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="channel-template-name">Nome do template na Meta</label>
+                  <input id="channel-template-name" name="name" required maxlength="512" autocomplete="off" placeholder="lembrete_consulta" value="${escapeHtml(draft.name)}" />
+                </div>
+                <div class="field">
+                  <label for="channel-template-language">Idioma</label>
+                  <input id="channel-template-language" name="language_code" required maxlength="6" autocomplete="off" value="${escapeHtml(draft.language_code)}" />
+                </div>
+                <div class="field">
+                  <label for="channel-template-category">Categoria</label>
+                  <select id="channel-template-category" name="category">
+                    ${[["utility", "Utilidade"], ["marketing", "Marketing"], ["authentication", "Autenticação"]]
+                      .map(([key, label]) => `<option value="${key}" ${draft.category === key ? "selected" : ""}>${label}</option>`)
+                      .join("")}
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="channel-template-status">Situação na Meta</label>
+                  <select id="channel-template-status" name="status">
+                    ${Object.entries(TEMPLATE_STATUS_LABELS).map(([key, label]) => `<option value="${key}" ${draft.status === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="channel-template-parameters">Variáveis no corpo</label>
+                  <input id="channel-template-parameters" name="parameter_count" type="number" min="0" max="10" step="1" inputmode="numeric" value="${escapeHtml(draft.parameter_count)}" />
+                  <small>Lembrete de agendamento: 1. Oferta de vaga: 2.</small>
+                </div>
+                <label class="team-active-toggle">
+                  <input type="checkbox" name="active" ${draft.active ? "checked" : ""} />
+                  <span>Usar este template</span>
+                </label>
+                <div class="toolbar-row">
+                  <button class="button" type="submit" ${busy}>Salvar template</button>
+                </div>
+              </form>
+            `
+            : '<p class="subtle">Somente administradores da empresa cadastram templates.</p>'
+        }
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <div>
+          <h3 class="card-title">Consentimento do contato</h3>
+          <p class="card-copy">SAIR e VOLTAR enviados pelo cliente valem sozinhos. Registre aqui consentimento obtido fora do WhatsApp, com evidência.</p>
+        </div>
+      </div>
+      <form id="channel-contact-form" class="inline-actions channel-contact-form">
+        <input id="channel-contact-input" name="contact_id" required inputmode="tel" autocomplete="off" placeholder="5511999999999" aria-label="Telefone do contato" />
+        <button class="button-ghost" type="submit" ${busy}>Consultar</button>
+      </form>
+      ${renderChannelContact(contact, canOperate)}
+    </section>
+  `
+}
+
+async function lookupChannelContact(contactId) {
+  state.channelBusy = true
+  renderApp()
+  try {
+    const contact = await apiRequest(`/admin/whatsapp/contacts/${encodeURIComponent(contactId)}/channel`, {
+      params: getAdminCompanyParams(),
+    })
+    state.channelContact = { ...contact, companyId: state.config.companyId }
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.channelBusy = false
+    renderApp()
+  }
+}
+
+async function runChannelAction(action, successMessage) {
+  if (state.channelBusy) return
+  state.channelBusy = true
+  renderApp()
+  let succeeded = false
+  try {
+    await action()
+    succeeded = true
+    pushToast(successMessage, "success")
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.channelBusy = false
+  }
+  if (succeeded && state.channelContact) {
+    await lookupChannelContact(state.channelContact.contact_id)
+  }
+  await refreshCurrentView({ silent: true })
+}
+
+async function runOperationsAction(action, successMessage) {
+  if (state.opsBusy) return
+  state.opsBusy = true
+  renderApp()
+  try {
+    await action()
+    pushToast(successMessage, "success")
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.opsBusy = false
+    state.opsConfirm = null
+  }
+  await refreshCurrentView({ silent: true })
+}
+
 function renderCurrentView() {
   if (state.view === "dashboard") return renderDashboardView()
   if (state.view === "analytics") return renderAnalyticsView()
   if (state.view === "studio") return renderStudioView()
   if (state.view === "flows") return renderFlowsView()
   if (state.view === "agenda") return renderAgendaView()
+  if (state.view === "operations") return renderOperationsView()
+  if (state.view === "policy") return renderPolicyView()
+  if (state.view === "channel") return renderChannelView()
   if (state.view === "contacts") return renderContactsView()
   if (state.view === "training") return renderTrainingView()
   if (state.view === "team") return renderTeamView()
@@ -4689,6 +5937,8 @@ function bindEvents() {
       persistConfig()
       state.companyContext = null
       state.trainingImportResult = null
+      state.calendarConnectionTest = null
+      state.whatsappConnectionTest = null
       await refreshCurrentView()
     })
   }
@@ -5604,9 +6854,25 @@ function bindAgendaEvents() {
     })
   })
 
+  // Cancelamento em dois passos: o primeiro clique só pede confirmação.
   document.querySelectorAll("[data-cancel-booking]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.bookingCancelConfirm = button.dataset.cancelBooking
+      renderApp()
+    })
+  })
+
+  document.querySelectorAll("[data-cancel-booking-abort]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.bookingCancelConfirm = null
+      renderApp()
+    })
+  })
+
+  document.querySelectorAll("[data-cancel-booking-confirm]").forEach((button) => {
     button.addEventListener("click", async () => {
-      const bookingId = Number(button.dataset.cancelBooking)
+      const bookingId = Number(button.dataset.cancelBookingConfirm)
+      state.bookingCancelConfirm = null
       state.loading = true
       state.loadingMessage = "Cancelando booking..."
       renderApp()
@@ -5808,6 +7074,132 @@ root.addEventListener("click", async (e) => {
     return
   }
 
+  const calendarConnectionButton = e.target.closest("[data-test-calendar-connection]")
+  if (calendarConnectionButton && !state.connectionTestBusy) {
+    state.connectionTestBusy = "calendar"
+    renderApp()
+    try {
+      const result = await apiRequest("/admin/calendar/test-connection", {
+        method: "POST",
+        params: getAdminCompanyParams(),
+      })
+      state.calendarConnectionTest = { ...result, companyId: state.config.companyId }
+      pushToast(result.connected ? "Conexão com a agenda confirmada." : result.details, result.connected ? "success" : "error")
+    } catch (error) {
+      pushToast(summarizeError(error), "error")
+    } finally {
+      state.connectionTestBusy = null
+      renderApp()
+    }
+    return
+  }
+
+  const whatsappConnectionButton = e.target.closest("[data-test-whatsapp-connection]")
+  if (whatsappConnectionButton && !state.connectionTestBusy) {
+    state.connectionTestBusy = "whatsapp"
+    renderApp()
+    try {
+      const result = await apiRequest("/admin/whatsapp/test-connection", {
+        method: "POST",
+        params: getAdminCompanyParams(),
+      })
+      state.whatsappConnectionTest = { ...result, companyId: state.config.companyId }
+      pushToast(result.connected ? "Conexão com a Meta confirmada." : result.details, result.connected ? "success" : "error")
+    } catch (error) {
+      pushToast(summarizeError(error), "error")
+    } finally {
+      state.connectionTestBusy = null
+      renderApp()
+    }
+    return
+  }
+
+  // Canal: consentimento do contato consultado.
+  const consentButton = e.target.closest("[data-consent-status]")
+  if (consentButton && state.channelContact) {
+    // Lido antes de qualquer re-render, que recria o campo vazio.
+    const evidence = String(root.querySelector("#channel-consent-evidence")?.value || "").trim()
+    const contactId = encodeURIComponent(state.channelContact.contact_id)
+    const purpose = encodeURIComponent(consentButton.dataset.consentPurpose)
+    const status = consentButton.dataset.consentStatus
+    await runChannelAction(
+      () => apiRequest(`/admin/whatsapp/contacts/${contactId}/consents/${purpose}`, {
+        method: "PUT",
+        params: getAdminCompanyParams(),
+        body: { status, evidence_ref: evidence || null },
+      }),
+      status === "granted" ? "Consentimento registrado." : "Revogação registrada."
+    )
+    return
+  }
+
+  // Política: salvar/publicar e publicar versão do histórico em dois passos.
+  const policySave = e.target.closest("[data-policy-save]")
+  if (policySave) {
+    await savePolicyVersion(policySave.dataset.policySave === "publish")
+    return
+  }
+  const policyPublish = e.target.closest("[data-policy-publish-version]")
+  if (policyPublish) {
+    state.policyConfirm = policyPublish.dataset.policyPublishVersion
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-policy-cancel]")) {
+    state.policyConfirm = null
+    renderApp()
+    return
+  }
+  const policyPublishConfirm = e.target.closest("[data-policy-publish-confirm]")
+  if (policyPublishConfirm) {
+    await publishPolicyVersion(policyPublishConfirm.dataset.policyPublishConfirm)
+    return
+  }
+
+  // Operação: confirmação em dois passos para resolver revisão.
+  const opsResolve = e.target.closest("[data-ops-resolve]")
+  if (opsResolve) {
+    state.opsConfirm = `resolve:${opsResolve.dataset.opsResolve}`
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-ops-cancel]")) {
+    state.opsConfirm = null
+    renderApp()
+    return
+  }
+  const opsResolveConfirm = e.target.closest("[data-ops-resolve-confirm]")
+  if (opsResolveConfirm) {
+    const jobId = encodeURIComponent(opsResolveConfirm.dataset.opsResolveConfirm)
+    await runOperationsAction(
+      () => apiRequest(`/admin/inbound/jobs/${jobId}/resolve`, { method: "POST", params: getAdminCompanyParams() }),
+      "Revisão marcada como tratada."
+    )
+    return
+  }
+  const opsTake = e.target.closest("[data-ops-take]")
+  if (opsTake) {
+    const contactId = encodeURIComponent(opsTake.dataset.opsTake)
+    await runOperationsAction(
+      () => apiRequest(`/admin/conversations/${contactId}/take`, { method: "POST", params: getAdminCompanyParams(), body: {} }),
+      "Conversa assumida: o bot não responde até você devolver."
+    )
+    return
+  }
+  const opsRelease = e.target.closest("[data-ops-release]")
+  if (opsRelease) {
+    const contactId = encodeURIComponent(opsRelease.dataset.opsRelease)
+    await runOperationsAction(
+      () => apiRequest(`/admin/conversations/${contactId}/release`, {
+        method: "POST",
+        params: getAdminCompanyParams(),
+        body: opsRelease.dataset.opsForce ? { force: true } : {},
+      }),
+      "Conversa devolvida ao bot."
+    )
+    return
+  }
+
   // Mobile menu
   if (e.target.closest("#mobile-menu-toggle")) {
     state.mobileMenuOpen = true
@@ -5819,6 +7211,139 @@ root.addEventListener("click", async (e) => {
     renderApp()
     return
   }
+})
+
+function readChannelTemplateDraft(form) {
+  const data = new FormData(form)
+  return {
+    purpose: String(data.get("purpose") || "reminders"),
+    name: String(data.get("name") || ""),
+    language_code: String(data.get("language_code") || ""),
+    category: String(data.get("category") || "utility"),
+    status: String(data.get("status") || "approved"),
+    parameter_count: String(data.get("parameter_count") ?? ""),
+    active: data.get("active") === "on",
+  }
+}
+
+// Operação: o que foi digitado em "Assumir conversa" sobrevive a re-render.
+root.addEventListener("input", (e) => {
+  const form = e.target.closest("#operations-take-form")
+  if (!form) return
+  const data = new FormData(form)
+  state.opsTakeDraft = {
+    contact_id: String(data.get("contact_id") || ""),
+    reason: String(data.get("reason") || ""),
+  }
+})
+
+// Canal: rascunho do template sobrevive a re-render (aviso de erro, SSE).
+root.addEventListener("input", (e) => {
+  const form = e.target.closest("#channel-template-form")
+  if (form) state.channelDraft = readChannelTemplateDraft(form)
+})
+
+// Canal: cadastro de template e consulta de contato.
+root.addEventListener("submit", async (e) => {
+  const templateForm = e.target.closest("#channel-template-form")
+  const contactForm = e.target.closest("#channel-contact-form")
+  if (!templateForm && !contactForm) return
+  e.preventDefault()
+  if (state.channelBusy) return
+
+  if (contactForm) {
+    const contactId = String(new FormData(contactForm).get("contact_id") || "").replace(/\D/g, "")
+    if (!contactId) {
+      pushToast("Informe o telefone do contato, só com números.", "error")
+      return
+    }
+    await lookupChannelContact(contactId)
+    return
+  }
+
+  state.channelDraft = readChannelTemplateDraft(templateForm)
+  const data = new FormData(templateForm)
+  const purpose = String(data.get("purpose") || "")
+  const rawCount = String(data.get("parameter_count") || "").trim()
+  const body = {
+    purpose,
+    name: String(data.get("name") || "").trim(),
+    language_code: String(data.get("language_code") || "").trim(),
+    category: String(data.get("category") || "utility"),
+    status: String(data.get("status") || ""),
+    parameter_count: rawCount === "" ? Number.NaN : Number(rawCount),
+    active: data.get("active") === "on",
+  }
+  const expected = CHANNEL_EXPECTED_PARAMETERS[purpose]
+  let problem = ""
+  if (!body.name) {
+    problem = "Informe o nome do template exatamente como na Meta."
+  } else if (!/^[a-z]{2,3}(_[A-Z]{2})?$/.test(body.language_code)) {
+    problem = "Idioma: use o código da Meta, ex.: pt_BR."
+  } else if (!Number.isInteger(body.parameter_count) || body.parameter_count < 0 || body.parameter_count > 10) {
+    problem = "Variáveis: um número inteiro de 0 a 10."
+  } else if (expected !== undefined && body.parameter_count !== expected) {
+    // Contagem diferente da que o sistema preenche = envio bloqueado depois.
+    problem = `${channelPurposeLabel(purpose)} usa ${expected} variável(is) no template.`
+  } else if (body.category === "marketing" && purpose !== "marketing") {
+    problem = "A categoria Marketing só vale para a finalidade Marketing."
+  }
+  if (problem) {
+    pushToast(problem, "error")
+    return
+  }
+  await runChannelAction(async () => {
+    await apiRequest("/admin/whatsapp/templates", { method: "PUT", params: getAdminCompanyParams(), body })
+    // Só depois de gravado: em erro, o que foi digitado continua no formulário.
+    state.channelDraft = null
+  }, "Template salvo.")
+})
+
+// Política: o rascunho vive no estado, sem re-render a cada tecla (mantém o foco).
+root.addEventListener("input", (e) => {
+  if (!state.policy) return
+  const note = e.target.closest("#policy-change-note")
+  if (note) {
+    state.policy.changeNote = note.value
+    return
+  }
+  const field = e.target.closest("[data-policy-path]")
+  if (!field || !state.policy.draft) return
+  let value
+  if (field.type === "checkbox") {
+    value = field.checked
+  } else if (field.dataset.policyType === "int") {
+    value = field.value.trim() === "" ? Number.NaN : Number(field.value)
+  } else {
+    value = field.value
+  }
+  setPolicyValue(state.policy.draft, field.dataset.policyPath, value)
+  const preview = root.querySelector(`[data-policy-preview="${field.dataset.policyPath}"]`)
+  if (preview) {
+    preview.textContent = renderPolicyMessage(value, state.policy.config.company_name || "")
+  }
+})
+
+root.addEventListener("submit", async (e) => {
+  const form = e.target.closest("#operations-take-form")
+  if (!form) return
+  e.preventDefault()
+  const data = new FormData(form)
+  const contactId = String(data.get("contact_id") || "").replace(/\D/g, "")
+  if (!contactId) {
+    pushToast("Informe o telefone do contato, só com números.", "error")
+    return
+  }
+  const reason = String(data.get("reason") || "").trim()
+  await runOperationsAction(async () => {
+    await apiRequest(`/admin/conversations/${contactId}/take`, {
+      method: "POST",
+      params: getAdminCompanyParams(),
+      body: reason ? { reason } : {},
+    })
+    // Só depois de assumir: em erro, telefone e motivo continuam no formulário.
+    state.opsTakeDraft = { contact_id: "", reason: "" }
+  }, "Conversa assumida: o bot não responde até você devolver.")
 })
 
 // ── Real-time SSE connection ──────────────────────────────────────────
@@ -5908,24 +7433,45 @@ function handleRealtimeEvent(event) {
 
 async function bootstrap() {
   renderApp()
+  // Capacidades só ajustam o formulário de login: a falha delas não pode
+  // derrubar uma sessão válida (antes, qualquer falha aqui abria o login).
   try {
     await fetchAuthCapabilities()
-    await fetchPlatformSession()
-    await refreshCurrentView()
-    state.settingsOpen = Boolean(
-      state.authAction.invitationToken || state.authAction.passwordResetToken
-    )
-    connectSSE()
-    renderApp()
   } catch {
+    // Keep conservative defaults when capability discovery is unavailable.
+  }
+
+  let session = null
+  for (let attempt = 1; attempt <= 2 && !session; attempt += 1) {
     try {
-      await fetchAuthCapabilities()
-    } catch {
-      // Keep conservative defaults when capability discovery is unavailable.
+      session = await fetchPlatformSession()
+    } catch (error) {
+      if (error.status === 401) break
+      if (attempt === 1) {
+        // Rede instável (celular) ou servidor reiniciando: uma nova tentativa
+        // antes de concluir qualquer coisa sobre a sessão.
+        await new Promise((resolve) => window.setTimeout(resolve, 800))
+        continue
+      }
+      // Sem resposta confiável: não fingir que a pessoa saiu da conta.
+      state.errorMessage = summarizeError(error)
+      pushToast("Não foi possível falar com o servidor. Verifique a conexão e atualize a página.", "error")
+      return
     }
+  }
+
+  if (!session) {
     state.settingsOpen = true
     renderApp()
+    return
   }
+
+  await refreshCurrentView()
+  state.settingsOpen = Boolean(
+    state.authAction.invitationToken || state.authAction.passwordResetToken
+  )
+  connectSSE()
+  renderApp()
 }
 
 bootstrap()

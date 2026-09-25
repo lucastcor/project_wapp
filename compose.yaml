@@ -67,7 +67,7 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
-    environment:
+    environment: &runtime-environment
       ENVIRONMENT: ${ENVIRONMENT:-production}
       DEBUG: ${DEBUG:-false}
       DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
@@ -138,10 +138,10 @@ services:
       APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES: ${APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES:-30}
       ADMIN_APP_API_BASE_URL: ${ADMIN_APP_API_BASE_URL:-http://api:8000}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4o-mini}
       OPENAI_FINETUNED_MODEL: ${OPENAI_FINETUNED_MODEL:-}
       USE_FINETUNED_MODEL_FOR_REPLIES: ${USE_FINETUNED_MODEL_FOR_REPLIES:-false}
-      OPENAI_FINETUNING_BASE_MODEL: ${OPENAI_FINETUNING_BASE_MODEL:-gpt-4.1-mini}
+      OPENAI_FINETUNING_BASE_MODEL: ${OPENAI_FINETUNING_BASE_MODEL:-gpt-4o-mini-2024-07-18}
       OPENAI_FINETUNING_SUFFIX: ${OPENAI_FINETUNING_SUFFIX:-project-wapp-style}
       ENABLE_FINETUNING_PIPELINE: ${ENABLE_FINETUNING_PIPELINE:-false}
       CLASSIFICATION_PROVIDER: ${CLASSIFICATION_PROVIDER:-openai}
@@ -165,6 +165,29 @@ services:
       WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
       WHATSAPP_WEBHOOK_VERIFY_TOKEN: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN:-}
       WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
+      OLLAMA_BASE_URL: ${COMPOSE_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:9b-q4_K_M}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-30}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-8192}
+      OLLAMA_NUM_PREDICT: ${OLLAMA_NUM_PREDICT:-512}
+      OLLAMA_MAX_CONCURRENCY: ${OLLAMA_MAX_CONCURRENCY:-1}
+      OLLAMA_KEEP_ALIVE: ${OLLAMA_KEEP_ALIVE:-5m}
+      INBOUND_WORKER_ENABLED: ${INBOUND_WORKER_ENABLED:-true}
+      INBOUND_WORKER_POLL_SECONDS: ${INBOUND_WORKER_POLL_SECONDS:-1}
+      INBOUND_JOB_LEASE_SECONDS: ${INBOUND_JOB_LEASE_SECONDS:-300}
+      WORKER_HEARTBEAT_TTL_SECONDS: ${WORKER_HEARTBEAT_TTL_SECONDS:-180}
+      AUTOMATION_ENGINE_ENABLED: ${AUTOMATION_ENGINE_ENABLED:-false}
+      AUTOMATION_WORKER_ENABLED: ${AUTOMATION_WORKER_ENABLED:-false}
+      AUTOMATION_WORKER_POLL_SECONDS: ${AUTOMATION_WORKER_POLL_SECONDS:-5}
+      AUTOMATION_WORKER_BATCH_SIZE: ${AUTOMATION_WORKER_BATCH_SIZE:-10}
+      AUTOMATION_MAX_STEPS_PER_EXECUTION: ${AUTOMATION_MAX_STEPS_PER_EXECUTION:-50}
+      AUTOMATION_MAX_ATTEMPTS: ${AUTOMATION_MAX_ATTEMPTS:-5}
+      AUTOMATION_RETRY_BASE_SECONDS: ${AUTOMATION_RETRY_BASE_SECONDS:-10}
+      AUTOMATION_RETRY_MAX_SECONDS: ${AUTOMATION_RETRY_MAX_SECONDS:-900}
+      AUTOMATION_JOB_LEASE_SECONDS: ${AUTOMATION_JOB_LEASE_SECONDS:-120}
+      AUTOMATION_GATE_LEASE_SECONDS: ${AUTOMATION_GATE_LEASE_SECONDS:-300}
+      AUTOMATION_MAX_EVENT_BYTES: ${AUTOMATION_MAX_EVENT_BYTES:-65536}
+      PII_PSEUDONYMIZATION_KEY: ${PII_PSEUDONYMIZATION_KEY:-}
     volumes:
       - backups_data:/app/backups
     ports:
@@ -197,48 +220,7 @@ services:
         condition: service_completed_successfully
     command: ["python", "-m", "app.tools.reminder_worker"]
     environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      DEBUG: ${DEBUG:-false}
-      STRICT_RUNTIME_VALIDATION: ${STRICT_RUNTIME_VALIDATION:-true}
-      OPERATIONS_BACKUP_DIR: ${OPERATIONS_BACKUP_DIR:-/app/backups}
-      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
-      POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
-      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
-      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
-      RUN_MIGRATIONS_ON_STARTUP: "false"
-      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://redis:6379/0}
-      REQUIRE_SHARED_STATE: ${REQUIRE_SHARED_STATE:-true}
-      LOG_JSON: ${LOG_JSON:-true}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ENABLE_ADMIN_AUTH: ${ENABLE_ADMIN_AUTH:-true}
-      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
-      ADMIN_VIEWER_TOKEN: ${ADMIN_VIEWER_TOKEN:-}
-      ADMIN_OPERATOR_TOKEN: ${ADMIN_OPERATOR_TOKEN:-}
-      ADMIN_SUPERADMIN_TOKEN: ${ADMIN_SUPERADMIN_TOKEN:-}
-      # The worker runs the same readiness gate as the API, so it needs the
-      # security settings those checks inspect.
-      PLATFORM_SESSION_SECRET: ${PLATFORM_SESSION_SECRET:-}
-      ENABLE_NORMALIZED_WHATSAPP_INGRESS: ${ENABLE_NORMALIZED_WHATSAPP_INGRESS:-false}
-      INTERNAL_INGRESS_SECRET: ${INTERNAL_INGRESS_SECRET:-}
-      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      CLASSIFICATION_PROVIDER: ${CLASSIFICATION_PROVIDER:-openai}
-      OUTBOUND_PROVIDER: ${OUTBOUND_PROVIDER:-whatsapp}
-      OUTBOUND_DEFAULT_CHANNEL: ${OUTBOUND_DEFAULT_CHANNEL:-whatsapp}
-      WHATSAPP_API_BASE_URL: ${WHATSAPP_API_BASE_URL:-}
-      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:-}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
-      WHATSAPP_WEBHOOK_VERIFY_TOKEN: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN:-}
-      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
-      REMINDER_WORKER_ENABLED: ${REMINDER_WORKER_ENABLED:-true}
-      REMINDER_WORKER_POLL_SECONDS: ${REMINDER_WORKER_POLL_SECONDS:-60}
-      REMINDER_WORKER_BATCH_SIZE: ${REMINDER_WORKER_BATCH_SIZE:-100}
-      REMINDER_WORKER_DISPATCH_IMMEDIATELY: ${REMINDER_WORKER_DISPATCH_IMMEDIATELY:-true}
-      REMINDER_WORKER_CHANNEL: ${REMINDER_WORKER_CHANNEL:-}
-      REMINDER_WORKER_AUDIENCES: ${REMINDER_WORKER_AUDIENCES:-customer,internal}
-      APPOINTMENT_QUEUE_AUTO_DISPATCH: ${APPOINTMENT_QUEUE_AUTO_DISPATCH:-true}
-      APPOINTMENT_QUEUE_RESPONSE_WINDOW_MINUTES: ${APPOINTMENT_QUEUE_RESPONSE_WINDOW_MINUTES:-30}
-      APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES: ${APPOINTMENT_QUEUE_WAIT_FOLLOWUP_MINUTES:-30}
+      <<: *runtime-environment
     volumes:
       - backups_data:/app/backups
     healthcheck:
@@ -263,60 +245,35 @@ services:
         condition: service_completed_successfully
     command: ["python", "-m", "app.tools.automation_worker"]
     environment:
-      ENVIRONMENT: ${ENVIRONMENT:-production}
-      DEBUG: ${DEBUG:-false}
-      STRICT_RUNTIME_VALIDATION: ${STRICT_RUNTIME_VALIDATION:-true}
-      OPERATIONS_BACKUP_DIR: ${OPERATIONS_BACKUP_DIR:-/app/backups}
-      DATABASE_URL: ${COMPOSE_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
-      POSTGRES_DATABASE_URL: ${COMPOSE_POSTGRES_DATABASE_URL:-postgresql://project_wapp:project_wapp@postgres:5432/project_wapp}
-      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
-      DATABASE_STATEMENT_TIMEOUT_MS: ${DATABASE_STATEMENT_TIMEOUT_MS:-5000}
-      RUN_MIGRATIONS_ON_STARTUP: "false"
-      REDIS_URL: ${COMPOSE_REDIS_URL:-redis://redis:6379/0}
-      REQUIRE_SHARED_STATE: ${REQUIRE_SHARED_STATE:-true}
-      LOG_JSON: ${LOG_JSON:-true}
-      LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      ENABLE_ADMIN_AUTH: ${ENABLE_ADMIN_AUTH:-true}
-      ADMIN_API_TOKEN: ${ADMIN_API_TOKEN:-}
-      ADMIN_VIEWER_TOKEN: ${ADMIN_VIEWER_TOKEN:-}
-      ADMIN_OPERATOR_TOKEN: ${ADMIN_OPERATOR_TOKEN:-}
-      ADMIN_SUPERADMIN_TOKEN: ${ADMIN_SUPERADMIN_TOKEN:-}
-      # The worker runs the same readiness gate as the API, so it needs the
-      # security settings those checks inspect.
-      PLATFORM_SESSION_SECRET: ${PLATFORM_SESSION_SECRET:-}
-      ENABLE_NORMALIZED_WHATSAPP_INGRESS: ${ENABLE_NORMALIZED_WHATSAPP_INGRESS:-false}
-      INTERNAL_INGRESS_SECRET: ${INTERNAL_INGRESS_SECRET:-}
-      AUDIT_RETENTION_DAYS: ${AUDIT_RETENTION_DAYS:-90}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      CLASSIFICATION_PROVIDER: ${CLASSIFICATION_PROVIDER:-openai}
-      OUTBOUND_PROVIDER: ${OUTBOUND_PROVIDER:-whatsapp}
-      OUTBOUND_DEFAULT_CHANNEL: ${OUTBOUND_DEFAULT_CHANNEL:-whatsapp}
-      WHATSAPP_API_BASE_URL: ${WHATSAPP_API_BASE_URL:-}
-      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:-}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
-      WHATSAPP_WEBHOOK_VERIFY_TOKEN: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN:-}
-      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET:-}
-      # O motor e o worker são interruptores separados de propósito: ligar o
-      # motor habilita publicar e executar; ligar o worker põe **esta máquina**
-      # a puxar trabalho. Escalar réplicas divide a fila em vez de duplicá-la,
-      # porque o claim de job é atômico nos dois backends.
-      AUTOMATION_ENGINE_ENABLED: ${AUTOMATION_ENGINE_ENABLED:-true}
-      AUTOMATION_WORKER_ENABLED: ${AUTOMATION_WORKER_ENABLED:-true}
-      AUTOMATION_WORKER_POLL_SECONDS: ${AUTOMATION_WORKER_POLL_SECONDS:-5}
-      AUTOMATION_WORKER_BATCH_SIZE: ${AUTOMATION_WORKER_BATCH_SIZE:-10}
-      AUTOMATION_MAX_STEPS_PER_EXECUTION: ${AUTOMATION_MAX_STEPS_PER_EXECUTION:-50}
-      AUTOMATION_MAX_ATTEMPTS: ${AUTOMATION_MAX_ATTEMPTS:-5}
-      AUTOMATION_JOB_LEASE_SECONDS: ${AUTOMATION_JOB_LEASE_SECONDS:-120}
-      AUTOMATION_GATE_LEASE_SECONDS: ${AUTOMATION_GATE_LEASE_SECONDS:-300}
-      PII_PSEUDONYMIZATION_KEY: ${PII_PSEUDONYMIZATION_KEY:-}
+      <<: *runtime-environment
     volumes:
       - backups_data:/app/backups
     healthcheck:
-      test: ["CMD", "python", "-m", "app.tools.automation_worker", "--validate-only"]
+      test: ["CMD", "python", "-m", "app.tools.automation_worker", "--healthcheck"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 15s
+
+  inbound-worker:
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    command: ["python", "-m", "app.tools.inbound_worker"]
+    environment:
+      <<: *runtime-environment
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.tools.inbound_worker", "--healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
   admin:
     build:

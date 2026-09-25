@@ -9,6 +9,7 @@ secrets or a production-shaped configuration.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -58,12 +59,24 @@ for key in _TEST_ENV_CLEARED:
 
 # Set TEST_DATABASE_URL to run the same suite against PostgreSQL; the default is
 # a throwaway SQLite file so the suite needs no external service.
+#
+# O arquivo SQLite padrão é único por execução: um caminho fixo em /tmp fazia
+# duas execuções simultâneas (outro terminal, outro worktree) apagarem o banco
+# uma da outra no meio da suíte. `TEST_SQLITE_PATH` fixa um caminho explícito
+# quando alguém precisa inspecionar o banco depois — e aí a exclusividade é
+# responsabilidade de quem escolheu o caminho.
 _TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL", "").strip()
 _TEST_DB_PATH: Path | None = None
+_TEST_DB_DIR: Path | None = None
 if _TEST_DATABASE_URL:
     os.environ["DATABASE_URL"] = _TEST_DATABASE_URL
 else:
-    _TEST_DB_PATH = Path(tempfile.gettempdir()) / "project_wapp_test.db"
+    _explicit_sqlite_path = os.environ.get("TEST_SQLITE_PATH", "").strip()
+    if _explicit_sqlite_path:
+        _TEST_DB_PATH = Path(_explicit_sqlite_path)
+    else:
+        _TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="project_wapp_test_"))
+        _TEST_DB_PATH = _TEST_DB_DIR / "project_wapp_test.db"
     if _TEST_DB_PATH.exists():
         _TEST_DB_PATH.unlink()
     os.environ["DATABASE_URL"] = f"sqlite:///{_TEST_DB_PATH}"
@@ -81,6 +94,8 @@ def _bootstrap_test_database() -> pytest.FixtureRequest:
     yield
     if _TEST_DB_PATH is not None and _TEST_DB_PATH.exists():
         _TEST_DB_PATH.unlink()
+    if _TEST_DB_DIR is not None:
+        shutil.rmtree(_TEST_DB_DIR, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
@@ -91,6 +106,30 @@ def _reset_rate_limit_between_tests() -> None:
     clear_rate_limit_counters()
     yield
     clear_rate_limit_counters()
+
+
+@pytest.fixture()
+def global_company_runtime():
+    """Substituto de `orchestrator.resolve_company_runtime` sem banco.
+
+    Testes de orquestrador com repositório falso usam empresas que não existem
+    no banco; a leitura real da configuração publicada recusaria com razão.
+    Devolve o template global de desenvolvimento e a política default
+    documentada, ou a política montada a partir de `policies` informado.
+    """
+    from app.core.company_context import get_seed_company_context
+    from app.services.company_policy_service import build_effective_policy
+
+    def _build(policies: dict | None = None, context: dict | None = None):
+        resolved_context = context if context is not None else get_seed_company_context(None)
+        policy = build_effective_policy(
+            context=resolved_context,
+            policies=policies,
+            source="test_global_template",
+        )
+        return lambda company_id: (resolved_context, policy)
+
+    return _build
 
 
 @pytest.fixture()

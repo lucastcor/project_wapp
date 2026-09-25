@@ -582,10 +582,11 @@ def test_cancel_calendar_booking_endpoint_triggers_queue_recovery(monkeypatch) -
             return 1
 
     monkeypatch.setattr(admin_routes, "repository", FakeRepository())
+    # A API age como operador (A08): o kwarg `actor` é repassado ao serviço.
     monkeypatch.setattr(
         admin_routes,
         "release_booking_slot",
-        lambda booking_id: {
+        lambda booking_id, actor="customer": {
             "booking": {
                 "id": booking_id,
                 "company_id": 1,

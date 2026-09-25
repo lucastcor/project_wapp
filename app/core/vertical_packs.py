@@ -7,6 +7,7 @@ para a empresa, com overrides explícitos por cima do preset.
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -38,6 +39,45 @@ POLICY_DEFAULTS: dict[str, Any] = {
     # Cenários que esta vertical nunca envia para fine-tuning, somados aos
     # cenários excluídos globalmente pela taxonomia.
     "extra_excluded_training_scenarios": [],
+    # Seções abaixo: contrato P01 (docs/piloto/CONTRATOS.md). Interpretadas
+    # somente por `app.services.company_policy_service`; override parcial de
+    # uma seção mantém as demais chaves do default.
+    "conversation": {
+        "greeting_enabled": True,
+        "greeting_message": "Olá! Aqui é o atendimento da {company_name}. Como posso ajudar?",
+        "clarification_message": (
+            "Não consegui entender bem o que você precisa. "
+            "Pode me contar com um pouco mais de detalhe?"
+        ),
+        "handoff_notice_enabled": True,
+        "handoff_notice_message": (
+            "Recebi sua mensagem e encaminhei para a nossa equipe, "
+            "que continua o atendimento por aqui."
+        ),
+        "unsupported_content_message": (
+            "Por enquanto consigo entender apenas mensagens de texto. "
+            "Pode escrever o que você precisa?"
+        ),
+        "opt_out_confirmation_message": (
+            "Pronto. Você não vai mais receber lembretes e avisos automáticos por aqui. "
+            "Se quiser voltar a receber, envie VOLTAR."
+        ),
+        "opt_in_confirmation_message": "Pronto, você voltou a receber lembretes e avisos por aqui.",
+        # continue | notice_only
+        "after_hours_mode": "continue",
+        "after_hours_message": (
+            "Estamos fora do horário de atendimento. Sua mensagem ficou registrada "
+            "e a equipe responde no próximo período de atendimento."
+        ),
+    },
+    # Cancelamento/remarcação livres até o início; fora da regra, humano.
+    "booking_rules": {
+        "cancellation": {"allowed": True, "min_notice_minutes": 0, "outside_window": "handoff"},
+        "reschedule": {"allowed": True, "min_notice_minutes": 0, "outside_window": "handoff"},
+    },
+    "confirmation": {"proposal_ttl_minutes": 30},
+    # Idioma dos templates aprovados usados fora da janela de 24 h (P05).
+    "channel": {"template_language": "pt_BR"},
 }
 
 
@@ -157,9 +197,23 @@ def build_default_capabilities(business_type: str | None) -> dict[str, bool]:
     return {**_BASE_CAPABILITIES, **pack.capabilities}
 
 
+def _merge_policy_value(base: Any, override: Any) -> Any:
+    # Seções dict mesclam por chave: uma empresa que muda só a saudação não
+    # pode perder o aviso de handoff e o modo de fora do horário do default.
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = copy.deepcopy(base)
+        for key, value in override.items():
+            merged[key] = _merge_policy_value(merged.get(key), value)
+        return merged
+    return copy.deepcopy(override)
+
+
 def build_default_policies(business_type: str | None) -> dict[str, Any]:
     pack = resolve_vertical_pack(business_type)
-    return {**POLICY_DEFAULTS, **pack.policies}
+    resolved = copy.deepcopy(POLICY_DEFAULTS)
+    for key, value in pack.policies.items():
+        resolved[key] = _merge_policy_value(resolved.get(key), value)
+    return resolved
 
 
 def merge_capabilities(business_type: str | None, overrides: dict[str, Any] | None) -> dict[str, bool]:
@@ -177,7 +231,7 @@ def merge_policies(business_type: str | None, overrides: dict[str, Any] | None) 
     for key, value in (overrides or {}).items():
         if key not in POLICY_DEFAULTS:
             continue
-        resolved[key] = value
+        resolved[key] = _merge_policy_value(resolved.get(key), value)
     return resolved
 
 

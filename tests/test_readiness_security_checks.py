@@ -103,6 +103,11 @@ def healthy_production(monkeypatch):
         system_readiness_service, "get_calendar_profile",
         lambda: {"provider_readiness": {"ready": True, "details": "calendar ok"}},
     )
+    # A URL de banco acima é fictícia: sondas que consultam o banco são stubadas.
+    monkeypatch.setattr(
+        system_readiness_service, "_legacy_context_drift_status",
+        lambda: {"ok": True, "detail": "legacy ok"},
+    )
     return monkeypatch
 
 
@@ -309,3 +314,13 @@ def test_tests_do_not_inherit_the_local_dotenv() -> None:
     assert settings.environment == "test"
     assert os.environ.get("ADMIN_API_TOKEN") is None
     assert os.environ.get("INTERNAL_INGRESS_SECRET") is None
+
+
+@pytest.fixture(autouse=True)
+def isolate_new_worker_probes(monkeypatch):
+    # These readiness unit tests replace DB connectivity with fake URLs.
+    # Worker probe behavior is exercised against a real DB in its own tests.
+    monkeypatch.setattr(settings, "inbound_worker_enabled", True)
+    monkeypatch.setattr(settings, "pii_pseudonymization_key", "test-ready-pii-secret")
+    monkeypatch.setattr("app.services.local_runtime_readiness.worker_is_alive", lambda _: True)
+    monkeypatch.setattr("app.services.local_runtime_readiness.review_count", lambda: 0)
