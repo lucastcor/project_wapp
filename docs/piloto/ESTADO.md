@@ -94,7 +94,10 @@ O painel agora usa a fonte canônica, mascara identificadores e oferece probes s
   e da agenda Google por OAuth, ambas por empresa e pelo painel, com
   credenciais cifradas (migration 074; contrato em `CONTRATOS.md`; evidência
   em [P08](evidencias/P08.md)); guia de implantação barata com Caddy e
-  checklists Meta/Google em [IMPLANTACAO.md](IMPLANTACAO.md). Também entregues: navegação em seis itens com grupo
+  checklists Meta/Google em [IMPLANTACAO.md](IMPLANTACAO.md) e o roteiro do app da
+  Meta como Tech Provider em [META_APP_TECH_PROVIDER.md](META_APP_TECH_PROVIDER.md)
+  (com cinco pendências de código listadas ao final: renovação do token de 60 dias,
+  Embedded Signup v4, `PARTNER_REMOVED`, `smb_message_echoes`, checklist pós-conexão). Também entregues: navegação em seis itens com grupo
   "Mais", editor de serviços/preços/regras fora do wizard e nichos estética,
   pet e aulas. Ainda abertas: Instagram, áudio, inbox ao vivo e preço. Integrações reais continuam pendentes de credenciais
   (G3).

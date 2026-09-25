@@ -60,6 +60,8 @@ Copie a pasta `backups/` para fora do servidor (Backblaze B2, Cloudflare R2 ou u
 
 ## 4. Checklist Meta (WhatsApp) — feito uma vez pela sua empresa
 
+Passo a passo detalhado, com as telas da Meta, o mapeamento para o `.env`, o que testar antes do App Review e os custos que o cliente paga: [META_APP_TECH_PROVIDER.md](META_APP_TECH_PROVIDER.md). O resumo abaixo é a versão curta.
+
 1. Crie um app em developers.facebook.com do tipo **Business** e adicione o produto **WhatsApp**.
 2. Cadastre-se como **Tech Provider** (gratuito) e crie uma configuração de **Facebook Login for Business** para o Embedded Signup; anote o **Configuration ID** (`META_EMBEDDED_SIGNUP_CONFIG_ID`). Use a versão atual do fluxo (v4): a v2 é desligada em outubro de 2026.
 3. Em Configurações do app, copie o **App ID** (`META_APP_ID`) e o **App Secret** (`WHATSAPP_APP_SECRET`).
