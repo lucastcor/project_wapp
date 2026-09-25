@@ -53,6 +53,11 @@ class JsonFormatter(logging.Formatter):
 def configure_logging() -> None:
     root_logger = logging.getLogger()
     desired_level = getattr(logging, settings.log_level, logging.INFO)
+    # Bibliotecas HTTP registram a linha da requisição em DEBUG, com a query
+    # string inteira — que, nas chamadas à Meta e ao Google, carrega token e
+    # código de autorização. Elas nunca descem de INFO, mesmo com LOG_LEVEL=DEBUG.
+    for noisy in ("urllib3", "httpx", "httpcore", "googleapiclient", "google_auth_httplib2"):
+        logging.getLogger(noisy).setLevel(max(desired_level, logging.INFO))
 
     if root_logger.handlers:
         root_logger.setLevel(desired_level)

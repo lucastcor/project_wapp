@@ -231,6 +231,52 @@ textarea { resize: vertical; min-height: 92px; }
   color: var(--text-faint);
 }
 
+.nav-more-toggle {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  width: 100%;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.nav-more-toggle:hover { color: var(--text); border-color: var(--text-faint); }
+
+.nav-list-advanced { margin-top: 6px; }
+
+.services-table { display: grid; gap: 8px; margin-top: 8px; }
+
+.services-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 2fr) 110px 120px minmax(160px, 2fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.services-head span {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.services-row input {
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .services-head { display: none; }
+  .services-row { grid-template-columns: 1fr 1fr; }
+}
+
 .nav-button {
   display: grid;
   grid-template-columns: 36px minmax(0, 1fr);
@@ -890,7 +936,60 @@ select:focus {
   line-height: 1.5;
   color: var(--text);
   box-shadow: var(--shadow-sm);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.bubble-text {
+  display: block;
   white-space: pre-wrap;
+}
+
+.bubble-details {
+  width: 100%;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.bubble-details summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.bubble-details summary::-webkit-details-marker { display: none; }
+
+.bubble-details summary::before {
+  content: "▸ ";
+}
+
+.bubble-details[open] summary::before {
+  content: "▾ ";
+}
+
+.bubble-details-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.first-steps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.first-step {
+  display: grid;
+  gap: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.first-step strong {
+  color: var(--text);
+  font-size: 14px;
 }
 
 .bubble-user {
@@ -3225,6 +3324,60 @@ select:focus {
 .channel-contact {
   display: grid;
   gap: 12px;
+}
+
+/* Conexões por empresa (P08): WhatsApp pelo painel e Google Agenda */
+.connection-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 10px 16px;
+  margin: 0 0 12px;
+}
+
+.connection-facts div {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.connection-facts dt {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.connection-facts dd {
+  margin: 0;
+  font-size: 14px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.connection-notice {
+  display: grid;
+  gap: 6px;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  font-size: 13px;
+}
+
+.connection-notice code {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.connection-warning {
+  border-color: rgba(255, 91, 106, 0.45);
+  color: var(--text);
+}
+
+.connection-select {
+  max-width: 440px;
+  margin-bottom: 12px;
 }
 
 /* Estado verdadeiro da reserva (P07) */

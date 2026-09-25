@@ -10,7 +10,7 @@ from app.api.admin_security import (
     build_require_admin_role,
 )
 from app.api.admin_support import build_prometheus_metrics, record_audit_event
-from app.api.company_scope import get_authorized_scope
+from app.api.company_scope import authorize_company, get_authorized_scope, require_authorized_company_id
 from app.api.schemas import (
     AppointmentBookingCancellationPayload,
     AppointmentBookingPayload,
@@ -1974,6 +1974,72 @@ def run_onboarding_setup(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@admin_router.post(
+    "/onboarding/configure",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def run_onboarding_configure(
+    payload: OnboardingSetupPayload,
+    request: Request,
+) -> dict:
+    """Apply the wizard to the company the caller already belongs to.
+
+    Tenant-scoped, unlike ``/onboarding/setup``: an identity owner/admin can
+    configure their own company (the one created at signup) and a
+    break-glass operator must name the company explicitly. No company is
+    created here, so the slug-squatting risk of ``setup`` does not apply.
+    """
+    company_id = require_authorized_company_id(request)
+    from app.services.onboarding_service import OnboardingError, configure_company
+
+    try:
+        result = configure_company(
+            company_id=company_id,
+            company_name=payload.company_name,
+            business_type_key=payload.business_type_key,
+            segment=payload.segment,
+            company_description=payload.company_description,
+            phone=payload.phone,
+            email=payload.email,
+            instagram=payload.instagram,
+            website=payload.website,
+            timezone=payload.timezone,
+            weekday_hours=payload.weekday_hours,
+            saturday_hours=payload.saturday_hours,
+            sunday_hours=payload.sunday_hours,
+            slot_duration_minutes=payload.slot_duration_minutes,
+            minimum_notice_minutes=payload.minimum_notice_minutes,
+            reminder_offsets_days=payload.reminder_offsets_days,
+            brand_style=payload.brand_style,
+            custom_rules=payload.custom_rules,
+            services=[s.model_dump() for s in payload.services] if payload.services else None,
+            calendar_provider=payload.calendar_provider,
+            calendar_config=payload.calendar_config,
+        )
+    except OnboardingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="onboarding_configure",
+        resource_type="company",
+        resource_id=str(company_id),
+        company_id=company_id,
+        metadata={
+            "company_name": payload.company_name,
+            "business_type_key": payload.business_type_key,
+        },
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.onboarding.configured",
+        company_id=company_id,
+        business_type_key=payload.business_type_key,
+    )
+    return result
+
+
 @admin_router.get("/onboarding/setup-status/{company_id}")
 def read_onboarding_setup_status(company_id: int) -> dict:
     from app.services.onboarding_service import OnboardingError, get_setup_status
@@ -2391,6 +2457,12 @@ def upsert_whatsapp_binding_endpoint(
     request: Request,
 ) -> WhatsAppBindingResponse:
     """Bind a Meta phone_number_id to a company (superadmin only)."""
+    # O company_id vem do corpo, não da query: sem esta checagem uma sessão
+    # de identidade autorizada para a empresa A poderia apontar o número da
+    # empresa B para si. Sem escopo resolvido (autenticação administrativa
+    # desligada, só em desenvolvimento/teste) não há principal a conferir.
+    if get_authorized_scope(request) is not None:
+        authorize_company(request, payload.company_id)
     company = repository.get_company(payload.company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Company not found.")
@@ -2407,6 +2479,15 @@ def upsert_whatsapp_binding_endpoint(
             status_code=409,
             detail="This WhatsApp phone number is already actively bound to another company.",
         )
+    if payload.active:
+        # O envio exige um único vínculo ativo por empresa. Um PUT manual
+        # depois de uma conexão pelo painel deixaria dois ativos e bloquearia
+        # o envio; o vínculo antigo sai de cena e perde o token que guardava.
+        from app.storage.whatsapp_credentials_repository import clear_connection
+
+        for other in repository.get_whatsapp_bindings(company_id=payload.company_id, active_only=True):
+            if int(other["id"]) != int(binding["id"]):
+                clear_connection(payload.company_id, int(other["id"]))
 
     _record_audit_event(
         request=request,
@@ -2452,6 +2533,20 @@ def set_whatsapp_binding_state(
     )
     if result == "not_found":
         raise HTTPException(status_code=404, detail="WhatsApp channel binding not found.")
+    if not payload.active and result != "conflict":
+        # Desativar pelo painel de plataforma é desconectar: o token de
+        # negócio daquele número não pode continuar utilizável numa linha
+        # inativa.
+        from app.storage.whatsapp_credentials_repository import clear_connection
+
+        owner_id = company_id
+        if owner_id is None:
+            owner_id = next(
+                (int(row["company_id"]) for row in repository.get_whatsapp_bindings(active_only=False) if int(row["id"]) == binding_id),
+                None,
+            )
+        if owner_id is not None:
+            clear_connection(int(owner_id), binding_id)
     if result == "conflict":
         # Reactivating a historical binding whose number moved to another tenant.
         _record_audit_event(

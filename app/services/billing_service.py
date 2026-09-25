@@ -249,7 +249,14 @@ def seed_plans() -> list[dict[str, Any]]:
         ),
     }
     for plan_key, plan in PLANS.items():
-        monthly_price_id, annual_price_id = stripe_prices[plan_key]
+        raw_monthly_price_id, raw_annual_price_id = stripe_prices[plan_key]
+        # `.env` files ship the STRIPE_PRICE_* keys empty (`KEY=`), which
+        # reaches here as "" rather than None. The gateway columns carry a
+        # unique index, so writing "" for every plan collides on the second
+        # row and the whole Billing screen answered 500 before any Stripe
+        # price was configured.
+        monthly_price_id = (raw_monthly_price_id or "").strip() or None
+        annual_price_id = (raw_annual_price_id or "").strip() or None
         plan_id = repository.upsert_billing_plan(
             plan_key=plan_key,
             name=plan["name"],

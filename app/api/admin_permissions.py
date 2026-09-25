@@ -96,11 +96,20 @@ ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
     ("POST", "/admin/companies"): SUPERADMIN,
     ("PUT", "/admin/company-context"): SUPERADMIN,
     ("POST", "/admin/onboarding/setup"): SUPERADMIN,
+    ("POST", "/admin/onboarding/configure"): SUPERADMIN,
     ("POST", "/admin/calendar/integrations"): SUPERADMIN,
     ("POST", "/admin/calendar/test-connection"): SUPERADMIN,
     ("PUT", "/admin/whatsapp/bindings"): SUPERADMIN,
     ("POST", "/admin/whatsapp/bindings/{binding_id}/state"): SUPERADMIN,
     ("POST", "/admin/whatsapp/test-connection"): SUPERADMIN,
+    # Conexões por empresa: conectar/desconectar o número e a agenda muda o
+    # canal por onde o cliente final é atendido, logo é superadmin (dono ou
+    # admin da empresa, ou operador de plataforma).
+    ("POST", "/admin/whatsapp/embedded-signup/complete"): SUPERADMIN,
+    ("POST", "/admin/whatsapp/embedded-signup/disconnect"): SUPERADMIN,
+    ("POST", "/admin/calendar/google/authorize"): SUPERADMIN,
+    ("PATCH", "/admin/calendar/google/calendar"): SUPERADMIN,
+    ("POST", "/admin/calendar/google/disconnect"): SUPERADMIN,
     # Billing administration (tenant-owner billing is not implemented yet)
     ("POST", "/admin/billing/trial"): SUPERADMIN,
     ("POST", "/admin/billing/activate"): SUPERADMIN,

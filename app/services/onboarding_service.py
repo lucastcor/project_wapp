@@ -17,7 +17,7 @@ class OnboardingError(Exception):
 
 BUSINESS_TYPE_PRESETS: dict[str, dict[str, Any]] = {
     "clinica": {
-        "label": "Clinica / Consultorio",
+        "label": "Clínica / Consultório",
         "business_model": ["services", "scheduling"],
         "segment": "Saude e bem-estar",
         "modules": {
@@ -45,7 +45,7 @@ BUSINESS_TYPE_PRESETS: dict[str, dict[str, Any]] = {
         ],
     },
     "salao": {
-        "label": "Salao de beleza / Barbearia",
+        "label": "Salão de beleza / Barbearia",
         "business_model": ["services", "scheduling"],
         "segment": "Beleza e estetica",
         "modules": {
@@ -74,7 +74,7 @@ BUSINESS_TYPE_PRESETS: dict[str, dict[str, Any]] = {
         ],
     },
     "escritorio": {
-        "label": "Escritorio / Consultoria profissional",
+        "label": "Escritório / Consultoria profissional",
         "business_model": ["services", "scheduling", "custom_orders"],
         "segment": "Servicos profissionais",
         "modules": {
@@ -128,8 +128,91 @@ BUSINESS_TYPE_PRESETS: dict[str, dict[str, Any]] = {
             {"name": "avaliacoes", "type": "service"},
         ],
     },
+    "estetica": {
+        "label": "Clínica de estética",
+        "business_model": ["services", "scheduling"],
+        "segment": "Estética e bem-estar",
+        "modules": {
+            "catalog": True,
+            "services": True,
+            "products": True,
+            "scheduling": True,
+            "staff_selection": True,
+            "rentals": False,
+            "inventory": False,
+            "delivery": False,
+            "pickup": False,
+            "subscriptions": True,
+            "custom_orders": False,
+            "quotes": True,
+            "support": True,
+            "financial_handoff": True,
+            "reminders": True,
+        },
+        "default_slot_minutes": 60,
+        "catalog_categories": [
+            {"name": "facial", "type": "service"},
+            {"name": "corporal", "type": "service"},
+            {"name": "pacotes", "type": "service"},
+        ],
+    },
+    "pet": {
+        "label": "Pet shop / Veterinária",
+        "business_model": ["services", "scheduling", "products"],
+        "segment": "Pets",
+        "modules": {
+            "catalog": True,
+            "services": True,
+            "products": True,
+            "scheduling": True,
+            "staff_selection": False,
+            "rentals": False,
+            "inventory": False,
+            "delivery": False,
+            "pickup": True,
+            "subscriptions": False,
+            "custom_orders": False,
+            "quotes": True,
+            "support": True,
+            "financial_handoff": True,
+            "reminders": True,
+        },
+        "default_slot_minutes": 60,
+        "catalog_categories": [
+            {"name": "banho e tosa", "type": "service"},
+            {"name": "consultas", "type": "service"},
+            {"name": "vacinas", "type": "service"},
+        ],
+    },
+    "aulas": {
+        "label": "Aulas / Personal / Terapias",
+        "business_model": ["services", "scheduling"],
+        "segment": "Aulas e acompanhamento individual",
+        "modules": {
+            "catalog": True,
+            "services": True,
+            "products": False,
+            "scheduling": True,
+            "staff_selection": True,
+            "rentals": False,
+            "inventory": False,
+            "delivery": False,
+            "pickup": False,
+            "subscriptions": True,
+            "custom_orders": False,
+            "quotes": False,
+            "support": True,
+            "financial_handoff": True,
+            "reminders": True,
+        },
+        "default_slot_minutes": 50,
+        "catalog_categories": [
+            {"name": "sessoes", "type": "service"},
+            {"name": "pacotes", "type": "service"},
+        ],
+    },
     "outro": {
-        "label": "Outro tipo de negocio",
+        "label": "Outro tipo de negócio",
         "business_model": ["services", "scheduling"],
         "segment": "Servicos gerais",
         "modules": {
@@ -468,6 +551,109 @@ def setup_company(
     }
 
 
+def configure_company(
+    *,
+    company_id: int,
+    company_name: str,
+    business_type_key: str,
+    segment: str | None = None,
+    company_description: str | None = None,
+    phone: str | None = None,
+    email: str | None = None,
+    instagram: str | None = None,
+    website: str | None = None,
+    timezone: str = "America/Sao_Paulo",
+    weekday_hours: str = "08:00-18:00",
+    saturday_hours: str = "fechado",
+    sunday_hours: str = "fechado",
+    slot_duration_minutes: int = 60,
+    minimum_notice_minutes: int = 120,
+    reminder_offsets_days: list[int] | None = None,
+    brand_style: str | None = None,
+    custom_rules: list[str] | None = None,
+    services: list[dict[str, Any]] | None = None,
+    calendar_provider: str | None = None,
+    calendar_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Apply the onboarding wizard to a company that already exists.
+
+    Self-service signup creates the tenant before the owner has told us
+    anything about the business. Without this path the owner would have to
+    create a *second* company through ``setup_company`` (which is reserved
+    for platform operators) and the one they signed up with would stay on the
+    global demo template forever. The slug never changes; name and business
+    type are updated and a new context version is published.
+    """
+    if not company_name or not company_name.strip():
+        raise OnboardingError("company_name is required.")
+    if business_type_key not in BUSINESS_TYPE_PRESETS:
+        raise OnboardingError(f"Invalid business_type_key. Must be one of: {', '.join(sorted(BUSINESS_TYPE_PRESETS))}.")
+
+    company = repository.get_company(int(company_id))
+    if not company:
+        raise OnboardingError(f"Company {company_id} not found.")
+    slug = str(company["slug"])
+
+    context = _build_company_context(
+        company_name=company_name.strip(),
+        business_type_key=business_type_key,
+        segment=segment,
+        company_description=company_description,
+        phone=phone,
+        email=email,
+        instagram=instagram,
+        website=website,
+        timezone=timezone,
+        weekday_hours=weekday_hours,
+        saturday_hours=saturday_hours,
+        sunday_hours=sunday_hours,
+        slot_duration_minutes=slot_duration_minutes,
+        minimum_notice_minutes=minimum_notice_minutes,
+        reminder_offsets_days=reminder_offsets_days,
+        brand_style=brand_style,
+        custom_rules=custom_rules,
+        services=services,
+    )
+
+    repository.update_company_profile(
+        int(company_id),
+        name=company_name.strip(),
+        business_type=business_type_key,
+    )
+    save_company_context(context, company_slug=slug)
+    from app.services.company_config_service import save_company_config
+
+    save_company_config(
+        company_id=int(company_id),
+        context=context,
+        author="onboarding",
+        change_note="Contexto configurado pelo assistente de configuração",
+        publish=True,
+    )
+
+    calendar_integration = None
+    if calendar_provider:
+        try:
+            calendar_integration = create_calendar_integration(
+                provider=calendar_provider,
+                company_id=int(company_id),
+                config=calendar_config,
+                active=True,
+            )
+        except CalendarProviderError:
+            calendar_integration = {"error": "Failed to create calendar integration. You can configure it later."}
+
+    refreshed = repository.get_company(int(company_id))
+
+    return {
+        "company": refreshed,
+        "company_context_saved": True,
+        "calendar_integration": calendar_integration,
+        "onboarding_complete": True,
+        "next_steps": _build_next_steps(context, calendar_integration),
+    }
+
+
 def _build_next_steps(
     context: dict[str, Any],
     calendar_integration: dict[str, Any] | None,
@@ -479,8 +665,8 @@ def _build_next_steps(
     if not calendar_integration:
         steps.append({
             "key": "calendar",
-            "title": "Configurar integracao de calendario",
-            "description": "Conecte Google Calendar ou CalDAV para sincronizar agenda.",
+            "title": "Conectar a agenda",
+            "description": "Conecte o Google Agenda ou use a agenda interna para o bot marcar horários.",
             "view": "agenda",
         })
 
@@ -488,20 +674,20 @@ def _build_next_steps(
     if not catalog_items:
         steps.append({
             "key": "catalog",
-            "title": "Adicionar servicos ao catalogo",
-            "description": "Cadastre os servicos que o bot oferecera para agendamento.",
+            "title": "Adicionar serviços ao catálogo",
+            "description": "Cadastre os serviços, com duração e preço, que o bot vai oferecer.",
         })
 
     steps.append({
         "key": "policy",
-        "title": "Revisar a politica de conversa e cancelamento",
-        "description": "Confira as mensagens automaticas e as regras de cancelamento e remarcacao antes de atender clientes reais.",
+        "title": "Revisar mensagens e regras de cancelamento",
+        "description": "Confira as mensagens automáticas e as regras de cancelamento e remarcação antes de atender clientes reais.",
         "view": "policy",
     })
 
     steps.append({
         "key": "test",
-        "title": "Testar o bot no Bot Studio",
+        "title": "Testar o bot como cliente",
         "description": "Simule uma conversa para validar tom, agendamento e respostas.",
         "view": "studio",
     })
@@ -509,27 +695,27 @@ def _build_next_steps(
     steps.append({
         "key": "whatsapp",
         "title": "Conectar o WhatsApp Business",
-        "description": "Configure o webhook e token da API do WhatsApp para ir ao vivo.",
+        "description": "Vincule o número oficial da empresa (WhatsApp Business API da Meta) para atender clientes reais.",
     })
 
     steps.append({
         "key": "templates",
         "title": "Cadastrar templates aprovados",
-        "description": "Sem template aprovado, lembretes e ofertas de vaga nao saem depois de 24 h sem o cliente escrever.",
+        "description": "Sem template aprovado pela Meta, lembretes e ofertas de vaga não saem depois de 24 h sem o cliente escrever.",
         "view": "channel",
     })
 
     steps.append({
         "key": "team",
         "title": "Convidar operadores",
-        "description": "Quem atende precisa de conta propria para assumir conversas e resolver revisoes.",
+        "description": "Quem atende precisa de conta própria para assumir conversas e resolver revisões.",
         "view": "team",
     })
 
     steps.append({
         "key": "operations",
-        "title": "Conhecer a tela Operacao",
-        "description": "Mensagens em revisao, conversas com humano e envios com falha aparecem ali.",
+        "title": "Conhecer a tela Operação",
+        "description": "Mensagens em revisão, conversas com humano e envios com falha aparecem ali.",
         "view": "operations",
     })
 

@@ -97,30 +97,34 @@ const FLOW_NODE_TEMPLATES = [
   },
 ]
 
+// Seis itens para o dia a dia de quem opera o negócio; o resto fica em
+// "Mais", recolhido. Quem nunca teve um bot precisa de um caminho, não de
+// catorze módulos com nome de produto.
 const NAV_ITEMS = [
-  { key: "dashboard", label: "Control Tower", caption: "Readiness e postura operacional", icon: "dashboard" },
-  { key: "analytics", label: "Analytics", caption: "No-show, lembretes e funil", icon: "target" },
-  { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
-  { key: "flows", label: "Flow Studio", caption: "Pipelines, playbooks e respostas", icon: "flow" },
+  { key: "dashboard", label: "Início", caption: "Primeiros passos e visão geral", icon: "dashboard" },
+  { key: "onboarding", label: "Configuração", caption: "Dados, horários, serviços e regras", icon: "spark" },
+  { key: "studio", label: "Testar o bot", caption: "Converse como cliente antes de publicar", icon: "studio" },
+  { key: "operations", label: "Atendimento", caption: "Revisões, conversas com a equipe e alertas", icon: "bell" },
+  { key: "agenda", label: "Agenda", caption: "Calendário, reservas e fila de encaixe", icon: "calendar" },
+  { key: "channel", label: "WhatsApp", caption: "Conexão do número e templates", icon: "send" },
+  { key: "analytics", label: "Análises", caption: "Faltas, lembretes e funil", icon: "target", advanced: true },
+  { key: "flows", label: "Fluxos de conversa", caption: "Etapas, playbooks e respostas aprovadas", icon: "flow", advanced: true },
   // O Automation Studio é um app separado, servido na mesma origem. `href`
   // marca o item como navegação de saída: sem ele, o operador não teria
   // como descobrir o editor visual a partir da plataforma.
   {
     key: "automations",
-    label: "Automation Studio",
+    label: "Automações",
     caption: "Fluxos visuais, execuções e aprovações",
     icon: "flow",
     href: "/platform/automations",
+    advanced: true,
   },
-  { key: "operations", label: "Operação", caption: "Revisões, conversas com humano e alertas", icon: "bell" },
-  { key: "policy", label: "Política", caption: "Mensagens, regras de agenda e versões", icon: "tag" },
-  { key: "channel", label: "Canal WhatsApp", caption: "Templates aprovados e consentimento", icon: "send" },
-  { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
-  { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
-  { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
-  { key: "team", label: "Equipe", caption: "Acessos, papéis e convites", icon: "contacts" },
-  { key: "billing", label: "Billing", caption: "Planos, uso e assinatura", icon: "tag" },
-  { key: "onboarding", label: "Setup Wizard", caption: "Configurar nova empresa", icon: "spark" },
+  { key: "policy", label: "Mensagens e regras", caption: "Textos do bot, cancelamento e versões", icon: "tag", advanced: true },
+  { key: "contacts", label: "Contatos", caption: "Perfil, busca e notas", icon: "contacts", advanced: true },
+  { key: "training", label: "Treinamento", caption: "Importação, curadoria e ajuste fino", icon: "training", advanced: true },
+  { key: "team", label: "Equipe", caption: "Acessos, papéis e convites", icon: "contacts", advanced: true },
+  { key: "billing", label: "Plano", caption: "Assinatura, uso e limites", icon: "tag", advanced: true },
 ]
 
 const DEFAULT_PIPELINES = [
@@ -177,6 +181,17 @@ const state = {
   connectionTestBusy: null,
   calendarConnectionTest: null,
   whatsappConnectionTest: null,
+  // Conexão do número pelo Embedded Signup da Meta (P08): a configuração
+  // pública do app e o andamento do popup vivem no estado porque a tela é
+  // redesenhada a cada mudança e o popup devolve os ids por `postMessage`.
+  whatsappSignupConfig: null,
+  whatsappSignup: createIdleWhatsappSignup(),
+  channelConfirm: null,
+  // Conexão da Google Agenda por OAuth (P08).
+  googleCalendarConfig: null,
+  googleCalendars: null,
+  googleCalendarBusy: false,
+  calendarConfirm: null,
   bookingCancelConfirm: null,
   loading: false,
   loadingMessage: "",
@@ -244,6 +259,18 @@ const state = {
       custom_rules: "",
       services: [],
     },
+  },
+  servicesEditor: {
+    companyId: null,
+    available: false,
+    reason: "",
+    revision: null,
+    context: null,
+    items: [],
+    rules: "",
+    brandStyle: "",
+    dirty: false,
+    busy: false,
   },
   billingPlans: null,
   billingUsage: null,
@@ -614,6 +641,87 @@ function clearAuthActionFromUrl() {
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
 }
 
+// Volta do OAuth do Google e links diretos: o callback do servidor redireciona
+// para `/platform?view=agenda&company_id=<id>&google=connected` (ou
+// `google=error&reason=<código>`). Lido uma vez no bootstrap e removido da
+// URL, como `clearAuthActionFromUrl`, para um F5 não repetir o aviso.
+const URL_NAVIGATION_PARAMS = ["view", "company_id", "google", "reason"]
+
+// Rótulo por chave em mapa literal: `map[key]` direto aceita chaves do
+// protótipo (`constructor`, `toString`) e viraria texto sem sentido no toast
+// quando a chave vem da URL (`?google=error&reason=constructor`).
+function labelFor(map, key, fallback) {
+  const name = String(key ?? "")
+  return name && Object.hasOwn(map, name) ? map[name] : fallback
+}
+
+const GOOGLE_OAUTH_ERROR_MESSAGES = {
+  state_invalid: "A autorização expirou, tente de novo.",
+  forbidden: "Entre com a conta que iniciou a conexão.",
+  exchange_failed: "O Google não confirmou a autorização.",
+  no_refresh_token:
+    "O Google não devolveu permissão permanente. Remova o acesso em myaccount.google.com/permissions e conecte de novo.",
+  vault_unavailable: "O servidor não está configurado para guardar credenciais (CREDENTIALS_ENCRYPTION_KEY).",
+  access_denied: "Você cancelou a autorização.",
+  session_required: "Entre na plataforma e tente de novo.",
+}
+
+function consumeUrlNavigation() {
+  const url = new URL(window.location.href)
+  const navigation = {
+    view: url.searchParams.get("view") || "",
+    companyId: url.searchParams.get("company_id") || "",
+    google: url.searchParams.get("google") || "",
+    reason: url.searchParams.get("reason") || "",
+  }
+  if (URL_NAVIGATION_PARAMS.some((key) => url.searchParams.has(key))) {
+    URL_NAVIGATION_PARAMS.forEach((key) => url.searchParams.delete(key))
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
+  }
+  return navigation
+}
+
+// Só entra em tela conhecida e em empresa que a sessão pode ver: o link não
+// tem autoridade para ampliar o escopo, apenas para posicionar o painel.
+async function applyUrlNavigation(navigation, session) {
+  if (navigation.view && NAV_ITEMS.some((item) => item.key === navigation.view && !item.href)) {
+    state.view = navigation.view
+  }
+  if (!navigation.companyId) return
+  let company = null
+  if (session?.auth_mode === "identity") {
+    const membership = (session.memberships || []).find(
+      (item) => String(item.company_id) === String(navigation.companyId)
+    )
+    company = membership ? { id: membership.company_id, slug: membership.company_slug || "" } : null
+  } else {
+    try {
+      await loadCompanies()
+    } catch {
+      // A tela carrega as empresas de novo e mostra o erro no lugar certo.
+    }
+    company = state.companies.find((item) => String(item.id) === String(navigation.companyId)) || null
+  }
+  if (!company) {
+    pushToast("A empresa indicada no link não está disponível nesta sessão.", "error")
+    return
+  }
+  state.config.companyId = String(company.id)
+  state.config.companySlug = company.slug || ""
+  persistConfig()
+}
+
+function notifyGoogleOAuthResult(navigation) {
+  if (navigation.google === "connected") {
+    pushToast("Google Agenda conectada. As reservas passam a sincronizar com a conta autorizada.")
+  } else if (navigation.google === "error") {
+    pushToast(
+      labelFor(GOOGLE_OAUTH_ERROR_MESSAGES, navigation.reason, "Não foi possível conectar a Google Agenda. Tente de novo."),
+      "error"
+    )
+  }
+}
+
 async function loginPlatformSession() {
   const session = await apiRequest("/platform/auth/session", {
     method: "POST",
@@ -696,6 +804,234 @@ async function loadOnboardingData() {
   if (!state.onboardingPresets) {
     state.onboardingPresets = await apiRequest("/admin/onboarding/presets")
   }
+  await loadServicesEditor()
+}
+
+// Serviços, preços, regras e tom do bot vivem no contexto publicado da
+// empresa. O editor lê o registro com revisão para gravar com concorrência
+// otimista: duas pessoas editando ao mesmo tempo não se sobrescrevem em
+// silêncio.
+async function loadServicesEditor() {
+  const editor = state.servicesEditor
+  const company = getSelectedCompany()
+  if (!company) {
+    editor.available = false
+    editor.reason = "Selecione uma empresa para editar serviços."
+    editor.companyId = null
+    return
+  }
+  if (editor.dirty && String(editor.companyId) === String(company.id)) return
+  try {
+    const record = await apiRequest("/admin/company-context/record", {
+      params: { company_slug: company.slug, company_id: company.id },
+    })
+    const context = record.data || {}
+    const catalog = context.catalog || {}
+    editor.companyId = company.id
+    editor.available = true
+    editor.reason = ""
+    editor.revision = record.revision ?? null
+    editor.context = context
+    editor.items = (Array.isArray(catalog.items) ? catalog.items : []).map(serviceRowFromItem)
+    editor.rules = Array.isArray(context.business_rules) ? context.business_rules.join("\n") : ""
+    editor.brandStyle = context.brand_tone?.style || ""
+    editor.dirty = false
+  } catch (error) {
+    editor.companyId = company.id
+    editor.available = false
+    editor.items = []
+    editor.reason = error?.status === 400
+      ? "Conclua os cinco passos acima e publique: o editor de serviços aparece em seguida."
+      : summarizeError(error)
+  }
+}
+
+function serviceRowFromItem(item) {
+  const durationMatch = String(item.duration || "").match(/(\d+)/)
+  const price = item.price ?? item.starting_price
+  return {
+    original: item,
+    name: String(item.name || ""),
+    duration: durationMatch ? Number(durationMatch[1]) : "",
+    price: price === null || price === undefined ? "" : String(price),
+    description: item.description && item.description !== item.name ? String(item.description) : "",
+  }
+}
+
+function serviceItemFromRow(row, index) {
+  const name = String(row.name || "").trim()
+  const duration = Number.parseInt(row.duration, 10)
+  const priceText = String(row.price || "").trim().replace(",", ".")
+  const price = priceText ? Number(priceText) : null
+  const base = row.original && typeof row.original === "object" ? { ...row.original } : {
+    sku: `SVC-${String(index + 1).padStart(3, "0")}`,
+    category: "servicos",
+    type: "service",
+    transaction_modes: ["service", "scheduling"],
+    schedule_required: true,
+    professional_selection_allowed: false,
+    availability: "sob agendamento",
+    delivery_mode: "presencial",
+    customizable: false,
+    subscription_details: null,
+    rental_details: null,
+    stock_info: null,
+    variants: [],
+  }
+  base.name = name
+  base.description = String(row.description || "").trim() || name
+  base.duration = `${Number.isFinite(duration) && duration > 0 ? duration : 60} minutos`
+  if (price !== null && Number.isFinite(price) && price > 0) {
+    base.price = price
+    base.starting_price = price
+    base.price_mode = "fixed"
+  } else {
+    delete base.price
+    delete base.starting_price
+    base.price_mode = "under_consultation"
+  }
+  return base
+}
+
+function validateServiceRows(rows) {
+  for (const [index, row] of rows.entries()) {
+    if (!String(row.name || "").trim()) return `Informe o nome do serviço ${index + 1}.`
+    const duration = Number.parseInt(row.duration, 10)
+    if (!Number.isFinite(duration) || duration <= 0) return `Informe a duração em minutos do serviço "${row.name}".`
+    const priceText = String(row.price || "").trim().replace(",", ".")
+    if (priceText && !(Number(priceText) > 0)) return `O preço de "${row.name}" precisa ser um número maior que zero (ou vazio para "sob consulta").`
+  }
+  return null
+}
+
+function renderServicesEditorCard() {
+  const editor = state.servicesEditor
+  const canEdit = currentAdminRole() === "superadmin"
+  if (!getSelectedCompany()) return ""
+  if (!editor.available) {
+    return `
+      <section class="grid-one">
+        <article class="card">
+          <div class="section-header"><div>
+            <h3 class="section-title">Serviços e preços</h3>
+            <p class="section-copy">${escapeHtml(editor.reason || "Editor indisponível.")}</p>
+          </div></div>
+        </article>
+      </section>`
+  }
+  const rows = editor.items
+  return `
+    <section class="grid-one">
+      <article class="card" id="services-editor">
+        <div class="section-header">
+          <div>
+            <h3 class="section-title">Serviços e preços</h3>
+            <p class="section-copy">O que o bot oferece e agenda. Preço vazio significa "sob consulta"; o bot nunca inventa valores.</p>
+          </div>
+          ${canEdit ? '<button class="button-ghost" type="button" data-service-add>Adicionar serviço</button>' : ""}
+        </div>
+        ${rows.length ? `
+        <div class="services-table">
+          <div class="services-row services-head">
+            <span>Serviço</span><span>Duração (min)</span><span>Preço (R$)</span><span>Descrição</span><span></span>
+          </div>
+          ${rows.map((row, index) => `
+            <div class="services-row">
+              <input type="text" data-service-field="name" data-service-index="${index}" value="${escapeHtml(row.name)}" placeholder="Ex.: Limpeza de pele" ${canEdit ? "" : "disabled"} />
+              <input data-service-field="duration" data-service-index="${index}" type="number" min="5" step="5" value="${escapeHtml(String(row.duration))}" ${canEdit ? "" : "disabled"} />
+              <input type="text" data-service-field="price" data-service-index="${index}" inputmode="decimal" value="${escapeHtml(row.price)}" placeholder="sob consulta" ${canEdit ? "" : "disabled"} />
+              <input type="text" data-service-field="description" data-service-index="${index}" value="${escapeHtml(row.description)}" placeholder="Opcional" ${canEdit ? "" : "disabled"} />
+              ${canEdit ? `<button class="chip chip-danger" type="button" data-service-remove="${index}">Remover</button>` : "<span></span>"}
+            </div>
+          `).join("")}
+        </div>` : '<div class="empty-state">Nenhum serviço cadastrado. Adicione o primeiro para o bot poder agendar.</div>'}
+        <div class="form-grid-two" style="margin-top:16px;">
+          <div class="field">
+            <label for="services-brand-style">Tom do bot</label>
+            <input type="text" id="services-brand-style" data-service-brand value="${escapeHtml(editor.brandStyle)}" placeholder="Ex.: acolhedor, direto e sem gírias" ${canEdit ? "" : "disabled"} />
+          </div>
+          <div class="field">
+            <label for="services-rules">Regras do bot (uma por linha)</label>
+            <textarea id="services-rules" data-service-rules rows="4" placeholder="Não inventar preços&#10;Sempre confirmar horário antes de agendar" ${canEdit ? "" : "disabled"}>${escapeHtml(editor.rules)}</textarea>
+          </div>
+        </div>
+        ${canEdit ? `
+        <div class="toolbar-row" style="margin-top:12px;">
+          <button class="button" type="button" data-service-save ${editor.busy ? "disabled" : ""}>${editor.busy ? "Publicando…" : "Salvar e publicar"}</button>
+          ${editor.dirty ? '<span class="tag tag-warn">Alterações não publicadas</span>' : '<span class="tag tag-success">Publicado</span>'}
+        </div>` : '<p class="card-copy" style="margin-top:12px;">Somente o dono ou administrador da empresa pode editar.</p>'}
+      </article>
+    </section>`
+}
+
+function bindServicesEditorEvents() {
+  const card = document.getElementById("services-editor")
+  if (!card) return
+  const editor = state.servicesEditor
+  card.querySelectorAll("[data-service-field]").forEach((input) => {
+    input.addEventListener("input", (event) => {
+      const index = Number(event.target.dataset.serviceIndex)
+      const field = event.target.dataset.serviceField
+      if (!editor.items[index]) return
+      editor.items[index][field] = event.target.value
+      editor.dirty = true
+    })
+  })
+  const brand = card.querySelector("[data-service-brand]")
+  if (brand) brand.addEventListener("input", (event) => { editor.brandStyle = event.target.value; editor.dirty = true })
+  const rules = card.querySelector("[data-service-rules]")
+  if (rules) rules.addEventListener("input", (event) => { editor.rules = event.target.value; editor.dirty = true })
+  const add = card.querySelector("[data-service-add]")
+  if (add) add.addEventListener("click", () => {
+    editor.items.push({ original: null, name: "", duration: 60, price: "", description: "" })
+    editor.dirty = true
+    renderApp()
+    const last = document.querySelector(`[data-service-field="name"][data-service-index="${editor.items.length - 1}"]`)
+    if (last) last.focus()
+  })
+  card.querySelectorAll("[data-service-remove]").forEach((button) => {
+    button.addEventListener("click", () => {
+      editor.items.splice(Number(button.dataset.serviceRemove), 1)
+      editor.dirty = true
+      renderApp()
+    })
+  })
+  const save = card.querySelector("[data-service-save]")
+  if (save) save.addEventListener("click", async () => {
+    const problem = validateServiceRows(editor.items)
+    if (problem) { pushToast(problem, "error"); return }
+    const company = getSelectedCompany()
+    if (!company || String(company.id) !== String(editor.companyId)) { pushToast("Selecione a empresa antes de salvar.", "error"); return }
+    const context = JSON.parse(JSON.stringify(editor.context || {}))
+    context.catalog = { ...(context.catalog || {}), items: editor.items.map(serviceItemFromRow) }
+    const ruleLines = String(editor.rules || "").split("\n").map((line) => line.trim()).filter(Boolean)
+    if (ruleLines.length) context.business_rules = ruleLines
+    if (String(editor.brandStyle || "").trim()) {
+      context.brand_tone = { ...(context.brand_tone || {}), style: String(editor.brandStyle).trim() }
+    }
+    editor.busy = true
+    renderApp()
+    try {
+      await apiRequest("/admin/company-context", {
+        method: "PUT",
+        params: { company_slug: company.slug, company_id: company.id },
+        body: { data: context, expected_revision: editor.revision },
+      })
+      editor.dirty = false
+      state.companyContext = null
+      pushToast("Serviços publicados. O bot já responde com a lista nova.")
+      await loadServicesEditor()
+    } catch (error) {
+      if (error?.status === 409) {
+        pushToast("Outra pessoa publicou uma versão enquanto você editava. Recarregue a tela e refaça a alteração.", "error")
+      } else {
+        pushToast(summarizeError(error), "error")
+      }
+    } finally {
+      editor.busy = false
+      renderApp()
+    }
+  })
 }
 
 async function loadBillingData() {
@@ -761,7 +1097,7 @@ async function loadFlowData() {
 }
 
 async function loadAgendaData() {
-  const [calendarProfile, calendarBookings, queueEntries, queueOffers, calendarTimeline] = await Promise.all([
+  const [calendarProfile, calendarBookings, queueEntries, queueOffers, calendarTimeline, googleCalendarConfig] = await Promise.all([
     apiRequest("/admin/calendar/profile", {
       params: getAdminCompanyParams(),
     }),
@@ -780,12 +1116,148 @@ async function loadAgendaData() {
         days: 7,
       },
     }),
+    // Sem empresa: só diz se a conexão pelo painel está habilitada. 404/503
+    // (backend antigo ou sem cofre) viram "não habilitado", nunca erro de tela.
+    apiRequest("/admin/calendar/google/config").catch(() => null),
   ])
   state.calendarProfile = calendarProfile
   state.calendarBookings = Array.isArray(calendarBookings) ? calendarBookings : []
   state.queueEntries = Array.isArray(queueEntries) ? queueEntries : []
   state.queueOffers = Array.isArray(queueOffers) ? queueOffers : []
   state.calendarTimeline = calendarTimeline
+  state.googleCalendarConfig = googleCalendarConfig
+  // `calendarConfirm` não é limpo aqui: um evento SSE no meio do "Confirmar:
+  // desconectar" não pode descartar o passo. A troca de empresa já limpa.
+  scheduleGoogleCalendarsLoad(calendarProfile)
+}
+
+// Conexão feita pelo painel é uma linha da empresa no banco. A integração
+// vinda do ambiente (`GOOGLE_CALENDAR_REFRESH_TOKEN` global, `source:
+// "environment"`, sem `integration_id`) continua valendo para o bot, mas não
+// tem conta, data nem "Desconectar" (o servidor responde 400): a empresa
+// ainda pode conectar a própria conta.
+function isGoogleCalendarConnected(integration) {
+  if (!integration || String(integration.provider || "") !== "google_calendar") return false
+  if (String(integration.source || "") === "environment" || integration.integration_id == null) return false
+  return integration.active !== false && Number(integration.active ?? 1) !== 0
+}
+
+function isGoogleCalendarFromEnvironment(integration) {
+  if (!integration || String(integration.provider || "") !== "google_calendar") return false
+  return String(integration.source || "") === "environment"
+}
+
+// Lista de calendários da conta conectada: só para quem pode trocar o
+// calendário e uma vez por empresa, porque cada chamada renova o token no
+// Google e consulta a calendarList. Não segura a tela: a agenda aparece com
+// os dados internos e o seletor entra quando o Google responde. Refeita só
+// depois de conectar/desconectar (estado zerado) ou por "Tentar de novo".
+function scheduleGoogleCalendarsLoad(profile, { force = false } = {}) {
+  const companyId = String(state.config.companyId || "")
+  if (!companyId || !isGoogleCalendarConnected(profile?.integration) || currentAdminRole() !== "superadmin") {
+    state.googleCalendars = null
+    return
+  }
+  const cached = state.googleCalendars
+  if (!force && cached && String(cached.companyId) === companyId) return
+  state.googleCalendars = { companyId, items: [], error: "", loading: true }
+  void apiRequest("/admin/calendar/google/calendars", { params: getAdminCompanyParams() })
+    .then((items) => ({ companyId, items: Array.isArray(items) ? items : [], error: "", loading: false }))
+    .catch((error) => ({ companyId, items: [], error: summarizeError(error), loading: false }))
+    .then((result) => {
+      // A empresa pode ter mudado (ou a agenda sido desconectada) enquanto
+      // o Google respondia: resposta antiga não entra no estado.
+      if (String(state.config.companyId) !== companyId) return
+      if (!state.googleCalendars || String(state.googleCalendars.companyId) !== companyId) return
+      state.googleCalendars = result
+      if (state.view === "agenda" && !state.loading) renderApp()
+    })
+}
+
+async function startGoogleCalendarAuthorization() {
+  if (!state.config.companyId) {
+    pushToast("Selecione a empresa antes de conectar a Google Agenda.", "error")
+    return
+  }
+  if (state.googleCalendarBusy) return
+  state.googleCalendarBusy = true
+  renderApp()
+  try {
+    const result = await apiRequest("/admin/calendar/google/authorize", {
+      method: "POST",
+      params: getAdminCompanyParams(),
+    })
+    const authorizationUrl = String(result?.authorization_url || "")
+    // O painel só navega para o Google: um endereço diferente é bug do servidor.
+    if (!authorizationUrl.startsWith("https://accounts.google.com/")) {
+      throw new Error("O servidor não devolveu o endereço de autorização do Google.")
+    }
+    window.location.assign(authorizationUrl)
+    // A página sai para o Google; o estado ocupado fica até lá.
+  } catch (error) {
+    state.googleCalendarBusy = false
+    pushToast(summarizeError(error), "error")
+    renderApp()
+  }
+}
+
+// Voltar do consentimento do Google pelo botão do navegador pode restaurar a
+// página do bfcache com o estado em memória: o botão ficaria preso em
+// "Abrindo o Google…" até um F5.
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted || !state.googleCalendarBusy) return
+  state.googleCalendarBusy = false
+  renderApp()
+})
+
+async function disconnectGoogleCalendar() {
+  if (state.googleCalendarBusy || !state.config.companyId) return
+  state.googleCalendarBusy = true
+  state.calendarConfirm = null
+  renderApp()
+  try {
+    await apiRequest("/admin/calendar/google/disconnect", {
+      method: "POST",
+      params: getAdminCompanyParams(),
+    })
+    state.calendarConnectionTest = null
+    state.googleCalendars = null
+    pushToast("Google Agenda desconectada. As reservas continuam na agenda interna.")
+    await loadAgendaData().catch((error) => pushToast(summarizeError(error), "error"))
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.googleCalendarBusy = false
+    renderApp()
+  }
+}
+
+async function selectGoogleCalendar(calendarId) {
+  if (state.googleCalendarBusy || !state.config.companyId || !calendarId) return
+  state.googleCalendarBusy = true
+  renderApp()
+  try {
+    await apiRequest("/admin/calendar/google/calendar", {
+      method: "PATCH",
+      params: getAdminCompanyParams(),
+      body: { calendar_id: String(calendarId) },
+    })
+    pushToast("Calendário atualizado: as próximas reservas vão para ele.")
+    // A lista em cache só muda a marcação: não precisa perguntar ao Google.
+    const cached = state.googleCalendars
+    if (cached && String(cached.companyId) === String(state.config.companyId)) {
+      state.googleCalendars = {
+        ...cached,
+        items: cached.items.map((item) => ({ ...item, selected: String(item.id) === String(calendarId) })),
+      }
+    }
+    await loadAgendaData().catch((error) => pushToast(summarizeError(error), "error"))
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.googleCalendarBusy = false
+    renderApp()
+  }
 }
 
 async function loadOperationsData() {
@@ -977,6 +1449,45 @@ function viewLoadingLabel(view) {
   return "Carregando..."
 }
 
+const STUDIO_ACTION_LABELS = {
+  auto_reply: "Bot respondeu",
+  greeting: "Saudação",
+  schedule_options_presented: "Horários oferecidos",
+  booking_confirmation_requested: "Aguardando confirmação",
+  booking_created: "Agendamento criado",
+  booking_rescheduled: "Agendamento remarcado",
+  booking_cancelled: "Agendamento cancelado",
+  handoff: "Encaminhado à equipe",
+  human_review: "Enviado para revisão",
+  pending_review: "Enviado para revisão",
+  human_owned: "Atendimento com a equipe",
+  workflow: "Fluxo de agendamento",
+  review: "Enviado para revisão",
+  pending_needs_review: "Enviado para revisão",
+  request_customer_clarification: "Pediu esclarecimento",
+  schedule_confirmation_requested: "Aguardando confirmação",
+  schedule_confirmed: "Agendamento confirmado",
+  scheduling_abandoned: "Agendamento abandonado",
+  booking_cancel_confirmation_requested: "Confirmando cancelamento",
+  booking_reschedule_date_requested: "Pediu nova data",
+  booking_change_requires_human: "Encaminhado à equipe",
+  after_hours: "Fora do horário",
+  opt_out: "Cliente pediu para sair",
+  opt_in: "Cliente voltou a receber avisos",
+}
+
+function describeStudioAction(action) {
+  if (!action) return "Resposta do bot"
+  const key = String(action).toLowerCase()
+  if (STUDIO_ACTION_LABELS[key]) return STUDIO_ACTION_LABELS[key]
+  return key.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())
+}
+
+function generateStudioContactId() {
+  const digits = Array.from({ length: 8 }, () => Math.floor(Math.random() * 10)).join("")
+  return `5511${digits}`
+}
+
 function getReadinessTone(status) {
   if (status === "pass" || status === "ready") return "tag-success"
   if (status === "warn" || status === "warning") return "tag-warn"
@@ -1039,10 +1550,10 @@ function renderTopbar() {
 }
 
 function renderViewTitle() {
-  if (state.view === "dashboard") return "Uma camada premium para operar o bot como produto"
+  if (state.view === "dashboard") return "Seu atendimento no WhatsApp em um só lugar"
   if (state.view === "analytics") return "Analytics de no-show, lembretes e funil de agendamento"
   if (state.view === "billing") return "Billing — planos, assinatura e consumo"
-  if (state.view === "onboarding") return "Setup Wizard — configure uma nova empresa passo a passo"
+  if (state.view === "onboarding") return "Configuração — dados, horários, serviços e regras do bot"
   if (state.view === "studio") return "Bot Studio para testar conversa real antes de publicar"
   if (state.view === "flows") return "Flow Studio para lapidar regras, playbooks e respostas"
   if (state.view === "agenda") return "Agenda Console com controle manual e visão operacional"
@@ -1056,10 +1567,10 @@ function renderViewTitle() {
 }
 
 function renderViewCopy() {
-  if (state.view === "dashboard") return "Readiness, observabilidade, onboarding e comando central da operação."
+  if (state.view === "dashboard") return "Configure, teste, conecte e acompanhe o bot da sua empresa."
   if (state.view === "analytics") return "Meça impacto real: taxa de no-show, eficácia dos lembretes e recuperação via fila."
   if (state.view === "billing") return "Gerencie plano, acompanhe limites de uso e controle sua assinatura."
-  if (state.view === "onboarding") return "Preencha os dados, configure horários e ative o bot em minutos."
+  if (state.view === "onboarding") return "Cinco passos para o bot atender com os dados da sua empresa."
   if (state.view === "studio") return "Simule cliente, operador e fluxos de agendamento na mesma interface."
   if (state.view === "flows") return "Desenhe a experiência do bot, organize pipelines e promova mensagens aprovadas."
   if (state.view === "agenda") return "Monitore disponibilidade, bookings, remanejamento e ajustes manuais."
@@ -1097,36 +1608,44 @@ function renderSidebar() {
         </p>
       </div>
 
-      <div class="nav-section-label">Workspace</div>
+      <div class="nav-section-label">Principal</div>
       <nav class="nav-list">
-        ${NAV_ITEMS.map(
-          (item) => item.href
-            ? `
-            <a class="nav-button" href="${item.href}">
-              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
-              <span>
-                <span class="nav-label">${escapeHtml(item.label)}</span>
-                <span class="nav-caption">${escapeHtml(item.caption)}</span>
-              </span>
-            </a>
-          `
-            : `
-            <button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">
-              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
-              <span>
-                <span class="nav-label">${escapeHtml(item.label)}</span>
-                <span class="nav-caption">${escapeHtml(item.caption)}</span>
-              </span>
-            </button>
-          `
-        ).join("")}
+        ${NAV_ITEMS.filter((item) => !item.advanced).map(renderNavItem).join("")}
       </nav>
+      <button class="nav-more-toggle" type="button" data-nav-more aria-expanded="${isNavMoreOpen() ? "true" : "false"}">
+        <span>Mais</span>
+        <span class="nav-more-caret">${isNavMoreOpen() ? "▾" : "▸"}</span>
+      </button>
+      ${isNavMoreOpen() ? `
+      <nav class="nav-list nav-list-advanced">
+        ${NAV_ITEMS.filter((item) => item.advanced).map(renderNavItem).join("")}
+      </nav>` : ""}
 
       <div class="sidebar-footnote">
         v1.0 · Superfície principal <span class="mono">/platform</span>
       </div>
     </aside>
   `
+}
+
+function renderNavItem(item) {
+  const inner = `
+      <span class="nav-icon">${ICONS[item.icon] || ""}</span>
+      <span>
+        <span class="nav-label">${escapeHtml(item.label)}</span>
+        <span class="nav-caption">${escapeHtml(item.caption)}</span>
+      </span>`
+  if (item.href) {
+    return `<a class="nav-button" href="${item.href}">${inner}</a>`
+  }
+  return `<button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">${inner}</button>`
+}
+
+// O grupo "Mais" abre sozinho quando a tela atual está dentro dele; a escolha
+// do operador fica guardada com o resto da configuração local.
+function isNavMoreOpen() {
+  if (state.config.navMoreOpen) return true
+  return NAV_ITEMS.some((item) => item.advanced && !item.href && item.key === state.view)
 }
 
 function renderMetricCard(label, value, caption, tone = "default", iconKey = "dashboard") {
@@ -1156,17 +1675,19 @@ function renderDashboardView() {
 
   return `
     <section class="hero">
-      <span class="brand-eyebrow">Command Center</span>
-      <h2 class="hero-title">A operação inteira do bot em uma camada visual própria.</h2>
+      <span class="brand-eyebrow">Visão geral</span>
+      <h2 class="hero-title">Tudo o que o bot faz pela sua empresa, em um só painel.</h2>
       <p class="hero-copy">
-        Aqui você mede maturidade, readiness e tração real. A ideia é sair de um painel utilitário e entrar numa experiência de produto, com capacidade de teste, curadoria, agenda e controle.
+        Configure em minutos, teste como cliente, conecte o WhatsApp e acompanhe agendamentos, conversas e o que precisa da sua atenção.
       </p>
       <div class="hero-actions">
         <button class="button" data-jump-view="studio">Testar conversa agora</button>
-        <button class="button-ghost" data-jump-view="agenda">Abrir agenda operacional</button>
-        <button class="button-ghost" data-refresh-view>Atualizar panorama</button>
+        <button class="button-ghost" data-jump-view="agenda">Abrir agenda</button>
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
       </div>
     </section>
+
+    ${renderFirstStepsCard()}
 
     <section class="grid-four">
       ${renderMetricCard("Mensagens", formatNumber(totals.messages), "Volume já tratado pelo runtime atual.", "default", "studio")}
@@ -1263,8 +1784,8 @@ function renderDashboardView() {
       <article class="card">
         <div class="section-header">
           <div>
-            <h3 class="section-title">Quick actions</h3>
-            <p class="section-copy">Atalhos para os módulos que viram rotina operacional.</p>
+            <h3 class="section-title">Atalhos</h3>
+            <p class="section-copy">Os módulos que viram rotina depois que o bot está no ar.</p>
           </div>
         </div>
         <div class="grid-two">
@@ -1561,6 +2082,17 @@ function renderBillingView() {
   `
 }
 
+const WIZARD_TYPE_ICONS = {
+  clinica: "target",
+  salao: "spark",
+  estetica: "spark",
+  escritorio: "tag",
+  academia: "refresh",
+  pet: "contacts",
+  aulas: "training",
+  outro: "dashboard",
+}
+
 const ONBOARDING_STEPS = [
   { key: "business", label: "Dados do negócio", icon: "tag" },
   { key: "hours", label: "Horário de atendimento", icon: "clock" },
@@ -1596,7 +2128,7 @@ function renderOnboardingStep0() {
       <div class="wizard-type-grid">
         ${typeEntries.map(([key, info]) => `
           <button class="wizard-type-card ${d.business_type_key === key ? 'selected' : ''}" data-onboarding-type="${key}">
-            <span class="wizard-type-icon">${ICONS[key === "clinica" ? "target" : key === "salao" ? "spark" : key === "escritorio" ? "tag" : key === "academia" ? "refresh" : "dashboard"]}</span>
+            <span class="wizard-type-icon">${ICONS[WIZARD_TYPE_ICONS[key] || "dashboard"]}</span>
             <span class="wizard-type-label">${escapeHtml(info.label)}</span>
           </button>
         `).join("")}
@@ -1834,6 +2366,38 @@ function renderOnboardingStep4() {
   `
 }
 
+// Quem acabou de criar a conta precisa de um caminho, não de um painel de
+// métricas zeradas. A ordem é a que leva ao vivo com menos atrito.
+function renderFirstStepsCard() {
+  if (!getSelectedCompany()) return ""
+  const steps = [
+    { view: "onboarding", title: "1. Configurar a empresa", copy: "Horários, serviços, preços e regras em cinco passos." },
+    { view: "studio", title: "2. Testar o bot", copy: "Converse como cliente e ajuste o que não gostar." },
+    { view: "channel", title: "3. Conectar o WhatsApp", copy: "Vincule o número da empresa para atender de verdade." },
+    { view: "agenda", title: "4. Conectar a agenda", copy: "Google Agenda ou agenda interna para marcar horários." },
+  ]
+  return `
+    <section class="grid-one">
+      <article class="card">
+        <div class="section-header">
+          <div>
+            <h3 class="section-title">Primeiros passos</h3>
+            <p class="section-copy">Siga a ordem para colocar o bot no ar. Você pode voltar a qualquer passo depois.</p>
+          </div>
+        </div>
+        <div class="first-steps-grid">
+          ${steps.map((step) => `
+            <button class="card card-muted first-step" type="button" data-jump-view="${step.view}">
+              <strong>${escapeHtml(step.title)}</strong>
+              <span class="card-copy">${escapeHtml(step.copy)}</span>
+            </button>
+          `).join("")}
+        </div>
+      </article>
+    </section>
+  `
+}
+
 function renderOnboardingSuccess() {
   const result = state.onboardingWizard.result
   const company = result?.company || {}
@@ -1841,13 +2405,14 @@ function renderOnboardingSuccess() {
 
   return `
     <section class="hero" style="text-align:center">
-      <span class="brand-eyebrow" style="color:var(--brand)">Setup completo</span>
-      <h2 class="hero-title">${escapeHtml(company.name || "Empresa")} está pronta para operar.</h2>
-      <p class="hero-copy">O contexto foi gerado, os módulos ativados e a empresa já está na plataforma.</p>
+      <span class="brand-eyebrow" style="color:var(--brand)">Configuração publicada</span>
+      <h2 class="hero-title">${escapeHtml(company.name || "Empresa")} está pronta para testar.</h2>
+      <p class="hero-copy">O bot já conhece seus horários, serviços e regras. Teste uma conversa e depois conecte o WhatsApp para atender clientes reais.</p>
       <div class="hero-actions" style="justify-content:center">
         <button class="button" data-jump-view="studio">Testar o bot agora</button>
+        <button class="button-ghost" data-jump-view="channel">Conectar WhatsApp</button>
         <button class="button-ghost" data-jump-view="agenda">Abrir agenda</button>
-        <button class="button-ghost" id="onboarding-reset">Configurar outra empresa</button>
+        ${getWizardTargetCompany() ? '<button class="button-ghost" id="onboarding-reset">Revisar configuração</button>' : '<button class="button-ghost" id="onboarding-reset">Configurar outra empresa</button>'}
       </div>
     </section>
 
@@ -1879,9 +2444,23 @@ function renderOnboardingSuccess() {
   `
 }
 
+// A empresa selecionada no escopo é a que o wizard configura. Só sem escopo
+// (token de plataforma em "Escopo global") o wizard cria uma empresa nova:
+// quem entra pelo cadastro self-service já tem a sua e não pode criar outra.
+function getWizardTargetCompany() {
+  return getSelectedCompany() || null
+}
+
 function renderOnboardingView() {
   if (state.onboardingWizard.completed && state.onboardingWizard.result) {
     return renderOnboardingSuccess()
+  }
+
+  const target = getWizardTargetCompany()
+  const draft = state.onboardingWizard.draft
+  if (target && !draft.company_name && !state.onboardingWizard.prefilledFor) {
+    draft.company_name = target.name || ""
+    state.onboardingWizard.prefilledFor = target.id
   }
 
   const step = state.onboardingWizard.step
@@ -1896,11 +2475,18 @@ function renderOnboardingView() {
   else if (step === 3) stepContent = renderOnboardingStep3()
   else if (step === 4) stepContent = renderOnboardingStep4()
 
+  const heroTitle = target
+    ? `Configure ${escapeHtml(target.name)} em minutos.`
+    : "Configure uma nova empresa em minutos."
+  const heroCopy = target
+    ? "Responda em cinco passos e o bot passa a atender com os seus dados: horários, serviços, preços e regras. Nada é enviado ao WhatsApp até você conectar o canal."
+    : "Preencha os dados e o bot será configurado automaticamente com contexto, agenda, lembretes e catálogo."
+
   return `
     <section class="hero">
-      <span class="brand-eyebrow">Setup Wizard</span>
-      <h2 class="hero-title">Configure uma nova empresa em minutos.</h2>
-      <p class="hero-copy">Preencha os dados e o bot será configurado automaticamente com contexto, agenda, lembretes e catálogo.</p>
+      <span class="brand-eyebrow">Configuração</span>
+      <h2 class="hero-title">${heroTitle}</h2>
+      <p class="hero-copy">${heroCopy}</p>
     </section>
 
     <section class="grid-one">
@@ -1914,7 +2500,7 @@ function renderOnboardingView() {
         <div class="wizard-nav">
           ${!isFirst ? '<button class="button-ghost" id="wizard-prev">Voltar</button>' : '<span></span>'}
           ${isLast
-            ? '<button class="button" id="wizard-submit">Ativar empresa</button>'
+            ? `<button class="button" id="wizard-submit">${target ? "Salvar e publicar" : "Criar e ativar empresa"}</button>`
             : '<button class="button" id="wizard-next">Próximo</button>'
           }
         </div>
@@ -2360,8 +2946,8 @@ function renderStudioView() {
             <input id="studio-new-label" name="label" value="${escapeHtml(draftNew.label)}" placeholder="Ex.: Cliente Premium" />
           </div>
           <div class="field">
-            <label for="studio-new-contact-id">Contact ID</label>
-            <input id="studio-new-contact-id" name="contactId" value="${escapeHtml(draftNew.contactId)}" placeholder="5511999999999" />
+            <label for="studio-new-contact-id">Telefone do cliente de teste (opcional)</label>
+            <input id="studio-new-contact-id" name="contactId" value="${escapeHtml(draftNew.contactId)}" placeholder="Deixe vazio para gerar um número fictício" />
           </div>
           <div class="field">
             <label for="studio-new-contact-name">Nome exibido</label>
@@ -2386,11 +2972,11 @@ function renderStudioView() {
           <div class="section-header">
             <div>
               <h3 class="section-title">${escapeHtml(activeSession.label || activeSession.contact_id)}</h3>
-              <p class="section-copy">Contact ID: ${escapeHtml(activeSession.contact_id)}${activeSession.contact_name ? " · " + escapeHtml(activeSession.contact_name) : ""}</p>
+              <p class="section-copy">Telefone de teste: ${escapeHtml(activeSession.contact_id)}${activeSession.contact_name ? " · " + escapeHtml(activeSession.contact_name) : ""}</p>
             </div>
             ${
               activeSession.last_result
-                ? `<span class="tag ${getReadinessTone(activeSession.last_result.action === "auto_reply" ? "ready" : "warning")}">${escapeHtml(activeSession.last_result.action)}</span>`
+                ? `<span class="tag ${getReadinessTone(activeSession.last_result.action === "auto_reply" ? "ready" : "warning")}">${escapeHtml(describeStudioAction(activeSession.last_result.action))}</span>`
                 : ""
             }
           </div>
@@ -2408,28 +2994,30 @@ function renderStudioView() {
                       const ts = formatSessionTimestamp(item.at)
                       if (item.role === "user") {
                         return `
-                          <div class="bubble bubble-user">
-                            ${escapeHtml(item.text)}
-                            ${ts ? `<div class="bubble-meta"><span class="meta-chip">${escapeHtml(ts)}</span></div>` : ""}
-                          </div>
+                          <div class="bubble bubble-user"><span class="bubble-text">${escapeHtml(item.text)}</span>${ts ? `<div class="bubble-meta"><span class="meta-chip">${escapeHtml(ts)}</span></div>` : ""}</div>
                         `
                       }
                       const meta = item.meta || {}
                       return `
-                        <div class="bubble bubble-assistant">
-                          ${escapeHtml(item.text)}
+                        <div class="bubble bubble-assistant"><span class="bubble-text">${escapeHtml(item.text)}</span>
                           <div class="bubble-meta">
                             ${ts ? `<span class="meta-chip">${escapeHtml(ts)}</span>` : ""}
-                            <span class="meta-chip">Classificação: ${escapeHtml(meta.classification || "—")}</span>
-                            <span class="meta-chip">Ação: ${escapeHtml(meta.action || "—")}</span>
-                            <span class="meta-chip">Pipeline: ${escapeHtml(meta.pipeline_stage || "—")}</span>
-                            <span class="meta-chip">Fonte: ${escapeHtml(meta.source || "—")}</span>
+                            <span class="meta-chip">${escapeHtml(describeStudioAction(meta.action))}</span>
+                            <details class="bubble-details">
+                              <summary>Detalhes técnicos</summary>
+                              <div class="bubble-details-body">
+                                <span class="meta-chip">Classificação: ${escapeHtml(meta.classification || "—")}</span>
+                                <span class="meta-chip">Ação: ${escapeHtml(meta.action || "—")}</span>
+                                <span class="meta-chip">Etapa: ${escapeHtml(meta.pipeline_stage || "—")}</span>
+                                <span class="meta-chip">Origem: ${escapeHtml(meta.source || "—")}</span>
+                              </div>
+                            </details>
                           </div>
                         </div>
                       `
                     })
                     .join("")
-                : '<div class="empty-state">Envie uma mensagem para ver o comportamento do bot dentro do runtime real.</div>'
+                : '<div class="empty-state">Escreva a primeira mensagem como cliente para ver como o bot responde.</div>'
             }
           </div>
           <form id="studio-form" class="form-grid" style="margin-top:12px;">
@@ -2438,7 +3026,7 @@ function renderStudioView() {
               <textarea id="studio-message" name="message" placeholder="Ex.: Quero remarcar meu atendimento para sexta às 15h">${escapeHtml(state.studio.draftMessage)}</textarea>
             </div>
             <div class="toolbar-row">
-              <button class="button" type="submit">${ICONS.send}<span>Enviar para o runtime</span></button>
+              <button class="button" type="submit">${ICONS.send}<span>Enviar</span></button>
               <button class="button-ghost" type="button" id="clear-studio-log">Limpar histórico</button>
             </div>
           </form>
@@ -2453,9 +3041,9 @@ function renderStudioView() {
   return `
     <section class="hero">
       <span class="brand-eyebrow">Bot Studio</span>
-      <h2 class="hero-title">Teste conversa real antes de colocar para rodar.</h2>
+      <h2 class="hero-title">Converse com o seu bot antes de colocar para rodar.</h2>
       <p class="hero-copy">
-        Crie sessões de teste por contato, mantenha o histórico e valide o fluxo natural sem reinformar telefone a cada mensagem. Toda troca passa pelo mesmo runtime, através da rota autenticada /admin/simulator/messages.
+        Escreva como se fosse um cliente. As respostas vêm do mesmo motor que atende no WhatsApp, com os dados publicados da empresa. Nada é enviado a clientes reais.
       </p>
     </section>
 
@@ -3267,7 +3855,114 @@ function describeBookingState(booking) {
   return { key: status || "unknown", label: status || "Sem status", tone: "", detail: "", actionable: false }
 }
 
-const CALENDAR_PROVIDER_LABELS = { mock: "Agenda interna", google_calendar: "Google Calendar", caldav: "CalDAV" }
+const CALENDAR_PROVIDER_LABELS = { mock: "Agenda interna", google_calendar: "Google Agenda", caldav: "CalDAV" }
+
+function calendarProviderLabel(provider) {
+  const key = String(provider || "mock")
+  return CALENDAR_PROVIDER_LABELS[key] || key
+}
+
+// Conexão da Google Agenda (P08): o botão só aparece quando a instalação tem
+// as credenciais do app do Google; sem elas o dono lê o que falta e segue com
+// a agenda interna.
+function renderGoogleCalendarConnect(config, isCompanyAdmin, integration) {
+  // Instalação antiga: a conta Google vem do ambiente e vale para todas as
+  // empresas; a conexão pelo painel substitui isso só para esta empresa.
+  const environmentNote = isGoogleCalendarFromEnvironment(integration)
+    ? '<p class="subtle" data-google-environment-note>Esta empresa usa a conta Google compartilhada da instalação (GOOGLE_CALENDAR_REFRESH_TOKEN) até conectar a própria conta pelo painel.</p>'
+    : ""
+  if (!config?.enabled) {
+    return `
+      ${environmentNote}
+      <p class="subtle" data-google-connect-disabled>
+        A agenda interna continua funcionando; para conectar o Google, o administrador precisa configurar
+        GOOGLE_CALENDAR_CLIENT_ID/SECRET e PLATFORM_PUBLIC_URL.${config?.reason ? ` ${escapeHtml(config.reason)}` : ""}
+      </p>
+    `
+  }
+  if (!isCompanyAdmin) {
+    return `${environmentNote}<p class="subtle">Um administrador da empresa pode conectar a Google Agenda pelo painel.</p>`
+  }
+  const busy = state.googleCalendarBusy ? "disabled" : ""
+  return `
+    ${environmentNote}
+    <div class="hero-actions">
+      <button class="button" type="button" data-connect-google ${busy}>${state.googleCalendarBusy ? "Abrindo o Google…" : "Conectar Google Agenda"}</button>
+    </div>
+    <p class="subtle">Você será levado ao Google para autorizar; ao voltar, o bot passa a consultar e atualizar a agenda da conta.</p>
+  `
+}
+
+// Nome do calendário em uso sem expor o id: o servidor mascara ids reais
+// (podem ser e-mail) e só deixa passar o apelido `primary`. Um id mascarado
+// nunca vira texto na tela.
+function googleCalendarLabel(integration, selected) {
+  if (selected) return selected.summary || selected.id
+  const externalId = String(integration?.external_calendar_id || "")
+  const configId = String(integration?.config?.calendar_id || "")
+  if (!externalId || externalId === "primary" || configId === "primary") return "Calendário principal da conta"
+  if (externalId.startsWith("*")) return "Calendário escolhido pelo administrador"
+  return externalId
+}
+
+function renderGoogleCalendarConnected(integration, isCompanyAdmin) {
+  const calendars =
+    state.googleCalendars && String(state.googleCalendars.companyId) === String(state.config.companyId)
+      ? state.googleCalendars
+      : null
+  const items = calendars?.items || []
+  const selected = items.find((item) => item.selected) || null
+  const facts = [
+    ["Conta Google", integration.connected_account_email || "—"],
+    ["Conectado em", formatDateTime(integration.connected_at)],
+    ["Calendário em uso", googleCalendarLabel(integration, selected)],
+  ]
+  let selector = ""
+  if (isCompanyAdmin && items.length) {
+    const busy = state.googleCalendarBusy ? "disabled" : ""
+    selector = `
+      <div class="field connection-select">
+        <label for="google-calendar-select">Calendário usado pelo bot</label>
+        <select id="google-calendar-select" data-google-calendar-select ${busy}>
+          ${items
+            .map(
+              (item) =>
+                `<option value="${escapeHtml(item.id)}" ${item.selected ? "selected" : ""}>${escapeHtml(item.summary || item.id)}${item.primary ? " (principal)" : ""}</option>`
+            )
+            .join("")}
+        </select>
+        <small>Reservas, remarcações e cancelamentos vão para este calendário.</small>
+      </div>
+    `
+  } else if (isCompanyAdmin && calendars?.loading) {
+    selector = '<p class="subtle" data-google-calendars-loading>Carregando os calendários da conta…</p>'
+  } else if (isCompanyAdmin && calendars?.error) {
+    selector = `
+      <p class="subtle" data-google-calendars-error>Não foi possível listar os calendários: ${escapeHtml(calendars.error)}</p>
+      <div class="hero-actions">
+        <button class="button-ghost" type="button" data-google-calendars-refresh ${state.googleCalendarBusy ? "disabled" : ""}>Tentar de novo</button>
+      </div>
+    `
+  }
+  return `
+    <dl class="connection-facts" data-google-connected>
+      ${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join("")}
+    </dl>
+    ${selector}
+  `
+}
+
+function renderGoogleDisconnectActions() {
+  const busy = state.googleCalendarBusy ? "disabled" : ""
+  if (state.calendarConfirm === "disconnect") {
+    return `
+      <button class="button-danger" type="button" data-disconnect-google-confirm ${busy}>Confirmar: desconectar a Google Agenda</button>
+      <button class="button-ghost" type="button" data-calendar-cancel ${busy}>Cancelar</button>
+      <p class="ops-confirm-note">As reservas passam a ficar só na agenda interna; eventos já criados no Google não são apagados.</p>
+    `
+  }
+  return `<button class="button-ghost" type="button" data-disconnect-google ${busy}>${state.googleCalendarBusy ? "Aguarde…" : "Desconectar"}</button>`
+}
 
 // Integração de agenda da empresa (P07): distingue agenda interna de agenda
 // externa e mostra a prontidão informada pelo provider — nunca a configuração,
@@ -3278,7 +3973,7 @@ function renderCalendarIntegrationCard(profile) {
   const provider = String(integration.provider || readiness.provider || "mock")
   const internal = provider === "mock"
   const ready = Boolean(readiness.ready)
-  const label = CALENDAR_PROVIDER_LABELS[provider] || provider
+  const label = calendarProviderLabel(provider)
   const tone = internal ? "" : ready ? "tag-success" : "tag-danger"
   const status = internal ? "Sem sincronização externa" : ready ? "Credenciais encontradas" : "Configuração incompleta"
   const explanation = internal
@@ -3291,6 +3986,7 @@ function renderCalendarIntegrationCard(profile) {
     : null
   const testing = state.connectionTestBusy === "calendar"
   const canTest = currentAdminRole() === "superadmin"
+  const googleConnected = isGoogleCalendarConnected(integration)
   return `
     <section class="card" data-calendar-integration="${escapeHtml(provider)}">
       <div class="card-header">
@@ -3301,9 +3997,11 @@ function renderCalendarIntegrationCard(profile) {
         <span class="tag ${tone}">${escapeHtml(status)}</span>
       </div>
       ${!internal && readiness.details ? `<p class="subtle">${escapeHtml(readiness.details)}</p>` : ""}
+      ${googleConnected ? renderGoogleCalendarConnected(integration, canTest) : renderGoogleCalendarConnect(state.googleCalendarConfig, canTest, integration)}
       <div class="hero-actions">
-        ${canTest ? `<button class="button-ghost" type="button" data-test-calendar-connection ${testing ? "disabled" : ""}>${testing ? "Testando…" : internal ? "Verificar agenda interna" : "Testar conexão"}</button>` : ""}
+        ${canTest ? `<button class="button-ghost" type="button" data-test-calendar-connection ${testing || state.googleCalendarBusy ? "disabled" : ""}>${testing ? "Testando…" : internal ? "Verificar agenda interna" : "Testar conexão"}</button>` : ""}
         ${test ? `<span class="tag ${test.connected ? "tag-success" : "tag-danger"}">${escapeHtml(test.connected ? "Conexão confirmada" : "Falha na conexão")}</span>` : ""}
+        ${googleConnected && canTest ? renderGoogleDisconnectActions() : ""}
       </div>
       ${test ? `<p class="subtle">${escapeHtml(test.details || "Diagnóstico concluído.")} Verificado em ${escapeHtml(formatDateTime(test.checked_at))}.</p>` : ""}
     </section>
@@ -3338,7 +4036,7 @@ function renderAgendaView() {
     ${renderSchedulingPolicyEditor(context)}
 
     <section class="grid-three">
-      ${renderMetricCard("Provider", integration.provider || "—", "Integração ativa no escopo atual.", "default", "spark")}
+      ${renderMetricCard("Agenda", integration.provider ? calendarProviderLabel(integration.provider) : "—", "Integração ativa no escopo atual.", "default", "spark")}
       ${renderMetricCard("Bookings", formatNumber(bookings.length), "Reservas visíveis no escopo selecionado.", "default", "calendar")}
       ${renderMetricCard("Fila ativa", formatNumber(queueEntries.length), "Clientes esperando encaixe ou antecipação.", "warm", "clock")}
     </section>
@@ -4695,16 +5393,30 @@ async function loadChannelData() {
     return
   }
   const params = getAdminCompanyParams()
-  const [response, status] = await Promise.all([
+  const [response, status, signupConfig] = await Promise.all([
     apiRequest("/admin/whatsapp/templates", { params }),
     // Mesma fonte canônica usada pelo webhook e pelo envio em produção.
     apiRequest("/admin/whatsapp/channel-status", { params }).catch(() => null),
+    // Sem empresa: ids públicos do app da Meta. 404/503 (backend antigo ou
+    // cofre indisponível) viram "não habilitado" em vez de derrubar a tela.
+    apiRequest("/admin/whatsapp/embedded-signup/config").catch(() => null),
   ])
   state.channel = {
     companyId: state.config.companyId,
     language: response?.language_code || "pt_BR",
     templates: Array.isArray(response?.templates) ? response.templates : [],
     status,
+  }
+  state.whatsappSignupConfig = signupConfig
+  state.channelConfirm = null
+  if (!state.whatsappSignup.busy && String(state.whatsappSignup.companyId || "") !== String(state.config.companyId)) {
+    state.whatsappSignup = createIdleWhatsappSignup()
+  }
+  if (signupConfig?.enabled && signupConfig.app_id && currentAdminRole() === "superadmin") {
+    // Pré-carga: o clique em "Conectar" precisa chamar FB.login na hora. Só
+    // para quem vê o botão: operador e visualizador não recebem o script da
+    // Meta (terceiro com acesso à página e `autoLogAppEvents`).
+    ensureFacebookSdk(signupConfig.app_id, signupConfig.graph_api_version)
   }
   if (state.channelContact && String(state.channelContact.companyId) !== String(state.config.companyId)) {
     state.channelContact = null
@@ -4787,29 +5499,403 @@ function renderChannelContact(contact, canOperate) {
   `
 }
 
+// --- Conexão do número pelo Embedded Signup da Meta (P08) --------------------
+//
+// O popup da Meta devolve os identificadores por `postMessage` (evento
+// WA_EMBEDDED_SIGNUP) e o `code` de troca pelo callback de `FB.login`. O
+// `code` vai só para o servidor, que o troca pelo token de negócio da empresa
+// e o guarda cifrado; o painel nunca vê nem registra token ou PIN.
+
+const EMBEDDED_SIGNUP_ORIGINS = new Set(["https://www.facebook.com", "https://web.facebook.com"])
+const EMBEDDED_SIGNUP_FINISH_EVENTS = new Set(["FINISH", "FINISH_ONLY_WABA", "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING"])
+const FACEBOOK_SDK_SCRIPT_ID = "facebook-jssdk"
+const WHATSAPP_QUALITY_LABELS = {
+  GREEN: "Verde (boa)",
+  YELLOW: "Amarela (atenção)",
+  RED: "Vermelha (restrita)",
+  UNKNOWN: "Sem avaliação",
+  NA: "Sem avaliação",
+}
+const WHATSAPP_SOURCE_LABELS = {
+  embedded_signup: "Conectado pelo painel",
+  embedded_signup_coexistence: "Conectado pelo painel · app WhatsApp Business no celular",
+  manual: "Vínculo manual com credenciais da instalação",
+}
+
+// Passos em que o popup da Meta está aberto ou acabou de fechar: o estado
+// pertence ao popup e não pode ser zerado por outra parte da tela.
+const WHATSAPP_SIGNUP_POPUP_STEPS = new Set(["popup", "finished"])
+
+function companyLabelById(companyId) {
+  const company = state.companies.find((item) => String(item.id) === String(companyId))
+  if (company) return company.name || company.slug || String(companyId)
+  const membership = (state.session?.memberships || []).find((item) => String(item.company_id) === String(companyId))
+  return membership?.company_name || membership?.company_slug || String(companyId)
+}
+
+function createIdleWhatsappSignup() {
+  return {
+    busy: false,
+    companyId: "",
+    step: "idle",
+    error: "",
+    coexistence: false,
+    phoneNumberId: "",
+    wabaId: "",
+    businessId: "",
+    event: "",
+  }
+}
+
+let _facebookSdkRequested = false
+
+// Injeta o SDK uma única vez, em `document.head`: `#platform-root` é
+// reescrito a cada render e perderia a tag. Pré-carregado quando a tela
+// Canal abre com a conexão habilitada, para o clique chamar `FB.login` de
+// forma síncrona (bloqueador de popup) sem esperar download.
+function ensureFacebookSdk(appId, version) {
+  if (_facebookSdkRequested || !appId) return
+  _facebookSdkRequested = true
+  window.fbAsyncInit = function fbAsyncInit() {
+    if (!window.FB) return
+    window.FB.init({
+      appId: String(appId),
+      autoLogAppEvents: true,
+      xfbml: true,
+      version: String(version || "v23.0"),
+    })
+  }
+  if (document.getElementById(FACEBOOK_SDK_SCRIPT_ID)) return
+  const script = document.createElement("script")
+  script.id = FACEBOOK_SDK_SCRIPT_ID
+  script.src = "https://connect.facebook.net/pt_BR/sdk.js"
+  script.async = true
+  script.defer = true
+  script.crossOrigin = "anonymous"
+  // Bloqueador de anúncios ou sem rede: libera uma nova tentativa no próximo
+  // clique em "Conectar", em vez de exigir F5.
+  script.onerror = () => {
+    _facebookSdkRequested = false
+    script.remove()
+  }
+  document.head.appendChild(script)
+}
+
+function handleEmbeddedSignupMessage(event) {
+  if (!EMBEDDED_SIGNUP_ORIGINS.has(event.origin)) return
+  let data = null
+  try {
+    data = typeof event.data === "string" ? JSON.parse(event.data) : event.data
+  } catch {
+    return
+  }
+  if (!data || typeof data !== "object" || data.type !== "WA_EMBEDDED_SIGNUP") return
+  const payload = data.data && typeof data.data === "object" ? data.data : {}
+  const eventName = String(data.event || "")
+  if (EMBEDDED_SIGNUP_FINISH_EVENTS.has(eventName)) {
+    // Os ids chegam antes do `code`; ficam guardados até o callback do login.
+    // Só valem para um popup que esta tela abriu e ainda não cancelou.
+    if (!WHATSAPP_SIGNUP_POPUP_STEPS.has(state.whatsappSignup.step)) return
+    state.whatsappSignup = {
+      ...state.whatsappSignup,
+      step: "finished",
+      phoneNumberId: String(payload.phone_number_id || ""),
+      wabaId: String(payload.waba_id || ""),
+      businessId: String(payload.business_id || ""),
+      event: eventName,
+    }
+    return
+  }
+  if (eventName === "CANCEL") {
+    state.whatsappSignup = { ...state.whatsappSignup, busy: false, step: "cancelled" }
+    pushToast(`Conexão cancelada (passo ${payload.current_step || "não informado"}).`, "error")
+    return
+  }
+  if (eventName === "ERROR") {
+    const message = String(payload.error_message || "sem detalhes")
+    state.whatsappSignup = { ...state.whatsappSignup, busy: false, step: "error", error: message }
+    pushToast(`A Meta informou um erro: ${message}`, "error")
+  }
+}
+
+// Registrado uma vez, fora de qualquer render: sobrevive ao innerHTML e não
+// se duplica.
+window.addEventListener("message", handleEmbeddedSignupMessage)
+
+// Síncrona de propósito: `FB.login` precisa rodar dentro do gesto do clique,
+// senão o navegador bloqueia o popup.
+function startWhatsappSignup(coexistence) {
+  if (!state.config.companyId) {
+    pushToast("Selecione a empresa antes de conectar o WhatsApp.", "error")
+    return
+  }
+  const config = state.whatsappSignupConfig
+  if (!config?.enabled || !config.config_id) {
+    pushToast("A conexão pelo painel não está habilitada nesta instalação.", "error")
+    return
+  }
+  if (state.whatsappSignup.busy) return
+  if (!window.FB || typeof window.FB.login !== "function") {
+    ensureFacebookSdk(config.app_id, config.graph_api_version)
+    pushToast("O componente da Meta ainda não carregou; verifique bloqueador de anúncios e tente de novo (ou atualize a página).", "error")
+    return
+  }
+  // Ocupado desde a abertura do popup: a troca de empresa e o `loadChannelData`
+  // só zeram o estado quando não está ocupado, então a empresa para a qual o
+  // popup abriu fica guardada até o `code` chegar; e um segundo clique não
+  // abre um segundo popup.
+  state.whatsappSignup = {
+    ...createIdleWhatsappSignup(),
+    companyId: String(state.config.companyId),
+    busy: true,
+    step: "popup",
+    coexistence: Boolean(coexistence),
+  }
+  state.channelConfirm = null
+  window.FB.login(
+    (response) => {
+      void finishWhatsappSignup(response)
+    },
+    {
+      config_id: String(config.config_id),
+      response_type: "code",
+      override_default_response_type: true,
+      extras: {
+        setup: {},
+        featureType: coexistence ? "whatsapp_business_app_onboarding" : "",
+        sessionInfoVersion: "3",
+      },
+    }
+  )
+  // Depois do `FB.login` (o popup já abriu dentro do gesto): desabilita os botões.
+  renderApp()
+}
+
+// Saída para um popup que nunca responde (bloqueado pelo navegador, aba da
+// Meta fechada de outro jeito): sem isso a tela ficaria ocupada até um F5.
+// Um `code` que chegue depois é descartado por `whatsappSignupCompanyForCode`.
+function cancelWhatsappSignup() {
+  if (!WHATSAPP_SIGNUP_POPUP_STEPS.has(state.whatsappSignup.step)) return
+  state.whatsappSignup = createIdleWhatsappSignup()
+  pushToast("Conexão do WhatsApp cancelada. Feche a janela da Meta se ela ainda estiver aberta.", "error")
+  renderApp()
+}
+
+// Empresa para a qual o `code` vale: a registrada quando o popup abriu. Sem
+// ela (estado zerado por cancelamento) o código é descartado, nunca aplicado
+// à empresa selecionada agora — o número seria ligado ao tenant errado.
+function whatsappSignupCompanyForCode(signup) {
+  if (!signup || !WHATSAPP_SIGNUP_POPUP_STEPS.has(String(signup.step || ""))) return ""
+  return String(signup.companyId || "")
+}
+
+async function finishWhatsappSignup(response) {
+  const signup = state.whatsappSignup
+  const code = response?.authResponse?.code
+  if (!code) {
+    // Popup fechado sem concluir: CANCEL/ERROR já avisaram pelo postMessage.
+    if (!["cancelled", "error", "idle"].includes(signup.step)) {
+      pushToast("A Meta não devolveu a autorização; tente conectar de novo.", "error")
+    }
+    state.whatsappSignup = { ...signup, busy: false, step: "idle" }
+    renderApp()
+    return
+  }
+  const companyId = whatsappSignupCompanyForCode(signup)
+  if (!companyId) {
+    state.whatsappSignup = createIdleWhatsappSignup()
+    pushToast("A conexão foi cancelada antes de a Meta responder; abra a tela Canal da empresa certa e tente de novo.", "error")
+    renderApp()
+    return
+  }
+  state.whatsappSignup = { ...signup, companyId, busy: true, step: "completing", error: "" }
+  renderApp()
+  try {
+    const status = await apiRequest("/admin/whatsapp/embedded-signup/complete", {
+      method: "POST",
+      params: { company_id: companyId },
+      body: {
+        code,
+        phone_number_id: signup.phoneNumberId || null,
+        waba_id: signup.wabaId || null,
+        business_id: signup.businessId || null,
+        event: signup.event || null,
+        coexistence: Boolean(signup.coexistence),
+      },
+    })
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, step: "done" }
+    state.whatsappConnectionTest = null
+    const label = [status?.verified_name, status?.display_phone_number].filter(Boolean).join(" ")
+    if (String(state.config.companyId) === companyId) {
+      pushToast(label ? `WhatsApp conectado: ${label}` : "WhatsApp conectado.")
+      await loadChannelData().catch((error) => pushToast(summarizeError(error), "error"))
+    } else {
+      // A empresa selecionada mudou enquanto o popup estava aberto: o número
+      // foi ligado à empresa de origem, e a tela precisa dizer qual.
+      pushToast(`WhatsApp conectado${label ? `: ${label}` : ""} na empresa ${companyLabelById(companyId)}.`)
+    }
+  } catch (error) {
+    const message = summarizeError(error)
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, step: "failed", error: message }
+    pushToast(message, "error")
+  } finally {
+    renderApp()
+  }
+}
+
+async function disconnectWhatsapp() {
+  if (state.whatsappSignup.busy || !state.config.companyId) return
+  const companyId = String(state.config.companyId)
+  state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, busy: true, step: "disconnecting" }
+  state.channelConfirm = null
+  renderApp()
+  try {
+    await apiRequest("/admin/whatsapp/embedded-signup/disconnect", {
+      method: "POST",
+      params: { company_id: companyId },
+    })
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId }
+    state.whatsappConnectionTest = null
+    pushToast("WhatsApp desconectado. O bot deixa de enviar e receber por este número.")
+    await loadChannelData().catch((error) => pushToast(summarizeError(error), "error"))
+  } catch (error) {
+    const message = summarizeError(error)
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, step: "failed", error: message }
+    pushToast(message, "error")
+  } finally {
+    renderApp()
+  }
+}
+
+function renderWhatsappSignupDisabled(config) {
+  const reason =
+    config?.reason ||
+    (config === null
+      ? "O servidor não expôs a configuração da conexão pelo painel; confira se a versão instalada inclui o Embedded Signup."
+      : "")
+  return `
+    <div class="connection-notice" data-whatsapp-signup-disabled>
+      <strong>Conexão pelo painel ainda não habilitada nesta instalação</strong>
+      ${reason ? `<span class="subtle">${escapeHtml(reason)}</span>` : ""}
+      <span class="subtle">O administrador da instalação precisa definir <code>META_APP_ID</code>, <code>META_EMBEDDED_SIGNUP_CONFIG_ID</code>, <code>WHATSAPP_APP_SECRET</code> e <code>CREDENTIALS_ENCRYPTION_KEY</code> no servidor.</span>
+    </div>
+  `
+}
+
+function renderWhatsappConnectActions(signup, label) {
+  const busy = signup.busy ? "disabled" : ""
+  const waitingPopup = WHATSAPP_SIGNUP_POPUP_STEPS.has(signup.step)
+  const busyLabel = waitingPopup ? "Aguardando a janela da Meta…" : "Conectando…"
+  return `
+    <div class="hero-actions">
+      <button class="button" type="button" data-connect-whatsapp ${busy}>${signup.busy ? busyLabel : escapeHtml(label)}</button>
+      <button class="button-ghost" type="button" data-connect-whatsapp-coexistence ${busy}>Já uso o app WhatsApp Business no celular</button>
+      ${waitingPopup ? '<button class="button-ghost" type="button" data-whatsapp-signup-cancel>Cancelar</button>' : ""}
+    </div>
+    <p class="subtle">Abre o login da Meta em uma janela; use a conta do Facebook que administra o negócio. O código de autorização vai direto para o servidor.</p>
+  `
+}
+
+function renderWhatsappConnectedCard(status) {
+  const binding = status.binding || {}
+  const quality = String(status.quality_rating || "").toUpperCase()
+  const facts = [
+    ["Nome verificado", status.verified_name || "—"],
+    ["Número", status.display_phone_number || binding.display_phone_number || "—"],
+    ["Conta WhatsApp Business (WABA)", status.waba_id_masked || "—"],
+    ["Identificador do número", binding.phone_number_id || "—"],
+    ["Conectado em", formatDateTime(status.connected_at || binding.created_at)],
+    ["Qualidade do número", labelFor(WHATSAPP_QUALITY_LABELS, quality, status.quality_rating || "Sem avaliação")],
+  ]
+  return `
+    <div class="ops-list">
+      <div class="ops-alert" data-channel-binding="${escapeHtml(String(binding.id ?? ""))}">
+        <div class="channel-purpose-copy">
+          <strong>${escapeHtml(status.verified_name || status.display_phone_number || "WhatsApp")}</strong>
+          <span class="subtle">${escapeHtml(labelFor(WHATSAPP_SOURCE_LABELS, status.connection_source, "Conectado pelo painel"))}</span>
+        </div>
+        <span class="tag ${status.needs_reconnection ? "tag-danger" : "tag-success"}">${status.needs_reconnection ? "Precisa reconectar" : "Conectado"}</span>
+      </div>
+      ${
+        status.needs_reconnection
+          ? '<div class="ops-alert connection-warning" data-whatsapp-needs-reconnection><span>A Meta recusou o token deste número. Reconecte pelo painel para voltar a enviar e receber.</span></div>'
+          : ""
+      }
+      <dl class="connection-facts">
+        ${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join("")}
+      </dl>
+    </div>
+  `
+}
+
+// Desconectar em duas etapas (padrão de `state.policyConfirm`): o botão vira
+// confirmação explícita antes de chamar o servidor.
+function renderWhatsappDisconnectActions(isCompanyAdmin) {
+  if (!isCompanyAdmin) return ""
+  const signup = state.whatsappSignup
+  const busy = signup.busy ? "disabled" : ""
+  if (state.channelConfirm === "disconnect") {
+    return `
+      <button class="button-danger" type="button" data-disconnect-whatsapp-confirm ${busy}>Confirmar: desconectar o número</button>
+      <button class="button-ghost" type="button" data-channel-cancel ${busy}>Cancelar</button>
+      <p class="ops-confirm-note">O bot para de enviar e receber por este número até alguém reconectar. O número continua na sua conta da Meta.</p>
+    `
+  }
+  return `<button class="button-ghost" type="button" data-disconnect-whatsapp ${busy}>${signup.busy && signup.step === "disconnecting" ? "Desconectando…" : "Desconectar"}</button>`
+}
+
 function renderChannelBindingStatus(status) {
   if (status === null) {
     return '<p class="subtle">Não foi possível carregar o vínculo do número agora.</p>'
   }
-  if (!status?.binding) {
+  const config = state.whatsappSignupConfig
+  const signupEnabled = Boolean(config?.enabled)
+  const isCompanyAdmin = currentAdminRole() === "superadmin"
+  const signup = state.whatsappSignup
+  const signupError =
+    signup.step === "failed" && String(signup.companyId) === String(state.config.companyId) ? signup.error : ""
+  const errorBlock = signupError ? `<p class="policy-error" data-whatsapp-signup-error>${escapeHtml(signupError)}</p>` : ""
+  // Conectar quando não dá para enviar; reconectar quando a Meta recusou o token.
+  const offerConnect = !status.can_send || Boolean(status.needs_reconnection)
+  const connectActions =
+    isCompanyAdmin && offerConnect && signupEnabled
+      ? renderWhatsappConnectActions(signup, status.has_company_token || status.needs_reconnection ? "Reconectar WhatsApp" : "Conectar WhatsApp")
+      : ""
+  const disabledNotice = !status.has_company_token && !signupEnabled ? renderWhatsappSignupDisabled(config) : ""
+
+  if (!status.binding) {
+    const guidance = signupEnabled
+      ? isCompanyAdmin
+        ? " Conecte pelo botão abaixo com o login do Facebook do negócio."
+        : " Um administrador da empresa conecta o número pelo painel."
+      : ""
     return `
       <div class="empty-state" data-channel-binding-empty>
-        ${escapeHtml(status?.details || "Nenhum número vinculado: mensagens recebidas no WhatsApp não chegam a esta empresa.")}
-        O vínculo é feito por um administrador com o identificador do número na Meta.
+        ${escapeHtml(status.details || "Nenhum número conectado: mensagens recebidas no WhatsApp não chegam a esta empresa.")}${escapeHtml(guidance)}
       </div>
+      ${disabledNotice}
+      ${connectActions}
+      ${errorBlock}
     `
   }
+  if (status.has_company_token) {
+    return `${renderWhatsappConnectedCard(status)}${connectActions}${errorBlock}`
+  }
+  // Vínculo legado: identificador cadastrado à mão, credenciais da instalação.
   const binding = status.binding
   return `
     <div class="ops-list">
       <div class="ops-alert" data-channel-binding="${escapeHtml(String(binding.id))}">
         <div class="channel-purpose-copy">
           <strong>${escapeHtml(binding.display_phone_number || "WhatsApp")}</strong>
-          <span class="subtle">Identificador canônico ${escapeHtml(binding.phone_number_id || "—")} · desde ${escapeHtml(formatDateTime(binding.created_at))}</span>
+          <span class="subtle">Identificador canônico ${escapeHtml(binding.phone_number_id || "—")} · desde ${escapeHtml(formatDateTime(binding.created_at))} · ${escapeHtml(labelFor(WHATSAPP_SOURCE_LABELS, status.connection_source, WHATSAPP_SOURCE_LABELS.manual))}</span>
         </div>
         <span class="tag ${binding.active ? "tag-success" : "tag-danger"}">${binding.active ? "Ativo" : "Inativo"}</span>
       </div>
     </div>
+    ${disabledNotice}
+    ${connectActions}
+    ${errorBlock}
   `
 }
 
@@ -4865,13 +5951,16 @@ function renderChannelView() {
     <section class="hero">
       <span class="brand-eyebrow">Canal WhatsApp · ${escapeHtml(company.name)}</span>
       <h2 class="hero-title">${
-        missingInUse.length
-          ? "Há mensagens que não vão sair depois de 24 h sem o cliente escrever."
-          : "Lembretes e ofertas de vaga têm template aprovado."
+        status && status.can_send === false
+          ? "Conecte o número do WhatsApp para o bot enviar e receber mensagens."
+          : missingInUse.length
+            ? "Há mensagens que não vão sair depois de 24 h sem o cliente escrever."
+            : "Lembretes e ofertas de vaga têm template aprovado."
       }</h2>
       <p class="hero-copy">
-        Depois de 24 h sem mensagem do cliente, o WhatsApp só entrega template aprovado pela Meta.
-        Cadastre aqui o nome e o idioma exatamente como aprovados no WhatsApp Manager — este painel não envia template para aprovação.
+        Conecte o número da empresa com o login do Facebook do negócio; as credenciais ficam guardadas cifradas no servidor.
+        Depois de 24 h sem mensagem do cliente, o WhatsApp só entrega template aprovado pela Meta: cadastre aqui o nome e o idioma
+        exatamente como aprovados no WhatsApp Manager — este painel não envia template para aprovação.
       </p>
       <div class="hero-actions">
         <span class="tag">Idioma da política: ${escapeHtml(channel.language)}</span>
@@ -4891,8 +5980,9 @@ function renderChannelView() {
       ${renderChannelBindingStatus(status)}
       ${status ? `<p class="subtle">${escapeHtml(status.details || "")}</p>` : ""}
       <div class="hero-actions">
-        ${isCompanyAdmin ? `<button class="button-ghost" type="button" data-test-whatsapp-connection ${testing ? "disabled" : ""}>${testing ? "Testando…" : "Testar conexão com a Meta"}</button>` : ""}
+        ${isCompanyAdmin ? `<button class="button-ghost" type="button" data-test-whatsapp-connection ${testing || state.whatsappSignup.busy ? "disabled" : ""}>${testing ? "Testando…" : "Testar conexão com a Meta"}</button>` : ""}
         ${test ? `<span class="tag ${test.connected ? "tag-success" : "tag-danger"}">${escapeHtml(test.connected ? "Conexão confirmada" : "Falha na conexão")}</span>` : ""}
+        ${status?.has_company_token ? renderWhatsappDisconnectActions(isCompanyAdmin) : ""}
       </div>
       ${test ? `<p class="subtle">${escapeHtml(test.details || "Diagnóstico concluído.")} Verificado em ${escapeHtml(formatDateTime(test.checked_at))}.</p>` : ""}
     </section>
@@ -5049,7 +6139,7 @@ function renderCurrentView() {
   if (state.view === "training") return renderTrainingView()
   if (state.view === "team") return renderTeamView()
   if (state.view === "billing") return renderBillingView()
-  if (state.view === "onboarding") return renderOnboardingView()
+  if (state.view === "onboarding") return renderOnboardingView() + renderServicesEditorCard()
   return ""
 }
 
@@ -5139,7 +6229,7 @@ function renderSettingsModal() {
             </div>
             <div class="field">
               <label>Slug da empresa</label>
-              <input name="companySlug" required pattern="[a-z0-9][a-z0-9-]{1,61}[a-z0-9]" placeholder="minha-empresa" />
+              <input name="companySlug" required pattern="[a-z0-9][a-z0-9\\-]{1,61}[a-z0-9]" placeholder="minha-empresa" />
             </div>
             <div class="field">
               <label>Senha</label>
@@ -5388,6 +6478,8 @@ function bindEvents() {
     })
   }
 
+  bindServicesEditorEvents()
+
   const wizardSubmit = document.getElementById("wizard-submit")
   if (wizardSubmit) {
     wizardSubmit.addEventListener("click", async () => {
@@ -5437,14 +6529,28 @@ function bindEvents() {
           })) : undefined,
         }
 
-        const result = await apiRequest("/admin/onboarding/setup", {
-          method: "POST",
-          body: payload,
-        })
+        const target = getWizardTargetCompany()
+        const result = target
+          ? await apiRequest("/admin/onboarding/configure", {
+              method: "POST",
+              params: { company_id: target.id },
+              body: payload,
+            })
+          : await apiRequest("/admin/onboarding/setup", {
+              method: "POST",
+              body: payload,
+            })
         state.onboardingWizard.result = result
         state.onboardingWizard.completed = true
-        pushToast("Empresa configurada com sucesso!")
+        pushToast(target ? "Configuração publicada. O bot já usa os novos dados." : "Empresa configurada com sucesso!")
         await loadCompanies()
+        if (target) {
+          // O simulador e o Flow Studio leem `state.companyContext`; sem
+          // invalidar, continuariam mostrando o contexto anterior à publicação.
+          state.companyContext = null
+          state.servicesEditor.dirty = false
+          await loadServicesEditor().catch(() => null)
+        }
       } catch (error) {
         pushToast(summarizeError(error), "error")
       } finally {
@@ -5936,9 +7042,17 @@ function bindEvents() {
       }
       persistConfig()
       state.companyContext = null
+      state.servicesEditor.dirty = false
+      state.servicesEditor.available = false
       state.trainingImportResult = null
       state.calendarConnectionTest = null
       state.whatsappConnectionTest = null
+      state.channelConfirm = null
+      state.calendarConfirm = null
+      state.googleCalendars = null
+      if (!state.whatsappSignup.busy) {
+        state.whatsappSignup = createIdleWhatsappSignup()
+      }
       await refreshCurrentView()
     })
   }
@@ -5985,7 +7099,7 @@ function bindStudioEvents() {
       persistStudioSessions()
 
       state.loading = true
-      state.loadingMessage = "Enviando mensagem para o runtime..."
+      state.loadingMessage = "O bot está pensando na resposta..."
       renderApp()
       try {
         const result = await apiRequest("/admin/simulator/messages", {
@@ -6018,7 +7132,7 @@ function bindStudioEvents() {
           pipeline_stage: result.pipeline_stage,
         }
         persistStudioSessions()
-        pushToast("Mensagem processada pelo runtime real.")
+        pushToast("O bot respondeu.")
       } catch (error) {
         pushToast(summarizeError(error), "error")
       } finally {
@@ -6092,12 +7206,11 @@ function bindStudioEvents() {
     newSessionForm.addEventListener("submit", (event) => {
       event.preventDefault()
       const label = String(state.studio.newSession.label || "").trim()
-      const contactId = String(state.studio.newSession.contactId || "").trim()
+      const typedContactId = String(state.studio.newSession.contactId || "").replace(/\D/g, "")
       const contactName = String(state.studio.newSession.contactName || "").trim()
-      if (!contactId) {
-        pushToast("Informe o contact_id para criar a sessão.", "error")
-        return
-      }
+      // Um telefone fictício basta para testar: o dono do negócio não deve
+      // precisar saber o que é um "contact id" para conversar com o bot.
+      const contactId = typedContactId || generateStudioContactId()
       const now = new Date().toISOString()
       const session = {
         id: window.crypto.randomUUID(),
@@ -7059,6 +8172,13 @@ root.addEventListener("click", async (e) => {
     return
   }
 
+  const navMore = e.target.closest("[data-nav-more]")
+  if (navMore) {
+    state.config.navMoreOpen = !isNavMoreOpen()
+    persistConfig()
+    renderApp()
+    return
+  }
   const jumpBtn = e.target.closest("[data-jump-view]")
   if (jumpBtn) {
     state.view = jumpBtn.dataset.jumpView
@@ -7071,6 +8191,60 @@ root.addEventListener("click", async (e) => {
   const refreshBtn = e.target.closest("[data-refresh-view]")
   if (refreshBtn) {
     await refreshCurrentView()
+    return
+  }
+
+  // Canal: conexão do número pela Meta. Fica antes de qualquer `await` para o
+  // `FB.login` acontecer ainda dentro do gesto do clique.
+  if (e.target.closest("[data-connect-whatsapp-coexistence]")) {
+    startWhatsappSignup(true)
+    return
+  }
+  if (e.target.closest("[data-connect-whatsapp]")) {
+    startWhatsappSignup(false)
+    return
+  }
+  if (e.target.closest("[data-disconnect-whatsapp]")) {
+    state.channelConfirm = "disconnect"
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-channel-cancel]")) {
+    state.channelConfirm = null
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-disconnect-whatsapp-confirm]")) {
+    await disconnectWhatsapp()
+    return
+  }
+  if (e.target.closest("[data-whatsapp-signup-cancel]")) {
+    cancelWhatsappSignup()
+    return
+  }
+
+  // Agenda: conexão da Google Agenda por OAuth.
+  if (e.target.closest("[data-connect-google]")) {
+    await startGoogleCalendarAuthorization()
+    return
+  }
+  if (e.target.closest("[data-disconnect-google]")) {
+    state.calendarConfirm = "disconnect"
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-calendar-cancel]")) {
+    state.calendarConfirm = null
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-disconnect-google-confirm]")) {
+    await disconnectGoogleCalendar()
+    return
+  }
+  if (e.target.closest("[data-google-calendars-refresh]")) {
+    scheduleGoogleCalendarsLoad(state.calendarProfile, { force: true })
+    renderApp()
     return
   }
 
@@ -7431,6 +8605,15 @@ function handleRealtimeEvent(event) {
   }
 }
 
+// Registrado uma vez: o <select> é recriado a cada render, então a escuta
+// fica no root (delegação), como o clique.
+root.addEventListener("change", (e) => {
+  const calendarSelect = e.target.closest("[data-google-calendar-select]")
+  if (calendarSelect) {
+    void selectGoogleCalendar(calendarSelect.value)
+  }
+})
+
 async function bootstrap() {
   renderApp()
   // Capacidades só ajustam o formulário de login: a falha delas não pode
@@ -7460,18 +8643,25 @@ async function bootstrap() {
     }
   }
 
+  // Lido antes da primeira carga: a volta do Google diz qual tela e empresa
+  // abrir, e o aviso só faz sentido depois que a tela mostrou a conexão.
+  const navigation = consumeUrlNavigation()
+
   if (!session) {
     state.settingsOpen = true
     renderApp()
+    notifyGoogleOAuthResult(navigation)
     return
   }
 
+  await applyUrlNavigation(navigation, session)
   await refreshCurrentView()
   state.settingsOpen = Boolean(
     state.authAction.invitationToken || state.authAction.passwordResetToken
   )
   connectSSE()
   renderApp()
+  notifyGoogleOAuthResult(navigation)
 }
 
 bootstrap()

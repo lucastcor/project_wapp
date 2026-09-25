@@ -1,0 +1,31 @@
+# Sobreposição de compose que coloca um Caddy com TLS automático na frente da
+# API. Use junto com o compose.yaml principal:
+#
+#   docker compose --env-file .env.production \
+#     -f compose.yaml -f deploy/compose.caddy.yaml up -d
+#
+# Requer WAPP_DOMAIN no .env (ex.: app.suaempresa.com.br apontando para o IP
+# do servidor). Combine com APP_PORT=127.0.0.1:8000, POSTGRES_PORT=127.0.0.1:5432
+# e ADMIN_PORT=127.0.0.1:8501 para que só o Caddy fique exposto à internet.
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: project_wapp_caddy
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      WAPP_DOMAIN: ${WAPP_DOMAIN:?defina WAPP_DOMAIN no .env}
+    volumes:
+      - ${PWD}/deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

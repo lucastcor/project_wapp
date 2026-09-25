@@ -1,6 +1,6 @@
 # Checkpoint compacto — fonte de continuidade
 
-Atualizado: 24/09/2026. Status: **G0 e G1 aceitos; P08/G2 em execução**.
+Atualizado: 25/09/2026. Status: **G0 e G1 aceitos; P08/G2 em execução; revisão de produto registrada**.
 
 ## Leia primeiro
 
@@ -77,6 +77,30 @@ O painel agora usa a fonte canônica, mascara identificadores e oferece probes s
 - Suíte SQLite após as correções: 1.870 passaram, 18 pulados; Ruff, mypy (164
   arquivos) e `git diff --check` limpos. Execução em Python 3.14.3; o gate de
   release em Python 3.13/PostgreSQL continua sendo o registrado em 14/09.
+
+### Delta local de 25/09/2026 — revisão de produto
+
+- Revisão completa do produto contra o objetivo comercial (bot vendável por
+  assinatura a pequenas empresas) e contra o mercado, com jornada do dono de
+  negócio percorrida no navegador: [REVISAO_PRODUTO_2026-09-25.md](REVISAO_PRODUTO_2026-09-25.md).
+  Contém veredito, comparação com concorrentes, roadmap P0/P1/P2, custo de
+  hospedagem e decisões pendentes do dono do produto.
+- Corrigidos: o wizard devolvia 403 ao dono da conta self-service e criaria uma
+  segunda empresa (novo `POST /admin/onboarding/configure`, tenant-scoped);
+  Billing respondia 500 com `STRIPE_PRICE_*` vazios; simulador com texto
+  deslocado e jargão; painel inicial sem caminho (cartão "Primeiros passos");
+  pattern do slug inválido no cadastro. Evidência em [P08](evidencias/P08.md).
+- Entregues em seguida (mesmo dia): conexão do WhatsApp por Embedded Signup
+  e da agenda Google por OAuth, ambas por empresa e pelo painel, com
+  credenciais cifradas (migration 074; contrato em `CONTRATOS.md`; evidência
+  em [P08](evidencias/P08.md)); guia de implantação barata com Caddy e
+  checklists Meta/Google em [IMPLANTACAO.md](IMPLANTACAO.md) e o roteiro do app da
+  Meta como Tech Provider em [META_APP_TECH_PROVIDER.md](META_APP_TECH_PROVIDER.md)
+  (com cinco pendências de código listadas ao final: renovação do token de 60 dias,
+  Embedded Signup v4, `PARTNER_REMOVED`, `smb_message_echoes`, checklist pós-conexão). Também entregues: navegação em seis itens com grupo
+  "Mais", editor de serviços/preços/regras fora do wizard e nichos estética,
+  pet e aulas. Ainda abertas: Instagram, áudio, inbox ao vivo e preço. Integrações reais continuam pendentes de credenciais
+  (G3).
 
 Warnings conhecidos: três avisos de depreciação de TestClient/cookies. Não são falhas funcionais, mas devem ser tratados quando a pilha Starlette/httpx for atualizada.
 

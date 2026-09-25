@@ -12,6 +12,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from app.api.admin_routes import admin_router
 from app.api.automation_routes import automation_router
 from app.api.billing_routes import billing_router
+from app.api.google_calendar_routes import google_calendar_router
 from app.api.platform_admin_routes import platform_admin_router
 from app.api.platform_routes import (
     AUTOMATION_STUDIO_DIR,
@@ -19,6 +20,7 @@ from app.api.platform_routes import (
     platform_router,
 )
 from app.api.routes import router
+from app.api.whatsapp_signup_routes import whatsapp_signup_router
 from app.core.config import is_missing_or_placeholder, settings
 from app.core.logging import (
     clear_request_context,
@@ -151,12 +153,15 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
             clear_request_context()
             return response
 
+        # O retorno do OAuth traz o código de autorização e o state na query;
+        # nenhum dos dois pode parar no log.
+        loggable_query = None if request.url.path.startswith("/platform/integrations/") else (str(request.url.query) or None)
         log_event(
             logger,
             logging.INFO,
             "http.request.started",
             client_ip=client_ip,
-            query_string=str(request.url.query) or None,
+            query_string=loggable_query,
         )
 
         try:
@@ -177,6 +182,9 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # O SDK da Meta (Embedded Signup do WhatsApp) é o único script externo
+        # permitido: ele abre o popup de conexão e conversa com facebook.com
+        # via XHR e iframe. Tudo o mais continua restrito à própria origem.
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
             "base-uri 'self'; "
@@ -185,8 +193,10 @@ class RequestObservabilityMiddleware(BaseHTTPMiddleware):
             "img-src 'self' data:; "
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
             "font-src 'self' https://fonts.gstatic.com; "
-            "script-src 'self'; "
-            "connect-src 'self'"
+            "script-src 'self' https://connect.facebook.net; "
+            "connect-src 'self' https://www.facebook.com https://web.facebook.com "
+            "https://graph.facebook.com https://connect.facebook.net; "
+            "frame-src https://www.facebook.com https://web.facebook.com https://staticxx.facebook.com"
         )
         if settings.environment.strip().lower() == "production":
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
@@ -210,6 +220,8 @@ app.include_router(admin_router)
 app.include_router(automation_router)
 app.include_router(platform_admin_router)
 app.include_router(billing_router)
+app.include_router(whatsapp_signup_router)
+app.include_router(google_calendar_router)
 app.include_router(platform_router)
 app.mount("/platform/assets", StaticFiles(directory=str(PLATFORM_ASSETS_DIR)), name="platform-assets")
 

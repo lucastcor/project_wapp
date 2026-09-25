@@ -12,7 +12,7 @@ Este runbook consolida o minimo operacional para colocar o Project WAPP em produ
 4a. Definir `PII_PSEUDONYMIZATION_KEY`. Sem ela a aplicacao recusa subir em producao: um pseudonimo derivado so do valor e recuperavel por enumeracao, o que nao e pseudonimizacao.
 4b. Habilitar `INBOUND_WORKER_ENABLED=true` e o serviço `inbound-worker`. Para Qwen, configurar `CLASSIFICATION_PROVIDER=ollama`, modelo instalado e URL acessível aos containers (ver [guia local](local_qwen.md)).
 4c. Decidir sobre automacao. Sao dois interruptores, nao um: `AUTOMATION_ENGINE_ENABLED` habilita publicar e ativar fluxos; `AUTOMATION_WORKER_ENABLED` faz o servico `automation-worker` puxar trabalho da fila. Ambos nascem `false`.
-5. Configurar `OUTBOUND_PROVIDER=whatsapp`, `WHATSAPP_API_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_WEBHOOK_VERIFY_TOKEN` e `WHATSAPP_APP_SECRET`.
+5. Configurar `OUTBOUND_PROVIDER=whatsapp`, `WHATSAPP_WEBHOOK_VERIFY_TOKEN`, `WHATSAPP_APP_SECRET`, `META_APP_ID`, `META_EMBEDDED_SIGNUP_CONFIG_ID` e `CREDENTIALS_ENCRYPTION_KEY`; cada empresa conecta o próprio número pelo painel (Canal WhatsApp → Conectar WhatsApp). `WHATSAPP_API_TOKEN`/`WHATSAPP_PHONE_NUMBER_ID` só numa instalação antiga de número único. Para a agenda, `GOOGLE_CALENDAR_CLIENT_ID/SECRET` e o redirect `PLATFORM_PUBLIC_URL/platform/integrations/google/callback` registrado no Google Cloud. Roteiro completo, com VPS, Caddy e checklists Meta/Google, em [docs/piloto/IMPLANTACAO.md](piloto/IMPLANTACAO.md).
 6. Subir a stack endurecida:
    ```bash
    docker compose --env-file .env.production up --build -d
@@ -40,7 +40,7 @@ Conferir o estado antes de migrar:
 SELECT version FROM schema_migrations ORDER BY version;
 ```
 
-O release atual vai até `073_inbound_retry_schedule`. A 068 adiciona fila persistente de entrada e heartbeats; a 069, propostas/operações de agenda; a 070, recurso reservável e a guarda de banco contra agendamentos sobrepostos; a 071, janela de atendimento, opt-out, consentimento, templates e status de entrega do WhatsApp; a 072, posse humana da conversa; e a 073, espera persistente para retry da entrada.
+O release atual vai até `074_company_connection_credentials` (credenciais cifradas por empresa e `oauth_states`; ver `CONTRATOS.md`). A 068 adiciona fila persistente de entrada e heartbeats; a 069, propostas/operações de agenda; a 070, recurso reservável e a guarda de banco contra agendamentos sobrepostos; a 071, janela de atendimento, opt-out, consentimento, templates e status de entrega do WhatsApp; a 072, posse humana da conversa; e a 073, espera persistente para retry da entrada.
 
 Depois da 071, lembrete e oferta de encaixe fora da janela de 24 h so saem com template `utility` aprovado cadastrado para a empresa, finalidade e idioma (`whatsapp_templates`). Sem template, a mensagem vai para dead letter com `blocked:outside_window_no_template` — cadastrar os templates aprovados na Meta antes de ligar lembretes em producao. A migration 067 falha **de proposito** se encontrar linha orfa — uma linha apontando para empresa inexistente — nomeando a tabela. Resolver as orfas antes de repetir.
 

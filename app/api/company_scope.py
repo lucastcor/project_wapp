@@ -74,6 +74,10 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     ("/admin/billing/plans", frozenset({"GET"}), POLICY_UNSCOPED),
     ("/admin/onboarding/presets", frozenset({"GET"}), POLICY_UNSCOPED),
     ("/admin/calendar/providers", frozenset({"GET"}), POLICY_UNSCOPED),
+    # Configuração de conexão da instalação (ids públicos do app da Meta e
+    # do projeto Google): igual para todo tenant e sem segredo.
+    ("/admin/whatsapp/embedded-signup/config", frozenset({"GET"}), POLICY_UNSCOPED),
+    ("/admin/calendar/google/config", frozenset({"GET"}), POLICY_UNSCOPED),
     # Taxonomia e pacotes verticais são vocabulário do produto, idênticos
     # para todo tenant: é o que o editor usa para desenhar formulários.
     ("/admin/taxonomy", frozenset({"GET"}), POLICY_UNSCOPED),

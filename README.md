@@ -445,16 +445,15 @@ As variaveis internas que voce mesmo controla sao:
 
 As variaveis externas, que precisam vir do provedor real, sao:
 - `OPENAI_API_KEY`
-- `GOOGLE_CALENDAR_CLIENT_ID`
-- `GOOGLE_CALENDAR_CLIENT_SECRET`
-- `GOOGLE_CALENDAR_REFRESH_TOKEN`
-- `WHATSAPP_API_TOKEN`
-- `WHATSAPP_PHONE_NUMBER_ID`
-- `WHATSAPP_WEBHOOK_VERIFY_TOKEN`
-- `WHATSAPP_APP_SECRET`
+- `GOOGLE_CALENDAR_CLIENT_ID` e `GOOGLE_CALENDAR_CLIENT_SECRET` (projeto Google Cloud da instalação; cada empresa conecta a própria agenda pelo painel)
+- `META_APP_ID`, `META_EMBEDDED_SIGNUP_CONFIG_ID`, `WHATSAPP_APP_SECRET` e `WHATSAPP_WEBHOOK_VERIFY_TOKEN` (app da Meta da instalação; cada empresa conecta o próprio número pelo painel)
+- `CREDENTIALS_ENCRYPTION_KEY` (chave Fernet gerada por você; cifra os tokens por empresa)
+- `WHATSAPP_API_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` e `GOOGLE_CALENDAR_REFRESH_TOKEN` só numa instalação antiga de número/agenda únicos
 - `STRIPE_SECRET_KEY`
 - `STRIPE_WEBHOOK_SECRET`
 - `RESEND_API_KEY`
+
+Roteiro de implantação em servidor barato, com HTTPS e os checklists da Meta e do Google: [`docs/piloto/IMPLANTACAO.md`](docs/piloto/IMPLANTACAO.md).
 
 ## Como rodar localmente
 ### 1. Criar e ativar ambiente virtual
@@ -588,12 +587,14 @@ Com a API no ar, abra:
 http://127.0.0.1:8000/platform
 ```
 
-A nova interface dedicada entrega:
-- `Control Tower` com readiness, onboarding e observabilidade;
-- `Bot Studio` para testar cliente, operador, cancelamento e reagendamento antes do go-live;
-- `Flow Studio` para editar playbooks conversacionais em canvas visual e cadastrar respostas aprovadas;
-- `Agenda Console` para monitorar disponibilidade, bookings, timeline semanal, reagendamentos, cancelamentos e fila;
-- `Training Ops` para importar base histórica/CRM, revisar preview e disparar fine-tuning.
+A interface dedicada tem seis itens principais e um grupo "Mais":
+- `Início` com primeiros passos, readiness e visão geral;
+- `Configuração` com o assistente de cinco passos e o editor de serviços, preços, tom e regras do bot;
+- `Testar o bot` para conversar como cliente ou operador antes de ir ao ar;
+- `Atendimento` com revisões, conversas assumidas pela equipe e falhas de envio;
+- `Agenda` com calendário, reservas, fila de encaixe e conexão do Google Agenda por OAuth;
+- `WhatsApp` com a conexão do número por Embedded Signup da Meta e os templates aprovados;
+- em "Mais": Análises, Fluxos de conversa, Automações, Mensagens e regras, Contatos, Treinamento, Equipe e Plano.
 
 A plataforma agora autentica por sessao propria. O token administrativo deixa de ser usado como credencial permanente no navegador e passa a servir apenas para emissao de cookie HTTP-only da sessao web.
 

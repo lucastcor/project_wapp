@@ -21,6 +21,7 @@ from app.api.schemas import (
 )
 from app.core.config import settings
 from app.core.logging import get_logger, log_event
+from app.services.google_calendar_oauth_service import complete_callback as complete_google_calendar_callback
 from app.services.identity_service import (
     IdentityAuthorizationError,
     IdentityConflictError,
@@ -423,6 +424,31 @@ def confirm_platform_password_reset(payload: PasswordResetConfirmPayload) -> dic
     except IdentityError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"updated": True}
+
+
+@platform_router.get("/platform/integrations/google/callback")
+def google_calendar_oauth_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    """Retorno do consentimento do Google (navegação de topo, sem CSRF).
+
+    O navegador chega aqui com o cookie de sessão e nada mais: a empresa vem
+    do `state` gravado no início do fluxo, e a sessão precisa ser a mesma que
+    o iniciou. Toda saída é um redirect para o painel — sucesso ou erro em
+    código — para que a resposta nunca renderize dado do Google.
+    """
+    try:
+        session = require_platform_session(request)
+    except HTTPException:
+        return RedirectResponse(
+            url="/platform?view=agenda&google=error&reason=session_required",
+            status_code=303,
+        )
+    result = complete_google_calendar_callback(code=code, state=state, error=error, session=session)
+    return RedirectResponse(url=str(result["redirect_to"]), status_code=303)
 
 
 @platform_router.get("/platform/events")

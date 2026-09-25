@@ -7,6 +7,12 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.config import is_missing_or_placeholder, settings
+from app.core.credential_vault import (
+    CredentialVaultError,
+    decrypt_secret,
+    encrypt_secret,
+    is_encrypted,
+)
 from app.core.logging import get_logger, log_event
 from app.services.automation_trigger_service import emit_appointment_booked
 from app.services.billing_service import (
@@ -26,6 +32,7 @@ from app.services.company_policy_service import (
     resolve_effective_policy,
 )
 from app.services.reminder_service import schedule_booking_customer_reminders
+from app.storage import google_oauth_repository
 from app.storage.migrations_booking_capacity import (
     BookingCapacityConflictError,
     BookingResourceUnavailableError,
@@ -33,6 +40,12 @@ from app.storage.migrations_booking_capacity import (
 from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
+# Chaves de `config` que guardam credencial e vão cifradas para o banco
+# (`enc:v1:...`). A integração interna decifra ao resolver; a pública só
+# informa `*_present`.
+_ENCRYPTED_CONFIG_KEYS = ("refresh_token", "client_secret", "password")
+# Colunas de conexão (migration 074) que o painel mostra inteiras.
+_CONNECTION_METADATA_KEYS = ("connection_source", "connected_account_email", "connected_at", "connected_by")
 logger = get_logger(__name__)
 # Quem pede a mudança (A08): cliente e automação só seguem com `allowed`; o
 # operador é o humano que a política exige, então segue com `requires_human`.
@@ -484,9 +497,72 @@ def _default_provider_config(provider: str) -> dict[str, Any]:
     return {}
 
 
-def _resolve_calendar_integration(company_id: int | None = None) -> dict[str, Any]:
+def _attach_connection_metadata(
+    integration: dict[str, Any],
+    metadata: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Junta as colunas de conexão (074) que o `RuntimeRepository` não seleciona."""
+    integration_id = integration.get("id")
+    if integration_id is None:
+        return integration
+    if metadata is None:
+        company_id = integration.get("company_id")
+        metadata = google_oauth_repository.get_connection_metadata(
+            int(company_id) if company_id is not None else None
+        )
+    row = metadata.get(int(integration_id)) or {}
+    for key in _CONNECTION_METADATA_KEYS:
+        integration.setdefault(key, row.get(key))
+    return integration
+
+
+def _encrypt_config_secrets(config: dict[str, Any] | None) -> dict[str, Any]:
+    """Cifra as credenciais do `config` antes de gravar; valor já cifrado passa."""
+    result = dict(config or {})
+    for key in _ENCRYPTED_CONFIG_KEYS:
+        value = result.get(key)
+        if value is None or isinstance(value, bool) or is_encrypted(str(value)):
+            continue
+        text = str(value)
+        if not text.strip():
+            continue
+        try:
+            result[key] = encrypt_secret(text)
+        except CredentialVaultError as exc:
+            raise CalendarProviderError(
+                "O servidor não está configurado para guardar credenciais "
+                "(CREDENTIALS_ENCRYPTION_KEY); avise o administrador da instalação."
+            ) from exc
+    return result
+
+
+def _decrypt_config_secrets(config: dict[str, Any]) -> dict[str, Any]:
+    """Devolve o `config` com as credenciais em claro para o provider.
+
+    Linha legada com valor em claro segue como está. Cofre indisponível (chave
+    trocada, valor adulterado) vira erro que orienta a reconectar: sem a
+    credencial o provider não teria como falar com a agenda de qualquer modo.
+    """
+    result = dict(config)
+    for key in _ENCRYPTED_CONFIG_KEYS:
+        value = result.get(key)
+        if value is None or not is_encrypted(str(value)):
+            continue
+        try:
+            result[key] = decrypt_secret(str(value))
+        except CredentialVaultError as exc:
+            raise CalendarProviderError(
+                "Não foi possível ler a credencial guardada da agenda externa; "
+                "reconecte a agenda pelo painel."
+            ) from exc
+    return result
+
+
+def _load_calendar_integration(company_id: int | None = None) -> dict[str, Any]:
+    """Integração ativa como está no banco (config ainda cifrado), ou a do ambiente."""
     integration = repository.get_active_calendar_integration(company_id=company_id)
     if integration:
+        _attach_connection_metadata(integration)
         config = integration.get("config") or {}
         return {
             "integration_id": integration.get("id"),
@@ -496,6 +572,7 @@ def _resolve_calendar_integration(company_id: int | None = None) -> dict[str, An
             "config": config,
             "active": bool(integration.get("active")),
             "source": "database",
+            **{key: integration.get(key) for key in _CONNECTION_METADATA_KEYS},
         }
 
     provider = settings.calendar_provider.strip().lower() or "mock"
@@ -508,6 +585,13 @@ def _resolve_calendar_integration(company_id: int | None = None) -> dict[str, An
         "active": True,
         "source": "environment",
     }
+
+
+def _resolve_calendar_integration(company_id: int | None = None) -> dict[str, Any]:
+    """Integração interna, com as credenciais decifradas para o provider."""
+    integration = _load_calendar_integration(company_id=company_id)
+    integration["config"] = _decrypt_config_secrets(integration.get("config") or {})
+    return integration
 
 
 def _get_local_busy_intervals(
@@ -1170,6 +1254,9 @@ def list_supported_calendar_providers() -> list[dict[str, Any]]:
 
 # Chaves de configuração que podem aparecer inteiras no painel.
 _DISPLAY_CONFIG_KEYS = frozenset({"calendar_name"})
+# Apelido fixo do Google para o calendário da conta: não é identificador nem
+# e-mail, então sai inteiro e o painel consegue dizer "Calendário principal".
+_PRIMARY_CALENDAR_ID = "primary"
 
 
 def _mask_config_value(value: str) -> str:
@@ -1181,7 +1268,9 @@ def public_calendar_integration(integration: dict[str, Any]) -> dict[str, Any]:
 
     `config` guarda `client_secret`, `refresh_token` e senha CalDAV. Quem precisa
     do valor completo são os providers, que usam a integração interna; o painel
-    só precisa saber se cada credencial existe.
+    só precisa saber se cada credencial existe. As colunas de conexão
+    (`connection_source`, `connected_account_email`, `connected_at`,
+    `connected_by`) saem inteiras: é o que o dono quer ver na tela Agenda.
     """
     from app.tools.portability_security import is_sensitive_key
 
@@ -1194,21 +1283,28 @@ def public_calendar_integration(integration: dict[str, Any]) -> dict[str, Any]:
             safe_config[name] = value
         elif is_sensitive_key(name):
             safe_config[f"{name}_present"] = bool(value)
-        elif name in _DISPLAY_CONFIG_KEYS:
+        elif name in _DISPLAY_CONFIG_KEYS or (name == "calendar_id" and str(value) == _PRIMARY_CALENDAR_ID):
             safe_config[name] = value
         else:
             safe_config[name] = _mask_config_value(str(value))
     public["config"] = safe_config
-    if public.get("external_calendar_id"):
-        public["external_calendar_id"] = _mask_config_value(str(public["external_calendar_id"]))
+    external_id = public.get("external_calendar_id")
+    # Ids reais (podem ser e-mail) continuam mascarados; só o apelido passa.
+    if external_id and str(external_id) != _PRIMARY_CALENDAR_ID:
+        public["external_calendar_id"] = _mask_config_value(str(external_id))
     return public
 
 
 def get_calendar_profile(company_id: int | None = None) -> dict[str, Any]:
     company_context = _resolve_company_context(company_id)
-    integration = _resolve_calendar_integration(company_id=company_id)
-    provider = _get_provider(integration)
-    readiness = provider.readiness()
+    try:
+        integration = _resolve_calendar_integration(company_id=company_id)
+        readiness = _get_provider(integration).readiness()
+    except CalendarProviderError as exc:
+        # Cofre indisponível (chave trocada, por exemplo): a tela Agenda
+        # continua abrindo e mostra o motivo, em vez de cair num 500.
+        integration = _load_calendar_integration(company_id=company_id)
+        readiness = {"provider": integration.get("provider"), "ready": False, "details": str(exc)}
     return {
         # Leitura de viewer: nunca devolver a configuração com credenciais.
         "integration": public_calendar_integration(integration),
@@ -1225,7 +1321,22 @@ def check_calendar_connection(company_id: int | None = None) -> dict[str, Any]:
     This explicit operator action proves that credentials can reach the remote
     calendar without creating, changing, or deleting an event.
     """
-    integration = _resolve_calendar_integration(company_id=company_id)
+    try:
+        integration = _resolve_calendar_integration(company_id=company_id)
+    except CalendarProviderError as exc:
+        # Cofre sem a chave da credencial guardada (chave trocada, valor
+        # adulterado): "Testar conexão" é onde o dono procura o motivo, então
+        # devolve o diagnóstico com a orientação de reconectar, não um 500.
+        stored = _load_calendar_integration(company_id=company_id)
+        return {
+            "provider": str(stored.get("provider") or "mock"),
+            "configured": False,
+            "connected": False,
+            "mode": "external",
+            "checked_at": datetime.now(UTC).isoformat(),
+            "error_kind": "configuration",
+            "details": str(exc),
+        }
     provider = _get_provider(integration)
     readiness = provider.readiness()
     provider_name = str(readiness.get("provider") or integration.get("provider") or "mock")
@@ -2215,7 +2326,8 @@ def create_calendar_integration(
         company_id=company_id,
         provider=normalized_provider,
         external_calendar_id=external_calendar_id,
-        config=config,
+        # Credencial nunca chega ao banco em claro; a integração interna decifra.
+        config=_encrypt_config_secrets(config),
         active=active,
     )
     integration = repository.get_calendar_integration(
@@ -2225,12 +2337,13 @@ def create_calendar_integration(
     if not integration:
         raise CalendarProviderError("Calendar integration not found after creation.")
     # A resposta de criação vai para a API e para o resultado do onboarding.
-    return public_calendar_integration(integration)
+    return public_calendar_integration(_attach_connection_metadata(integration))
 
 
 def get_calendar_integrations(company_id: int | None = None) -> list[dict[str, Any]]:
+    metadata = google_oauth_repository.get_connection_metadata(company_id)
     return [
-        public_calendar_integration(integration)
+        public_calendar_integration(_attach_connection_metadata(integration, metadata))
         for integration in repository.get_calendar_integrations(company_id=company_id)
     ]
 

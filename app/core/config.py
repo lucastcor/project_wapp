@@ -178,6 +178,20 @@ class Settings:
     whatsapp_webhook_verify_token: str | None = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN")
     whatsapp_app_secret: str | None = os.getenv("WHATSAPP_APP_SECRET")
 
+    # --- Conexões por empresa (Embedded Signup da Meta e OAuth do Google) ---
+    #
+    # O app da Meta é um por instalação (id, segredo, token de verificação do
+    # webhook); o que muda por empresa é o token de negócio, o número e a
+    # WABA obtidos quando o dono conecta pelo popup. Esses segredos por
+    # empresa são cifrados com CREDENTIALS_ENCRYPTION_KEY antes de ir ao banco.
+    meta_app_id: str | None = os.getenv("META_APP_ID")
+    meta_embedded_signup_config_id: str | None = os.getenv("META_EMBEDDED_SIGNUP_CONFIG_ID")
+    meta_graph_api_version: str = os.getenv("META_GRAPH_API_VERSION", "v23.0")
+    credentials_encryption_key: str | None = os.getenv("CREDENTIALS_ENCRYPTION_KEY")
+    # URL absoluta registrada no Google Cloud como redirect URI. Vazio deriva
+    # de PLATFORM_PUBLIC_URL + /platform/integrations/google/callback.
+    google_oauth_redirect_url: str | None = os.getenv("GOOGLE_OAUTH_REDIRECT_URL")
+
     # --- Recuperação de conhecimento (RAG) ---
     #
     # O RAG funciona sem provider de embeddings: a busca lexical é

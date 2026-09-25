@@ -18,7 +18,7 @@ Abra <http://127.0.0.1:8010/platform>. Entre com a conta local ou, em
 **Acesso administrativo de emergência**, com o token do `.env`. Não copie o
 token para comandos, logs ou documentação.
 
-No **Setup Wizard**, crie uma empresa exclusiva para o teste. Exemplo:
+Em **Configuração** (o assistente de cinco passos), configure a empresa criada no cadastro ou, com o token administrativo em escopo global, crie uma empresa exclusiva para o teste. Exemplo:
 
 - nome: `Clínica Piloto Local`;
 - tipo: `Clínica / Consultório`;
@@ -35,10 +35,9 @@ o cliente configurado.
 Mantenha `OUTBOUND_PROVIDER=mock` e `CALENDAR_PROVIDER=mock`. Assim o teste
 persiste todos os efeitos locais sem enviar WhatsApp nem gravar numa agenda real.
 
-## 2. Conversa principal no Bot Studio
+## 2. Conversa principal em Testar o bot
 
-Abra **Bot Studio**, crie uma sessão com um contact ID sintético, como
-`cliente-homologacao-01`, e use a mesma sessão até o cancelamento. Escolha uma
+Abra **Testar o bot**, crie uma sessão (o telefone de teste é gerado sozinho se ficar vazio) e use a mesma sessão até o cancelamento. Escolha uma
 data útil futura dentro do horário publicado.
 
 | Passo | Mensagem | Resultado obrigatório |
@@ -56,7 +55,7 @@ data útil futura dentro do horário publicado.
 | 11 | `Sim, pode cancelar` | `Ação: booking_cancelled`; o mesmo booking passa a `cancelled` |
 | 12 | repita `Sim, pode cancelar` | não produz novo efeito nem reativa o booking |
 
-Depois dos passos 5, 8, 10 e 11, confira o **Agenda Console**. O estado visual
+Depois dos passos 5, 8, 10 e 11, confira a tela **Agenda**. O estado visual
 deve coincidir com a conversa. O cancelamento deve liberar o horário e sair da
 ocupação do calendário.
 
