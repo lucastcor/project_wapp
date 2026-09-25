@@ -1,11 +1,19 @@
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from app.core.config import settings
 from app.core.logging import get_logger, log_event
+from app.llm.factory import get_llm_provider
 from app.llm.providers.openai_provider import OpenAIProvider
+from app.services.conversation_control_service import (
+    CONFIRM,
+    REJECT,
+    fold_text,
+    interpret_control_message,
+)
 from app.services.outbound_dispatch_service import (
     OutboundDispatchError,
     dispatch_outbound_message,
@@ -63,6 +71,10 @@ QUEUE_DECLINE_TERMS = {
     "não posso",
 }
 QUEUE_KEEP_WAITING_TERMS = {
+    # Negação de saída conta como permanência; com termo de saída junto, a
+    # resposta fica ambígua e o cliente é perguntado de novo.
+    "não quero sair",
+    "nao quero sair",
     "me mantém na fila",
     "me mantem na fila",
     "manter na fila",
@@ -183,14 +195,15 @@ def _build_keep_waiting_message(*, desired_title: str) -> str:
 
 def _build_waiting_ack_message(*, wait_minutes: int) -> str:
     return (
-        f"Perfeito. Pode verificar com calma. Eu seguro essa vaga por cerca de {wait_minutes} minuto(s) e depois volto a falar com você."
+        f"Perfeito. Pode verificar com calma. Volto a falar com você em cerca de {wait_minutes} minuto(s); "
+        "se a vaga ainda estiver livre, é só confirmar."
     )
 
 
 def _build_waiting_followup_message(*, desired_title: str, starts_at: datetime) -> str:
     human_time = starts_at.strftime("%d/%m às %H:%M")
     return (
-        f"Passando para confirmar se você conseguiu verificar. A vaga de {desired_title} em {human_time} ainda está reservada para você. "
+        f"Passando para confirmar se você conseguiu verificar. A vaga de {desired_title} em {human_time} continuava livre até agora. "
         "Se quiser seguir com ela, eu confirmo por aqui. Se não encaixar, também me fala."
     )
 
@@ -229,29 +242,35 @@ def _matches_queue_entry(
     return not (hours_until_slot < SHORT_NOTICE_THRESHOLD_HOURS and not bool(entry.get("accepts_short_notice")))
 
 
+def _phrase_tokens(value: str) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", fold_text(value)).split())
+
+
+def _contains_any_phrase(message: str, terms: set[str]) -> bool:
+    # Palavra inteira, nunca substring: "assim" não contém "sim" e "não quero"
+    # não é "quero". Substring aqui reservava vaga a partir de uma negativa.
+    padded = f" {_phrase_tokens(message)} "
+    return any(
+        f" {term_tokens} " in padded
+        for term_tokens in (_phrase_tokens(term) for term in terms)
+        if term_tokens
+    )
+
+
 def _is_queue_waiting_message(message: str) -> bool:
-    normalized = _normalize_text(message)
-    return any(term in normalized for term in QUEUE_WAITING_TERMS)
-
-
-def _is_queue_confirmation_message(message: str) -> bool:
-    normalized = _normalize_text(message)
-    return any(term in normalized for term in QUEUE_CONFIRMATION_TERMS)
+    return _contains_any_phrase(message, QUEUE_WAITING_TERMS)
 
 
 def _is_queue_decline_message(message: str) -> bool:
-    normalized = _normalize_text(message)
-    return any(term in normalized for term in QUEUE_DECLINE_TERMS)
+    return _contains_any_phrase(message, QUEUE_DECLINE_TERMS)
 
 
 def _wants_to_keep_waiting(message: str) -> bool:
-    normalized = _normalize_text(message)
-    return any(term in normalized for term in QUEUE_KEEP_WAITING_TERMS)
+    return _contains_any_phrase(message, QUEUE_KEEP_WAITING_TERMS)
 
 
 def _wants_to_leave_queue(message: str) -> bool:
-    normalized = _normalize_text(message)
-    return any(term in normalized for term in QUEUE_LEAVE_TERMS)
+    return _contains_any_phrase(message, QUEUE_LEAVE_TERMS)
 
 
 def _interpret_queue_reply_with_llm(
@@ -262,11 +281,11 @@ def _interpret_queue_reply_with_llm(
     offered_starts_at: str | None = None,
     timezone_name: str | None = None,
 ) -> dict[str, Any] | None:
-    if not settings.openai_api_key:
+    if settings.classification_provider not in {"openai", "ollama"}:
         return None
 
     try:
-        provider = OpenAIProvider()
+        provider = get_llm_provider(openai_factory=OpenAIProvider)
         result = provider.interpret_appointment_queue_reply(
             stage=stage,
             customer_message=message,
@@ -304,13 +323,14 @@ def _interpret_queue_reply_with_llm(
 
 
 def _fallback_interpret_slot_offer_reply(message: str) -> dict[str, Any]:
-    if _is_queue_waiting_message(message):
+    # Mesma interpretação de controle da conversa (P02): negação e pergunta
+    # nunca autorizam; só confirmação inequívoca reserva a vaga.
+    control = interpret_control_message(message, kind="create")
+    declined = control.intent == REJECT or _is_queue_decline_message(message)
+    if _is_queue_waiting_message(message) and not declined:
         intent = "wait"
         reason = "Heurística detectou pedido de tempo para verificar a vaga."
-    elif _is_queue_confirmation_message(message):
-        intent = "accept_offer"
-        reason = "Heurística detectou confirmação da vaga."
-    elif _is_queue_decline_message(message):
+    elif declined:
         if _wants_to_leave_queue(message):
             intent = "decline_offer_leave_queue"
             reason = "Heurística detectou recusa da vaga com saída da fila."
@@ -320,9 +340,12 @@ def _fallback_interpret_slot_offer_reply(message: str) -> dict[str, Any]:
         else:
             intent = "decline_offer"
             reason = "Heurística detectou recusa da vaga atual."
+    elif control.intent == CONFIRM:
+        intent = "accept_offer"
+        reason = "Confirmação inequívoca da vaga."
     else:
         intent = "unclear"
-        reason = "Sem sinal suficiente para decidir a intenção da resposta."
+        reason = f"Sem confirmação inequívoca ({control.intent})."
 
     return {
         "intent": intent,
@@ -333,12 +356,22 @@ def _fallback_interpret_slot_offer_reply(message: str) -> dict[str, Any]:
 
 
 def _fallback_interpret_queue_membership_reply(message: str) -> dict[str, Any]:
-    if _is_queue_confirmation_message(message) or _wants_to_keep_waiting(message):
+    control = interpret_control_message(message, kind="create")
+    keep = _wants_to_keep_waiting(message)
+    leave = _wants_to_leave_queue(message)
+    negated = control.intent == REJECT or _is_queue_decline_message(message)
+    if keep and not leave:
         intent = "continue_queue"
         reason = "Heurística detectou permanência na fila."
-    elif _is_queue_decline_message(message) or _wants_to_leave_queue(message):
+    elif leave and not keep:
         intent = "leave_queue"
         reason = "Heurística detectou saída da fila."
+    elif not keep and not leave and negated:
+        intent = "leave_queue"
+        reason = "Cliente recusou continuar na fila."
+    elif not keep and not leave and control.intent == CONFIRM:
+        intent = "continue_queue"
+        reason = "Cliente confirmou continuar na fila."
     else:
         intent = "unclear"
         reason = "Sem sinal suficiente para decidir permanência na fila."
@@ -357,6 +390,7 @@ def _interpret_slot_offer_reply(
     entry: dict[str, Any],
     offer: dict[str, Any],
 ) -> dict[str, Any]:
+    heuristic = _fallback_interpret_slot_offer_reply(message)
     llm_result = _interpret_queue_reply_with_llm(
         stage="slot_offer",
         message=message,
@@ -365,8 +399,18 @@ def _interpret_slot_offer_reply(
         timezone_name=str(offer.get("timezone") or entry.get("timezone") or "UTC"),
     )
     if llm_result:
+        # O modelo sugere; reservar a vaga exige a confirmação inequívoca
+        # verificada pelo serviço (CONTRATOS, "Interpretação e confirmação").
+        if llm_result["intent"] == "accept_offer" and heuristic["intent"] != "accept_offer":
+            log_event(
+                logger,
+                logging.WARNING,
+                "appointment_queue.reply_interpretation.accept_not_confirmed",
+                heuristic_intent=heuristic["intent"],
+            )
+            return {**heuristic, "source": "heuristic_guard"}
         return llm_result
-    return _fallback_interpret_slot_offer_reply(message)
+    return heuristic
 
 
 def _interpret_queue_membership_reply(
@@ -417,6 +461,7 @@ def _create_and_dispatch_outbound(
     contact_id: str,
     message: str,
     source: str,
+    template_parameters: list[str] | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
     outbound_message_id = repository.create_outbound_message(
         contact_id=contact_id,
@@ -424,6 +469,7 @@ def _create_and_dispatch_outbound(
         message=message,
         source=source,
         status="pending",
+        template_parameters=template_parameters,
     )
     dispatch_result = _dispatch_queue_outbound_message(
         outbound_message_id,
@@ -448,14 +494,76 @@ def _find_offer_for_contact(
 
     allowed_statuses = statuses or {"pending", "waiting"}
     entry_ids = {int(entry["id"]) for entry in matching_entries}
+    now = datetime.now(UTC)
     offers = [
         offer
         for offer in repository.get_appointment_queue_offers(company_id=company_id, status=None)
         if int(offer["queue_entry_id"]) in entry_ids
         and str(offer.get("status") or "") in allowed_statuses
+        # Oferta vencida não aceita resposta, mesmo antes da varredura expirá-la.
+        and not _offer_deadline_passed(offer, now)
     ]
     offers.sort(key=lambda item: (str(item.get("created_at") or ""), int(item.get("id") or 0)), reverse=True)
     return offers[0] if offers else None
+
+
+def _offer_deadline_passed(offer: dict[str, Any], now: datetime) -> bool:
+    if str(offer.get("status") or "") != "pending" or not offer.get("response_deadline_at"):
+        return False
+    return _parse_iso_datetime(str(offer["response_deadline_at"])) <= now
+
+
+def has_open_queue_offer(*, contact_id: str, company_id: int | None) -> bool:
+    """O contato tem oferta de encaixe aguardando resposta?"""
+    return _find_offer_for_contact(contact_id=contact_id, company_id=company_id) is not None
+
+
+def _slot_is_taken(
+    *, company_id: int | None, slot_start: datetime, slot_end: datetime, released_booking_id: int
+) -> bool:
+    """A vaga liberada já foi ocupada por outra reserva ou remarcação em andamento?"""
+    bookings = repository.get_appointment_bookings_between(
+        company_id=company_id,
+        starts_at=_to_utc_iso(slot_start),
+        ends_at=_to_utc_iso(slot_end),
+    )
+    for booking in bookings:
+        if int(booking.get("id") or 0) == int(released_booking_id):
+            continue
+        timezone_name = str(booking.get("timezone") or "UTC")
+        intervals = [(booking.get("starts_at"), booking.get("ends_at"))]
+        # Remarcação em andamento retém também o novo intervalo (070).
+        intervals.append((booking.get("hold_starts_at"), booking.get("hold_ends_at")))
+        for starts_at, ends_at in intervals:
+            if not starts_at or not ends_at:
+                continue
+            if (
+                _parse_iso_datetime(str(starts_at), timezone_name) < slot_end
+                and _parse_iso_datetime(str(ends_at), timezone_name) > slot_start
+            ):
+                return True
+    return False
+
+
+def _slot_already_offered(*, company_id: int | None, slot_start: datetime, slot_end: datetime) -> bool:
+    """Outra oferta aberta já promete um intervalo sobreposto (ex.: dois cancelamentos no mesmo horário)."""
+    for offer in repository.get_appointment_queue_offers(company_id=company_id, status=None):
+        if str(offer.get("status") or "") not in {"pending", "waiting"}:
+            continue
+        timezone_name = str(offer.get("timezone") or "UTC")
+        offered_start = _parse_iso_datetime(str(offer["offered_starts_at"]), timezone_name)
+        offered_end = _parse_iso_datetime(str(offer["offered_ends_at"]), timezone_name)
+        if offered_start < slot_end and offered_end > slot_start:
+            return True
+    return False
+
+
+def _contact_is_human_owned(company_id: int | None, contact_id: Any) -> bool:
+    if company_id is None or not contact_id:
+        return False
+    from app.storage.ownership_repository import is_human_owned
+
+    return is_human_owned(company_id=int(company_id), contact_id=str(contact_id))
 
 
 def _find_entry_for_contact(
@@ -584,6 +692,22 @@ def list_queue_offers(
     return repository.get_appointment_queue_offers(company_id=company_id, status=status)
 
 
+def _queue_enabled(company_id: int | None) -> bool:
+    """Capacidade `appointment_queue` da configuração publicada da empresa.
+
+    Desligar a fila precisa impedir o efeito (oferta enviada ao cliente), não
+    só esconder a tela. Empresa sem configuração resolvível não recebe oferta.
+    """
+    if company_id is None:
+        return True
+    from app.services.company_config_service import CompanyConfigError, get_company_config
+
+    try:
+        return get_company_config(int(company_id)).has_capability("appointment_queue")
+    except CompanyConfigError:
+        return False
+
+
 def offer_released_booking_slot(
     *,
     released_booking_id: int,
@@ -595,8 +719,35 @@ def offer_released_booking_slot(
         raise AppointmentQueueError("Released booking not found.")
 
     company_id = booking.get("company_id")
+    if not _queue_enabled(company_id):
+        return {
+            "released_booking_id": released_booking_id,
+            "candidate_count": 0,
+            "created_offer": None,
+            "status": "queue_disabled",
+        }
     timezone_name = str(booking.get("timezone") or "UTC")
     slot_start = _parse_iso_datetime(str(booking["starts_at"]), timezone_name)
+    slot_end = _parse_iso_datetime(str(booking["ends_at"]), timezone_name)
+
+    # A oferta não retém capacidade (o aceite passa pela guarda do banco), mas
+    # não promete uma vaga que já está ocupada nem a mesma vaga a dois contatos.
+    if _slot_is_taken(
+        company_id=company_id, slot_start=slot_start, slot_end=slot_end, released_booking_id=released_booking_id
+    ):
+        return {
+            "released_booking_id": released_booking_id,
+            "candidate_count": 0,
+            "created_offer": None,
+            "status": "slot_unavailable",
+        }
+    if _slot_already_offered(company_id=company_id, slot_start=slot_start, slot_end=slot_end):
+        return {
+            "released_booking_id": released_booking_id,
+            "candidate_count": 0,
+            "created_offer": None,
+            "status": "slot_already_offered",
+        }
 
     existing_offers = repository.get_appointment_queue_offers(
         company_id=company_id,
@@ -613,6 +764,8 @@ def offer_released_booking_slot(
         if int(entry["id"]) not in already_contacted_entry_ids
         and entry.get("contact_id") != booking.get("contact_id")
         and _matches_queue_entry(entry=entry, slot_start=slot_start, released_booking=booking)
+        # Conversa com humano (P06): o bot não envia oferta automática.
+        and not _contact_is_human_owned(company_id, entry.get("contact_id"))
     ]
     candidates.sort(key=_priority_weight, reverse=True)
 
@@ -625,14 +778,22 @@ def offer_released_booking_slot(
 
     selected_entry = candidates[0]
     response_deadline_at = _to_utc_iso(datetime.now(UTC) + timedelta(minutes=max(5, response_window_minutes)))
-    outbound_message_id, dispatch_result = _create_and_dispatch_outbound(
-        company_id=company_id,
+    # A oferta é gravada antes do envio: o cliente nunca recebe uma promessa de
+    # vaga que o sistema não registrou (P04, R03).
+    outbound_message_id = repository.create_outbound_message(
         contact_id=str(selected_entry["contact_id"]),
+        company_id=company_id,
         message=_build_offer_message(
             desired_title=str(selected_entry["desired_title"]),
             starts_at=slot_start.astimezone(ZoneInfo(timezone_name)),
         ),
         source="appointment_queue_offer",
+        status="pending",
+        # Template de oferta fora da janela de 24 h: serviço e horário local (071).
+        template_parameters=[
+            " ".join(str(selected_entry["desired_title"]).split())[:1024],
+            slot_start.astimezone(ZoneInfo(timezone_name)).strftime("%d/%m às %H:%M"),
+        ],
     )
     offer_id = repository.create_appointment_queue_offer(
         company_id=company_id,
@@ -654,6 +815,7 @@ def offer_released_booking_slot(
     created_offer = repository.get_appointment_queue_offer(offer_id, company_id=company_id)
     if not created_offer:
         raise AppointmentQueueError("Queue offer not found after creation.")
+    dispatch_result = _dispatch_queue_outbound_message(outbound_message_id, company_id=company_id)
 
     return {
         "released_booking_id": released_booking_id,
@@ -667,18 +829,44 @@ def release_booking_slot(
     *,
     booking_id: int,
     company_id: int | None = None,
+    actor: str = "customer",
 ) -> dict[str, Any]:
     from app.services.calendar_service import (
         CalendarProviderError,
         cancel_calendar_booking,
     )
 
+    # `actor` (A08) só é repassado quando difere do default do cancelamento,
+    # para não exigir o kwarg de substitutos de `cancel_calendar_booking`.
+    actor_kwargs = {} if actor == "customer" else {"actor": actor}
     try:
-        cancellation_result = cancel_calendar_booking(booking_id=booking_id, company_id=company_id)
+        cancellation_result = cancel_calendar_booking(
+            booking_id=booking_id,
+            company_id=company_id,
+            **actor_kwargs,
+        )
     except CalendarProviderError as exc:
         raise AppointmentQueueError(str(exc)) from exc
 
-    next_offer = offer_released_booking_slot(released_booking_id=booking_id, company_id=company_id)
+    # Cancelamento concluído não depende do encaixe (P04, R02): uma falha ao
+    # oferecer a vaga fica adiada para a varredura do worker, sem transformar
+    # o cancelamento já efetivado em erro para o cliente.
+    try:
+        next_offer = offer_released_booking_slot(released_booking_id=booking_id, company_id=company_id)
+    except Exception as exc:
+        log_event(
+            logger,
+            logging.WARNING,
+            "appointment_queue.offer_after_cancellation_deferred",
+            booking_id=booking_id,
+            error_type=type(exc).__name__,
+        )
+        next_offer = {
+            "released_booking_id": booking_id,
+            "candidate_count": None,
+            "created_offer": None,
+            "status": "deferred",
+        }
 
     return {
         "booking": cancellation_result["booking"],
@@ -686,6 +874,48 @@ def release_booking_slot(
         "external_sync": cancellation_result["external_sync"],
         "queue_recovery": next_offer,
     }
+
+
+def _book_offered_slot(
+    *,
+    offer: dict[str, Any],
+    entry: dict[str, Any],
+    request_summary: str | None,
+    offer_company_id: int | None,
+    create_calendar_booking: Any,
+    reschedule_calendar_booking: Any,
+) -> dict[str, Any]:
+    """Remarca o booking original da entrada ou cria um novo na vaga ofertada."""
+    original_booking_id = entry.get("original_booking_id")
+    scheduling_profile_key = str(entry.get("scheduling_profile_key") or "").strip() or None
+    customer_profile = str(entry.get("customer_profile")) if entry.get("customer_profile") is not None else None
+    if original_booking_id:
+        booking: dict[str, Any] = reschedule_calendar_booking(
+            booking_id=int(original_booking_id),
+            starts_at=str(offer["offered_starts_at"]),
+            ends_at=str(offer["offered_ends_at"]),
+            timezone_name=str(offer["timezone"]),
+            title=str(entry["desired_title"]),
+            description=request_summary,
+            scheduling_profile_key=scheduling_profile_key,
+            customer_profile=customer_profile,
+            request_context=request_summary,
+            company_id=offer_company_id,
+        )
+        return booking
+    created: dict[str, Any] = create_calendar_booking(
+        company_id=entry.get("company_id"),
+        contact_id=str(entry["contact_id"]),
+        title=str(entry["desired_title"]),
+        starts_at=str(offer["offered_starts_at"]),
+        ends_at=str(offer["offered_ends_at"]),
+        timezone_name=str(offer["timezone"]),
+        description=request_summary,
+        scheduling_profile_key=scheduling_profile_key,
+        customer_profile=customer_profile,
+        request_context=request_summary,
+    )
+    return created
 
 
 def respond_to_queue_offer(
@@ -705,6 +935,12 @@ def respond_to_queue_offer(
     normalized_queue_membership = queue_membership_after_decline.strip().lower()
     if normalized_queue_membership not in {"ask", "keep", "remove"}:
         raise AppointmentQueueError("queue_membership_after_decline must be ask, keep or remove.")
+
+    from app.services.execution_lease import assert_lease_before_effect
+
+    # Fencing (P06, F03): quem perdeu o job de entrada não aceita, recusa, envia
+    # mensagem nem oferece a vaga ao próximo contato.
+    assert_lease_before_effect()
 
     offer = repository.get_appointment_queue_offer(offer_id, company_id=company_id)
     if not offer:
@@ -802,40 +1038,106 @@ def respond_to_queue_offer(
         }
 
     from app.services.calendar_service import (
+        BookingConflictError,
+        CalendarProviderError,
+        ExternalCalendarUncertainError,
         create_calendar_booking,
         reschedule_calendar_booking,
     )
-
     request_summary = (entry.get("request_summary") or "").strip() or None
     original_booking_id = entry.get("original_booking_id")
     rescheduled_booking_id: int | None = None
-    if original_booking_id:
-        rescheduled_booking_id = int(original_booking_id)
-        booking = reschedule_calendar_booking(
-            booking_id=rescheduled_booking_id,
-            starts_at=str(offer["offered_starts_at"]),
-            ends_at=str(offer["offered_ends_at"]),
-            timezone_name=str(offer["timezone"]),
-            title=str(entry["desired_title"]),
-            description=request_summary,
-            scheduling_profile_key=str(entry.get("scheduling_profile_key") or "").strip() or None,
-            customer_profile=str(entry.get("customer_profile")) if entry.get("customer_profile") is not None else None,
-            request_context=request_summary,
+    try:
+        booking = _book_offered_slot(
+            offer=offer,
+            entry=entry,
+            request_summary=request_summary,
+            offer_company_id=offer_company_id,
+            create_calendar_booking=create_calendar_booking,
+            reschedule_calendar_booking=reschedule_calendar_booking,
+        )
+    except BookingConflictError:
+        # Outra reserva ocupou a vaga antes deste aceite (a guarda de capacidade
+        # recusou): a oferta expira, o cliente volta à fila com a prioridade e
+        # recebe uma explicação — nunca uma confirmação falsa.
+        repository.update_appointment_queue_offer(
+            offer_id,
+            status="expired",
+            response_deadline_at=offer.get("response_deadline_at"),
+            follow_up_after=None,
+            responded_at=responded_at,
+            response_notes="slot_taken_before_acceptance",
             company_id=offer_company_id,
         )
-    else:
-        booking = create_calendar_booking(
-            company_id=entry.get("company_id"),
-            contact_id=str(entry["contact_id"]),
-            title=str(entry["desired_title"]),
-            starts_at=str(offer["offered_starts_at"]),
-            ends_at=str(offer["offered_ends_at"]),
-            timezone_name=str(offer["timezone"]),
-            description=request_summary,
-            scheduling_profile_key=str(entry.get("scheduling_profile_key") or "").strip() or None,
-            customer_profile=str(entry.get("customer_profile")) if entry.get("customer_profile") is not None else None,
-            request_context=request_summary,
+        repository.update_appointment_queue_entry_status(
+            int(entry["id"]),
+            status="active",
+            notes="Offered slot was taken before the customer accepted.",
+            company_id=offer_company_id,
         )
+        return {
+            "offer": repository.get_appointment_queue_offer(offer_id, company_id=offer_company_id),
+            "entry": repository.get_appointment_queue_entry(int(entry["id"]), company_id=offer_company_id),
+            "new_booking": None,
+            "rescheduled_booking_id": None,
+            "next_offer": None,
+            "slot_unavailable": True,
+        }
+    except ExternalCalendarUncertainError:
+        # A agenda externa não respondeu: a reserva pode existir e fica para a
+        # reconciliação. A oferta sai de circulação (a vaga não é oferecida a
+        # outro contato) e a entrada fica `contacted` até a equipe verificar.
+        repository.update_appointment_queue_offer(
+            offer_id,
+            status="expired",
+            response_deadline_at=offer.get("response_deadline_at"),
+            follow_up_after=None,
+            responded_at=responded_at,
+            response_notes="booking_uncertain",
+            company_id=offer_company_id,
+        )
+        repository.update_appointment_queue_entry_status(
+            int(entry["id"]),
+            status="contacted",
+            notes="Offer accepted but the external calendar result is uncertain; awaiting review.",
+            company_id=offer_company_id,
+        )
+        return {
+            "offer": repository.get_appointment_queue_offer(offer_id, company_id=offer_company_id),
+            "entry": repository.get_appointment_queue_entry(int(entry["id"]), company_id=offer_company_id),
+            "new_booking": None,
+            "rescheduled_booking_id": None,
+            "next_offer": None,
+            "booking_uncertain": True,
+        }
+    except CalendarProviderError:
+        # Recusa explícita (antecedência mínima, janela, política, provider):
+        # nenhuma reserva foi feita; o cliente volta à fila e recebe resposta.
+        repository.update_appointment_queue_offer(
+            offer_id,
+            status="expired",
+            response_deadline_at=offer.get("response_deadline_at"),
+            follow_up_after=None,
+            responded_at=responded_at,
+            response_notes="booking_refused",
+            company_id=offer_company_id,
+        )
+        repository.update_appointment_queue_entry_status(
+            int(entry["id"]),
+            status="active",
+            notes="Offered slot could not be booked after acceptance.",
+            company_id=offer_company_id,
+        )
+        return {
+            "offer": repository.get_appointment_queue_offer(offer_id, company_id=offer_company_id),
+            "entry": repository.get_appointment_queue_entry(int(entry["id"]), company_id=offer_company_id),
+            "new_booking": None,
+            "rescheduled_booking_id": None,
+            "next_offer": None,
+            "booking_refused": True,
+        }
+    if original_booking_id:
+        rescheduled_booking_id = int(original_booking_id)
 
     repository.update_appointment_queue_offer(
         offer_id,
@@ -859,6 +1161,34 @@ def respond_to_queue_offer(
         "rescheduled_booking_id": rescheduled_booking_id,
         "next_offer": None,
     }
+
+
+def recover_deferred_queue_offers(*, limit: int = 50) -> list[dict[str, Any]]:
+    """Oferece vagas canceladas que ficaram sem oferta (falha adiada, R02).
+
+    Idempotente: `offer_released_booking_slot` não recontata entradas já
+    ofertadas e só age em vaga futura com fila ativa na mesma empresa.
+    """
+    recovered: list[dict[str, Any]] = []
+    reference_time = _to_utc_iso(datetime.now(UTC))
+    for booking in repository.get_cancelled_future_bookings_without_offers(reference_time, limit=limit):
+        try:
+            result = offer_released_booking_slot(
+                released_booking_id=int(booking["id"]),
+                company_id=booking.get("company_id"),
+            )
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "appointment_queue.deferred_offer_recovery_failed",
+                booking_id=booking["id"],
+                error_type=type(exc).__name__,
+            )
+            continue
+        if result.get("created_offer"):
+            recovered.append({"released_booking_id": booking["id"], "action": "deferred_offer_created"})
+    return recovered
 
 
 def process_due_queue_offers() -> list[dict[str, Any]]:
@@ -990,6 +1320,38 @@ def process_queue_contact_message(
                 send_customer_followup=False,
                 company_id=pending_offer_company_id,
             )
+            if result.get("booking_uncertain"):
+                return {
+                    "reply": (
+                        "Recebi sua confirmação, mas a agenda ainda não confirmou a reserva. "
+                        "Nossa equipe vai verificar e te retorna em breve."
+                    ),
+                    "action": "queue_offer_booking_uncertain",
+                    "workflow_type": "appointment_queue",
+                    "metadata": result,
+                    "handoff_question_type": "queue_booking_uncertain",
+                    "handoff_question": "Aceite de vaga da fila sem confirmação da agenda externa: verificar a reserva e avisar o cliente.",
+                }
+            if result.get("booking_refused"):
+                return {
+                    "reply": (
+                        "Não consegui reservar essa vaga agora. Você continua na fila com a mesma prioridade "
+                        "e eu te aviso na próxima oportunidade."
+                    ),
+                    "action": "queue_offer_booking_refused",
+                    "workflow_type": "appointment_queue",
+                    "metadata": result,
+                }
+            if result.get("slot_unavailable"):
+                return {
+                    "reply": (
+                        "Poxa, essa vaga acabou de ser preenchida antes da sua confirmação. "
+                        "Você continua na fila com a mesma prioridade e eu te aviso na próxima oportunidade."
+                    ),
+                    "action": "queue_offer_slot_taken",
+                    "workflow_type": "appointment_queue",
+                    "metadata": result,
+                }
             new_booking = result.get("new_booking") or {}
             booking_time = ""
             if isinstance(new_booking, dict) and new_booking.get("starts_at"):

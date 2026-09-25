@@ -13,6 +13,7 @@ from app.services.ingress_auth_service import (
 )
 from app.services.rate_limit_service import check_shared_state_connection
 from app.services.training_export_service import get_finetuning_readiness_report
+from app.storage import company_config_repository
 from app.storage.db import (
     check_postgres_target_connection,
     check_runtime_database_connection,
@@ -261,6 +262,26 @@ def _whatsapp_channel_binding_status() -> dict[str, Any]:
     }
 
 
+def _legacy_context_drift_status() -> dict[str, Any]:
+    """Empresas com edição legada posterior à versão publicada (D12)."""
+    try:
+        company_ids = company_config_repository.list_companies_with_newer_legacy_context()
+    except Exception as exc:  # pragma: no cover - defensive readiness probe
+        return {
+            "ok": False,
+            "detail": f"Falha ao comparar contexto legado e versões publicadas: {type(exc).__name__}.",
+        }
+    if company_ids:
+        return {
+            "ok": False,
+            "detail": (
+                f"{len(company_ids)} empresa(s) com edição no contexto legado depois da última "
+                "publicação; o atendimento usa a versão publicada."
+            ),
+        }
+    return {"ok": True, "detail": "Nenhuma empresa com contexto legado mais novo que a versão publicada."}
+
+
 def _mask_phone_number_id(phone_number_id: str) -> str:
     if len(phone_number_id) <= 4:
         return phone_number_id
@@ -493,6 +514,25 @@ def get_system_readiness() -> dict[str, Any]:
         )
     )
 
+    # D12: o runtime lê a versão publicada. Edição legada posterior à
+    # publicação não tem efeito — sem este alerta, a empresa atenderia com a
+    # versão antiga e ninguém saberia.
+    legacy_drift = _legacy_context_drift_status()
+    checks.append(
+        _make_check(
+            code="company_context_legacy_newer_than_published",
+            title="Contexto legado mais novo que a versão publicada",
+            status="pass" if legacy_drift["ok"] else "warn",
+            severity="warning",
+            detail=str(legacy_drift["detail"]),
+            recommendation=(
+                "Revisar e republicar o contexto da empresa (a API legada agora publica versão)."
+                if not legacy_drift["ok"]
+                else None
+            ),
+        )
+    )
+
     normalized_ingress_safe = normalized_whatsapp_ingress_is_safe()
     checks.append(
         _make_check(
@@ -660,8 +700,7 @@ def get_system_readiness() -> dict[str, Any]:
     )
 
     openai_required = (
-        production_guard_enabled
-        or settings.classification_provider == "openai"
+        settings.classification_provider == "openai"
         or settings.enable_finetuning_pipeline
     )
     openai_status = "pass" if _has_real_secret(settings.openai_api_key) else ("fail" if openai_required else "warn")
@@ -868,6 +907,9 @@ def get_system_readiness() -> dict[str, Any]:
             else None,
         )
     )
+
+    from app.services.local_runtime_readiness import additional_runtime_checks
+    checks.extend(additional_runtime_checks())
 
     has_blockers = any(check["status"] == "fail" and check["severity"] == "blocker" for check in checks)
     has_warnings = any(check["status"] == "warn" for check in checks)

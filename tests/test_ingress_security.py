@@ -65,7 +65,7 @@ class _StubRepository:
         return 1
 
     def get_company(self, company_id: int):
-        return None
+        return {"id": 1, "slug": "default"} if company_id == 1 else None
 
     def get_company_by_slug(self, slug: str):
         return None
@@ -91,7 +91,10 @@ class _StubRepository:
 def stub_pipeline(monkeypatch) -> _StubRepository:
     repository = _StubRepository()
     monkeypatch.setattr(routes, "repository", repository)
-    monkeypatch.setattr(routes, "process_whatsapp_webhook", lambda **kwargs: dict(ORCHESTRATOR_RESULT))
+    def enqueue(items):
+        repository.started.extend(items)
+        return [{"job_id": i + 1, "status": "pending", "duplicate": False} for i, _ in enumerate(items)]
+    monkeypatch.setattr(routes, "enqueue_batch", enqueue)
     monkeypatch.setattr(routes, "process_incoming_message", lambda **kwargs: dict(ORCHESTRATOR_RESULT))
     return repository
 
@@ -250,6 +253,7 @@ def test_normalized_ingress_with_valid_credentials_is_accepted(monkeypatch, stub
     response = client.post(
         "/webhooks/whatsapp",
         json={**NORMALIZED_PAYLOAD, "provider_message_id": "wamid.normalized.ok"},
+        params={"company_id": 1},
         headers=headers,
     )
 

@@ -67,8 +67,8 @@ def test_create_internal_reminder_from_natural_text(monkeypatch) -> None:
     monkeypatch.setattr(reminder_service, "repository", fake_repository)
     monkeypatch.setattr(
         reminder_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "get_runtime_company_context",
+        lambda company_id=None: {
             "business_hours": {"timezone": "America/Sao_Paulo"},
             "reminder_policy": {
                 "enabled": True,
@@ -112,8 +112,8 @@ def test_schedule_booking_customer_reminders_from_policy(monkeypatch) -> None:
     monkeypatch.setattr(reminder_service, "repository", fake_repository)
     monkeypatch.setattr(
         reminder_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "get_runtime_company_context",
+        lambda company_id=None: {
             "company_name": "Empresa Teste",
             "business_hours": {"timezone": "America/Sao_Paulo"},
             "reminder_policy": {
@@ -169,8 +169,8 @@ def test_dispatch_due_reminders_uses_company_policy_channel(monkeypatch) -> None
     monkeypatch.setattr(reminder_service, "repository", FakeRepository())
     monkeypatch.setattr(
         reminder_service,
-        "get_company_context",
-        lambda company_slug=None: {
+        "get_runtime_company_context",
+        lambda company_id=None: {
             "business_hours": {"timezone": "America/Sao_Paulo"},
             "reminder_policy": {
                 "enabled": True,

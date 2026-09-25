@@ -1,11 +1,21 @@
 # Project WAPP
 
+> **Frente ativa — piloto com pequenos clientes:** comece por [`docs/piloto/INICIO.md`](docs/piloto/INICIO.md). O plano contém checkpoint, tarefas, coordenação de agentes e critérios de liberação. Para Claude Code, [`CLAUDE.md`](CLAUDE.md) direciona a leitura inicial.
+
 Plataforma multi-tenant de comércio conversacional: atendimento com IA, operação comercial, handoff para humano, outbound multicanal, automação visual de fluxos, recuperação sobre a base de conhecimento da empresa (RAG) e ciclo completo de fine-tuning.
 
 > **Chegando agora no projeto?** Comece por [`docs/estado_do_projeto.md`](docs/estado_do_projeto.md) — o que existe de fato, o que está verificado com evidência, e o que ainda depende de credencial externa.
 
+## Testar com Qwen local
+
+O ambiente deste computador usa Ollama com `qwen3.5:9b-q4_K_M`. Inicie API e workers com
+`.venv/bin/python -m app.tools.local_dev --port 8010` e abra `http://127.0.0.1:8010/platform`.
+Veja [configuração, fila durável e critérios para piloto](docs/local_qwen.md).
+Para homologar conversa, agendamento e cancelamento, siga o [teste funcional local](docs/local_functional_test.md).
+Para medir carga com contatos sintéticos, siga o [teste local de capacidade](docs/local_capacity_test.md).
+
 ## Visão geral
-O Project WAPP é um backend em FastAPI pensado para evoluir de um chatbot simples para uma plataforma de atendimento orientada a negócio. O sistema já suporta classificação de mensagens, geração de resposta com OpenAI, memória por contato, pipeline comercial, handoff para responsável humano, knowledge base incremental, outbound persistido e pipeline de fine-tuning.
+O Project WAPP é um backend em FastAPI pensado para evoluir de um chatbot simples para uma plataforma de atendimento orientada a negócio. O sistema já suporta classificação de mensagens, geração de resposta com OpenAI ou Ollama, memória por contato, pipeline comercial, handoff para responsável humano, knowledge base incremental, outbound persistido e pipeline de fine-tuning.
 
 A arquitetura foi organizada para manter separação clara entre:
 - API e rotas administrativas
@@ -18,7 +28,7 @@ A arquitetura foi organizada para manter separação clara entre:
 ## Principais capacidades atuais
 - Recebimento e processamento de mensagens de clientes
 - Classificação de intenção e decisão de ação
-- Geração de respostas comerciais com OpenAI
+- Geração de respostas comerciais com OpenAI ou Qwen local via Ollama
 - Memória por contato com resumo conversacional
 - Pipeline comercial por estágio
 - Handoff para responsável humano quando a IA não deve decidir sozinha
@@ -80,7 +90,7 @@ A arquitetura foi organizada para manter separação clara entre:
 ### Isolamento e operação
 - Guarda de integridade de tenant no próprio banco em todas as tabelas com `company_id`
 - Escopo de empresa deny-by-default por rota, com papéis owner/admin/operator/viewer
-- Workers duráveis em processos separados da API (lembretes e automação)
+- Workers duráveis em processos separados da API (entrada WhatsApp, lembretes e automação)
 
 ## Stack principal
 - Python 3.13+
@@ -116,7 +126,7 @@ app/
     orchestrator.py           orquestra a mensagem recebida
     company_context.py        contexto por empresa
     config.py                 Settings
-  llm/providers/              OpenAI e mocks
+  llm/providers/              OpenAI, Ollama e mocks
   services/                   regras de negócio (~40 serviços)
     automation_*_service.py   workflow, trigger, execução, scheduler
     knowledge_*_service.py    documento, chunking, recuperação
@@ -130,9 +140,11 @@ app/
     sql_support.py            helpers de SQL seguros para os repositórios
     automation_repository.py  fluxos, execuções, outbox
     knowledge_repository.py   documentos e chunks
-    migrations_*.py           067 migrations acumuladas
+    migrations_*.py           068 migrations acumuladas
   tools/
     run_migrations.py         passo explícito de release
+    inbound_worker.py         fila durável de entrada WhatsApp
+    local_dev.py              API e workers para testes com Qwen
     reminder_worker.py        worker de lembretes
     automation_worker.py      worker de automação e scheduler
     preflight_check.py        checagem antes de publicar
@@ -145,7 +157,7 @@ frontend/
 tests/                        ~65 arquivos de teste
 docs/
 compose.yaml                  postgres, redis, migrate, api, worker,
-                              automation-worker, admin
+                              automation-worker, inbound-worker, admin
 Dockerfile                    alvos api / admin, com estágio do Studio
 vercel.json
 ```

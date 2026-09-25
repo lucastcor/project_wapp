@@ -147,8 +147,19 @@ def get_request_client_ip(request: Request) -> str:
     return "unknown"
 
 
-def _resolve_scope_and_limit(request_path: str) -> tuple[str, int] | None:
+SAFE_HTTP_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _resolve_scope_and_limit(request_path: str, method: str | None = None) -> tuple[str, int] | None:
     if request_path.startswith("/platform/auth/"):
+        # O limite estrito existe contra tentativa de senha/token: vale para o que
+        # recebe credencial ou muda sessão (login, cadastro, convite, redefinição,
+        # logout). Ler a própria sessão e as capacidades acontece a cada carga do
+        # painel; no mesmo orçamento, operadores atrás de um único IP (clínica)
+        # eram mandados para a tela de login por 429. Leitura tem escopo próprio,
+        # com o orçamento administrativo. Chamada sem método fica no estrito.
+        if method is not None and method.upper() in SAFE_HTTP_METHODS:
+            return "platform_auth_read", max(1, settings.rate_limit_admin_requests)
         return "platform_auth", max(1, settings.rate_limit_auth_requests)
     if request_path.startswith("/admin"):
         return "admin", max(1, settings.rate_limit_admin_requests)
@@ -165,7 +176,7 @@ def evaluate_rate_limit(request: Request) -> RateLimitDecision | None:
     if not settings.enable_rate_limiting:
         return None
 
-    scope_config = _resolve_scope_and_limit(request.url.path)
+    scope_config = _resolve_scope_and_limit(request.url.path, request.method)
     if scope_config is None:
         return None
 

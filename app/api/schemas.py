@@ -117,6 +117,20 @@ class NormalizedWhatsAppPayload(BaseModel):
     from_name: str | None = Field(default=None, max_length=MAX_CONTACT_NAME_LENGTH)
     text: str = Field(..., min_length=1, max_length=MAX_MESSAGE_LENGTH)
     provider_message_id: str | None = Field(default=None, max_length=MAX_PROVIDER_MESSAGE_ID_LENGTH)
+    # `text` para mensagem digitada; `interactive`/`button` para resposta a
+    # botão/lista (o título vira `text`, o id vai em `reply_id`); `unsupported`
+    # para áudio, imagem e demais tipos sem texto, que recebem orientação.
+    content_type: str = Field(default="text", pattern=r"^(text|interactive|button|unsupported)$")
+    reply_id: str | None = Field(default=None, max_length=256)
+    media_type: str | None = Field(default=None, max_length=32)
+    context_message_id: str | None = Field(default=None, max_length=MAX_PROVIDER_MESSAGE_ID_LENGTH)
+
+
+class ConversationOwnershipRequest(BaseModel):
+    """Assumir ou devolver uma conversa (P06). `force` só vale para administrador."""
+
+    reason: str | None = Field(default=None, max_length=200)
+    force: bool = False
 
 
 class WhatsAppWebhookResponse(BaseModel):

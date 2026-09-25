@@ -100,6 +100,9 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     # Introspecção do próprio escopo: passa pela mesma resolução das demais
     # rotas tenant, porque é justamente isso que ela precisa reportar.
     ("/admin/access/scope", None, POLICY_TENANT),
+    ("/admin/inbound", None, POLICY_TENANT),
+    ("/admin/conversations", None, POLICY_TENANT),
+    ("/admin/operations", None, POLICY_TENANT),
     ("/admin/analytics", None, POLICY_TENANT),
     ("/admin/audit-events", None, POLICY_TENANT),
     # O catálogo de nós é o mesmo para todos os tenants: é a paleta do
@@ -111,6 +114,7 @@ ROUTE_POLICIES: tuple[tuple[str, frozenset[str] | None, str], ...] = (
     # Plataforma multiempresa: conhecimento, datasets, avaliação, modelos e
     # importação de conversas. Tudo aqui é dado privado da empresa.
     ("/admin/channel-bindings", None, POLICY_TENANT),
+    ("/admin/whatsapp", None, POLICY_TENANT),
     ("/admin/company-config", None, POLICY_TENANT),
     ("/admin/conversation-import", None, POLICY_TENANT),
     ("/admin/dataset-versions", None, POLICY_TENANT),

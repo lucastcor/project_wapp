@@ -213,6 +213,7 @@ def _build_company_context(
 ) -> dict[str, Any]:
     preset = BUSINESS_TYPE_PRESETS.get(business_type_key, BUSINESS_TYPE_PRESETS["outro"])
 
+    has_fixed_price = any(service.get("price") is not None for service in (services or []))
     context: dict[str, Any] = {
         "company_name": company_name,
         "brand_tone": {
@@ -267,7 +268,11 @@ def _build_company_context(
         },
         "commercial_policy": {
             "currency": "BRL",
-            "budget_policy": "Os valores finais dependem do servico e disponibilidade.",
+            "budget_policy": (
+                "Informar exatamente os precos fixos cadastrados; valores sem preco cadastrado dependem do servico e disponibilidade."
+                if has_fixed_price
+                else "Os valores finais dependem do servico e disponibilidade."
+            ),
             "payment_methods": ["pix", "cartao_credito"],
             "installments_available": False,
             "minimum_order_value": None,
@@ -428,6 +433,17 @@ def setup_company(
     )
 
     save_company_context(context, company_slug=slug)
+    # D12: runtime lê a versão publicada. Sem esta publicação a empresa recém
+    # criada atenderia pelo caminho legado de compatibilidade.
+    from app.services.company_config_service import save_company_config
+
+    save_company_config(
+        company_id=company_id,
+        context=context,
+        author="onboarding",
+        change_note="Contexto inicial do onboarding",
+        publish=True,
+    )
 
     calendar_integration = None
     if calendar_provider:
@@ -456,6 +472,8 @@ def _build_next_steps(
     context: dict[str, Any],
     calendar_integration: dict[str, Any] | None,
 ) -> list[dict[str, str]]:
+    # `view` é a tela do painel que resolve o passo (P07); passo sem tela
+    # (token da Meta, catálogo no contexto) não tem atalho.
     steps = []
 
     if not calendar_integration:
@@ -463,6 +481,7 @@ def _build_next_steps(
             "key": "calendar",
             "title": "Configurar integracao de calendario",
             "description": "Conecte Google Calendar ou CalDAV para sincronizar agenda.",
+            "view": "agenda",
         })
 
     catalog_items = context.get("catalog", {}).get("items", [])
@@ -474,15 +493,44 @@ def _build_next_steps(
         })
 
     steps.append({
+        "key": "policy",
+        "title": "Revisar a politica de conversa e cancelamento",
+        "description": "Confira as mensagens automaticas e as regras de cancelamento e remarcacao antes de atender clientes reais.",
+        "view": "policy",
+    })
+
+    steps.append({
         "key": "test",
         "title": "Testar o bot no Bot Studio",
         "description": "Simule uma conversa para validar tom, agendamento e respostas.",
+        "view": "studio",
     })
 
     steps.append({
         "key": "whatsapp",
         "title": "Conectar o WhatsApp Business",
         "description": "Configure o webhook e token da API do WhatsApp para ir ao vivo.",
+    })
+
+    steps.append({
+        "key": "templates",
+        "title": "Cadastrar templates aprovados",
+        "description": "Sem template aprovado, lembretes e ofertas de vaga nao saem depois de 24 h sem o cliente escrever.",
+        "view": "channel",
+    })
+
+    steps.append({
+        "key": "team",
+        "title": "Convidar operadores",
+        "description": "Quem atende precisa de conta propria para assumir conversas e resolver revisoes.",
+        "view": "team",
+    })
+
+    steps.append({
+        "key": "operations",
+        "title": "Conhecer a tela Operacao",
+        "description": "Mensagens em revisao, conversas com humano e envios com falha aparecem ali.",
+        "view": "operations",
     })
 
     return steps
@@ -493,12 +541,12 @@ def get_setup_status(company_id: int) -> dict[str, Any]:
     if not company:
         raise OnboardingError(f"Company {company_id} not found.")
 
-    slug = str(company.get("slug") or "")
     has_context = False
     try:
-        from app.core.company_context import get_company_context
-        get_company_context(company_slug=slug)
-        has_context = True
+        from app.services.company_config_service import get_company_config
+
+        # Template global de desenvolvimento não é contexto da empresa.
+        has_context = get_company_config(company_id).source != "global_template"
     except Exception:
         has_context = False
 

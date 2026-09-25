@@ -138,6 +138,18 @@ class Settings:
     openai_finetuning_base_model: str = os.getenv("OPENAI_FINETUNING_BASE_MODEL", "gpt-4o-mini-2024-07-18")
     openai_finetuning_suffix: str = os.getenv("OPENAI_FINETUNING_SUFFIX", "project-wapp-style")
     enable_finetuning_pipeline: bool = os.getenv("ENABLE_FINETUNING_PIPELINE", "false").lower() == "true"
+    llm_timeout_seconds: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "30"))
+    ollama_base_url: str = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen3.5:9b-q4_K_M")
+    ollama_num_ctx: int = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+    ollama_num_predict: int = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
+    ollama_keep_alive: str = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
+    ollama_max_concurrency: int = int(os.getenv("OLLAMA_MAX_CONCURRENCY", "1"))
+    inbound_worker_enabled: bool = os.getenv("INBOUND_WORKER_ENABLED", "false").lower() == "true"
+    inbound_worker_poll_seconds: float = float(os.getenv("INBOUND_WORKER_POLL_SECONDS", "1"))
+    inbound_job_lease_seconds: int = int(os.getenv("INBOUND_JOB_LEASE_SECONDS", "300"))
+    inbound_dispatch_max_attempts: int = int(os.getenv("INBOUND_DISPATCH_MAX_ATTEMPTS", "12"))
+    worker_heartbeat_ttl_seconds: int = int(os.getenv("WORKER_HEARTBEAT_TTL_SECONDS", "180"))
     classification_provider: str = os.getenv("CLASSIFICATION_PROVIDER", "mock")
     outbound_provider: str = os.getenv("OUTBOUND_PROVIDER", "mock")
     outbound_default_channel: str = os.getenv("OUTBOUND_DEFAULT_CHANNEL", "whatsapp")

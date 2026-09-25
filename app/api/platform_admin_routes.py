@@ -13,6 +13,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 
 from app.api.admin_routes import (
+    _normalized_contact_id,
     _record_audit_event,
     require_admin_access,
     require_admin_role,
@@ -23,6 +24,7 @@ from app.api.platform_schemas import (
     ChannelBindingPayload,
     CompanyCapabilitiesPayload,
     CompanyConfigPublishPayload,
+    ContactConsentPayload,
     ConversationImportPayload,
     DatasetFreezePayload,
     DatasetVersionPayload,
@@ -34,13 +36,16 @@ from app.api.platform_schemas import (
     KnowledgeSearchPayload,
     ModelActivationPayload,
     ModelRegistrationPayload,
+    WhatsAppTemplatePayload,
 )
 from app.core.config import settings
+from app.core.logging import mask_identifier
 from app.core.taxonomy import describe_taxonomy
 from app.core.vertical_packs import list_vertical_packs
 from app.services.automation_execution_service import mask_secret
 from app.services.company_config_service import (
     CompanyConfigError,
+    CompanyConfigInvalidError,
     bootstrap_company_config,
     get_company_config,
     list_company_config_versions,
@@ -93,7 +98,9 @@ from app.services.model_registry_service import (
     resolve_reply_model,
     rollback_active_model,
 )
-from app.storage import channel_repository, import_repository
+from app.services.whatsapp_delivery_policy import template_language_for
+from app.storage import channel_delivery_repository, channel_repository, import_repository
+from app.storage.migrations_channel import CONSENT_PURPOSES
 
 platform_admin_router = APIRouter(
     prefix="/admin",
@@ -240,6 +247,126 @@ def deactivate_channel_binding(
     return {"binding_id": binding_id, "active": False}
 
 
+# --- WhatsApp: templates aprovados e consentimento (P07) ----------------------
+
+
+@platform_admin_router.get("/whatsapp/templates")
+def read_whatsapp_templates(
+    request: Request,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict[str, Any]:
+    resolved_company_id = _require_company(request)
+    return {
+        "company_id": resolved_company_id,
+        # Idioma que o dispatch procura: o da política publicada da empresa.
+        "language_code": template_language_for(resolved_company_id),
+        "templates": channel_delivery_repository.list_templates(company_id=resolved_company_id),
+    }
+
+
+@platform_admin_router.put(
+    "/whatsapp/templates",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def upsert_whatsapp_template(
+    payload: WhatsAppTemplatePayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict[str, Any]:
+    resolved_company_id = _require_company(request)
+    try:
+        template = channel_delivery_repository.upsert_template(
+            company_id=resolved_company_id,
+            purpose=payload.purpose,
+            name=payload.name,
+            language_code=payload.language_code,
+            category=payload.category,
+            status=payload.status,
+            parameter_count=payload.parameter_count,
+            active=payload.active,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _record_audit_event(
+        request=request,
+        action="upsert",
+        resource_type="whatsapp_template",
+        resource_id=str(template["id"]),
+        company_id=resolved_company_id,
+        metadata={
+            "purpose": payload.purpose,
+            "language_code": payload.language_code,
+            "status": payload.status,
+            "active": payload.active,
+        },
+    )
+    return template
+
+
+@platform_admin_router.get("/whatsapp/contacts/{contact_id}/channel")
+def read_contact_channel_state(
+    contact_id: str,
+    request: Request,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict[str, Any]:
+    resolved_company_id = _require_company(request)
+    normalized_contact_id = _normalized_contact_id(contact_id)
+    contact_state = channel_delivery_repository.get_contact_state(
+        company_id=resolved_company_id, contact_id=normalized_contact_id
+    ) or {}
+    return {
+        "contact_id": normalized_contact_id,
+        "opted_out_at": contact_state.get("opted_out_at"),
+        "opt_out_source": contact_state.get("opt_out_source"),
+        "last_inbound_at": contact_state.get("last_inbound_at"),
+        "consents": {
+            purpose: channel_delivery_repository.get_consent_status(
+                company_id=resolved_company_id, contact_id=normalized_contact_id, purpose=purpose
+            )
+            for purpose in CONSENT_PURPOSES
+        },
+    }
+
+
+@platform_admin_router.put(
+    "/whatsapp/contacts/{contact_id}/consents/{purpose}",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def set_contact_consent(
+    contact_id: str,
+    purpose: str,
+    payload: ContactConsentPayload,
+    request: Request,
+    company_id: int | None = Query(default=None),
+    company_slug: str | None = Query(default=None),
+) -> dict[str, Any]:
+    resolved_company_id = _require_company(request)
+    normalized_contact_id = _normalized_contact_id(contact_id)
+    try:
+        channel_delivery_repository.set_consent(
+            company_id=resolved_company_id,
+            contact_id=normalized_contact_id,
+            purpose=purpose,
+            status=payload.status,
+            source="operator_panel",
+            evidence_ref=payload.evidence_ref,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _record_audit_event(
+        request=request,
+        action="consent.set",
+        resource_type="contact_consent",
+        resource_id=mask_identifier(normalized_contact_id),
+        company_id=resolved_company_id,
+        metadata={"purpose": purpose, "status": payload.status, "has_evidence": bool(payload.evidence_ref)},
+    )
+    return {"contact_id": normalized_contact_id, "purpose": purpose, "status": payload.status}
+
+
 # --- configuração da empresa --------------------------------------------------
 
 
@@ -331,6 +458,8 @@ def publish_company_config_version(
             version_id=payload.version_id,
             author=_actor(request),
         )
+    except CompanyConfigInvalidError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except CompanyConfigError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

@@ -82,6 +82,17 @@ class FakeRepository:
     def save_message(self, **kwargs) -> None:
         self.messages.append(kwargs)
 
+    def get_latest_message_with_reply_source(self, contact_id: str, *, company_id: int, reply_source: str):
+        for saved in reversed(self.messages):
+            if (
+                saved.get("contact_id") == contact_id
+                and saved.get("company_id") == company_id
+                and saved.get("reply_source") == reply_source
+            ):
+                # Sem created_at no fake: o orquestrador trata como recente.
+                return {"reply_source": reply_source, "created_at": None}
+        return None
+
     def update_contact_memory(self, **kwargs) -> None:
         contact_id = kwargs["contact_id"]
         company_id = kwargs.get("company_id")
@@ -117,7 +128,7 @@ class FakeConversationEngine:
             "reason": "Mensagem com intenção comercial.",
         }
 
-    def decide_message_action(self, classification: str, confidence: float) -> dict:
+    def decide_message_action(self, classification: str, confidence: float, autonomy=None) -> dict:
         if classification in {"financeiro", "fornecedor"}:
             return {
                 "auto_reply": False,
@@ -269,11 +280,12 @@ EXPECTED_AUTO_REPLY = {
 }
 
 
-def test_business_conversation_scenarios(monkeypatch) -> None:
+def test_business_conversation_scenarios(monkeypatch, global_company_runtime) -> None:
     fake_repository = FakeRepository()
     fake_engine = FakeConversationEngine()
 
     monkeypatch.setattr(orchestrator, "repository", fake_repository)
+    monkeypatch.setattr(orchestrator, "resolve_company_runtime", global_company_runtime())
     monkeypatch.setattr(
         orchestrator,
         "handle_conversation_workflow",
@@ -375,11 +387,20 @@ def test_business_conversation_scenarios(monkeypatch) -> None:
                 f"(esperado um de {sorted(expected_pipelines)})"
             )
 
+        # "Sem resposta automática" significa sem resposta gerada pelo modelo:
+        # com a política default o cliente recebe o aviso de encaminhamento
+        # (contrato P01), e a mensagem vai para a equipe.
         expected_auto_reply = EXPECTED_AUTO_REPLY.get(scenario_name)
-        if expected_auto_reply is not None:
-            assert last_result["auto_reply"] is expected_auto_reply
+        if expected_auto_reply is False:
+            assert last_result["action"] == "handoff_human"
+            # O aviso sai uma vez por janela; mensagens seguidas não o repetem.
+            assert last_result["source"] in {"policy_handoff_notice", "none"}
+            assert last_result["handoff_required"] is True
 
-        if last_result["auto_reply"]:
+        if last_result["source"] == "policy_handoff_notice":
+            assert last_result["auto_reply"] is True
+            assert last_result["reply"] != ""
+        elif last_result["auto_reply"]:
             assert last_result["reply"] != ""
             assert last_result["source"] == "openai"
         else:

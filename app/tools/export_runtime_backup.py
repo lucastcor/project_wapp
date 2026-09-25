@@ -10,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
-from app.storage.db import db_session, db_transaction, get_database_backend, init_db
+from app.storage.db import (
+    close_postgres_pool,
+    db_session,
+    db_transaction,
+    get_database_backend,
+    init_db,
+)
 from app.tools.portability_security import sanitize_runtime_row
 
 # Parent-before-child for inserts and child-before-parent for deletes.
@@ -35,6 +41,8 @@ BACKUP_TABLES: list[str] = [
     "finetuning_jobs",
     "audit_events",
     "calendar_integrations",
+    # Recurso antes do agendamento que o referencia (070).
+    "booking_resources",
     "appointment_bookings",
     "conversation_flows",
     "customer_reminders",
@@ -76,6 +84,14 @@ BACKUP_TABLES: list[str] = [
     "automation_jobs",
     "automation_effects",
     "automation_approval_gates",
+    "inbound_jobs",
+    "booking_operations",
+    "whatsapp_contact_states",
+    "contact_consents",
+    "whatsapp_templates",
+    "whatsapp_delivery_events",
+    "conversation_ownerships",
+    "worker_heartbeats",
     "schema_migrations",
 ]
 BACKUP_TABLE_SET = set(BACKUP_TABLES)
@@ -99,6 +115,7 @@ TABLE_ORDER_BY = {
     "finetuning_jobs": "id ASC",
     "audit_events": "id ASC",
     "calendar_integrations": "id ASC",
+    "booking_resources": "id ASC",
     "appointment_bookings": "id ASC",
     "conversation_flows": "id ASC",
     "customer_reminders": "id ASC",
@@ -137,6 +154,14 @@ TABLE_ORDER_BY = {
     "automation_jobs": "id ASC",
     "automation_effects": "id ASC",
     "automation_approval_gates": "id ASC",
+    "inbound_jobs": "id ASC",
+    "booking_operations": "id ASC",
+    "whatsapp_contact_states": "company_id ASC, contact_id ASC",
+    "contact_consents": "id ASC",
+    "whatsapp_templates": "id ASC",
+    "whatsapp_delivery_events": "id ASC",
+    "conversation_ownerships": "company_id ASC, contact_id ASC",
+    "worker_heartbeats": "component ASC, instance_id ASC",
     "schema_migrations": "version ASC",
 }
 RESTORABLE_TABLES: list[str] = [
@@ -147,13 +172,14 @@ IDENTITY_TABLES = {
     for table_name, ordering in TABLE_ORDER_BY.items()
     if ordering == "id ASC" and table_name != "schema_migrations"
 }
-BACKUP_FORMAT_VERSION = 3
+BACKUP_FORMAT_VERSION = 4
 CHECKSUM_ALGORITHM = "sha256"
 EPHEMERAL_BACKUP_TABLES = {
     "user_invitations",
     "user_sessions",
     "password_reset_tokens",
     "worker_leases",
+    "worker_heartbeats",
 }
 _SQL_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -733,16 +759,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
-    if args.restore:
-        result = restore_backup_file(
-            args.restore,
-            truncate_first=not args.keep_existing_rows,
-            allow_legacy=args.allow_legacy,
-            partial_restore=args.partial,
-        )
-    else:
-        result = write_backup_file(output_path=args.output)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    try:
+        if args.restore:
+            result = restore_backup_file(
+                args.restore,
+                truncate_first=not args.keep_existing_rows,
+                allow_legacy=args.allow_legacy,
+                partial_restore=args.partial,
+            )
+        else:
+            result = write_backup_file(output_path=args.output)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    finally:
+        # CLI processes have no ASGI lifespan hook. Close worker threads from
+        # psycopg_pool explicitly so backup/restore exits promptly and cleanly.
+        close_postgres_pool()
 
 
 if __name__ == "__main__":

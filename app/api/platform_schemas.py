@@ -30,6 +30,27 @@ class ChannelBindingPayload(BaseModel):
     active: bool = True
 
 
+class WhatsAppTemplatePayload(BaseModel):
+    """Template já aprovado na Meta, cadastrado pela empresa (P07).
+
+    O painel não submete template para aprovação: registra nome, idioma e
+    situação exatamente como estão no WhatsApp Manager.
+    """
+
+    purpose: str = Field(..., min_length=1, max_length=40)
+    name: str = Field(..., min_length=1, max_length=512)
+    language_code: str = Field(..., pattern=r"^[a-z]{2,3}(_[A-Z]{2})?$")
+    category: str = Field(default="utility", min_length=1, max_length=40)
+    status: str = Field(..., min_length=1, max_length=20)
+    parameter_count: int = Field(default=0, ge=0, le=10)
+    active: bool = True
+
+
+class ContactConsentPayload(BaseModel):
+    status: str = Field(..., pattern=r"^(granted|revoked)$")
+    evidence_ref: str | None = Field(default=None, max_length=200)
+
+
 class CompanyConfigPublishPayload(BaseModel):
     version_id: int = Field(..., gt=0)
 

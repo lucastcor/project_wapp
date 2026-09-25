@@ -85,7 +85,11 @@ def captured_processing(monkeypatch) -> list[dict]:
             "question_type": None,
         }
 
-    monkeypatch.setattr(routes, "process_whatsapp_webhook", _capture)
+    original_enqueue = routes.enqueue_batch
+    def capture_enqueue(items):
+        captured.extend(items)
+        return original_enqueue(items)
+    monkeypatch.setattr(routes, "enqueue_batch", capture_enqueue)
     return captured
 
 
@@ -260,8 +264,10 @@ def test_idempotency_receipt_is_tenant_scoped(tenants, captured_processing, monk
     response = client.post("/webhooks/whatsapp", content=raw_body, headers=_signed_headers(raw_body))
 
     assert response.status_code == 200
-    assert receipts[0]["company_id"] == tenants["company_a"]
-    assert receipts[-1]["completed"]["company_id"] == tenants["company_a"]
+    from app.storage.inbound_repository import list_jobs
+    jobs = list_jobs(tenants["company_a"])
+    assert any(job["provider_message_id"] == "wamid.tenant.scope.1" for job in jobs)
+    assert receipts == []  # The HTTP route does not mark processing complete.
 
 
 def test_no_cross_tenant_realtime_event_is_emitted(tenants, captured_processing, monkeypatch) -> None:
@@ -281,7 +287,7 @@ def test_normalized_ingress_still_requires_its_secret(tenants) -> None:
     """Binding changes must not weaken the normalized ingress gate."""
     response = client.post(
         "/webhooks/whatsapp",
-        json={"event": "message.received", "from_number": "5511977776666", "text": "oi"},
+        json={"event": "message.received", "from_number": "5511977776666", "text": "oi", "provider_message_id": uuid4().hex},
     )
     assert response.status_code == 403
 
@@ -294,7 +300,7 @@ def test_normalized_ingress_may_still_select_a_tenant(tenants, captured_processi
     response = client.post(
         "/webhooks/whatsapp",
         params={"company_slug": tenants["slug_b"]},
-        json={"event": "message.received", "from_number": "5511977776666", "text": "oi"},
+        json={"event": "message.received", "from_number": "5511977776666", "text": "oi", "provider_message_id": uuid4().hex},
         headers={"X-Internal-Ingress-Secret": "tenant-binding-internal-secret"},
     )
 
@@ -470,6 +476,14 @@ def test_dispatch_scopes_the_provider_to_the_message_company(tenants, monkeypatc
     monkeypatch.setattr(settings, "outbound_provider", "whatsapp")
     monkeypatch.setattr(outbound_dispatch_service, "WhatsAppProvider", _RecordingProvider)
     monkeypatch.setattr(outbound_dispatch_service, "repository", _OutboundRepository())
+    # Janela de 24 h tem testes próprios; aqui só importa o escopo do número.
+    from app.services.whatsapp_delivery_policy import DeliveryDecision
+
+    monkeypatch.setattr(
+        outbound_dispatch_service,
+        "decide_whatsapp_delivery",
+        lambda outbound_message, *, now: DeliveryDecision("text", "reply", "within_service_window"),
+    )
 
     outbound_dispatch_service.dispatch_outbound_message(outbound_message_id=1, channel="whatsapp")
 

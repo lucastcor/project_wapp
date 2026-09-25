@@ -3,7 +3,9 @@
 from typing import Any, TypedDict
 
 from app.core.config import settings
+from app.llm.factory import get_llm_provider
 from app.llm.providers.openai_provider import OpenAIProvider
+from app.services.company_policy_service import DEFAULT_AUTONOMY_POLICY, AutonomyPolicy
 
 VALID_RESOLUTION_TYPES = {
     "final_answer",
@@ -75,11 +77,22 @@ def should_create_pending_question(
     confidence: float,
     message: str,
     company_context: dict[str, Any] | None = None,
+    autonomy: AutonomyPolicy | None = None,
 ) -> HandoffDecision:
-    normalized = message.lower()
-    context = company_context or {}
+    """Decide se a mensagem vira pendência para a equipe.
 
-    if classification == "indefinido" or confidence < 0.60:
+    `autonomy` vem da política publicada da empresa (limiar, handoff em baixa
+    confiança, intenções com humano obrigatório e com resposta automática).
+    """
+    normalized = message.lower()
+    policy = autonomy or DEFAULT_AUTONOMY_POLICY
+
+    # Spam é descartado por restrição fixa; não gera trabalho para a equipe.
+    if classification == "spam":
+        return _handoff_result(False)
+
+    low_confidence = policy.is_low_confidence(classification, confidence)
+    if low_confidence and policy.handoff_on_low_confidence:
         return _handoff_result(
             True,
             "classification_uncertain",
@@ -152,9 +165,32 @@ def should_create_pending_question(
             ),
         )
 
-    business_rules = context.get("business_rules", []) if isinstance(context, dict) else []
-    if not business_rules:
-        return _handoff_result(False)
+    if classification in policy.handoff_intents:
+        return _handoff_result(
+            True,
+            "handoff_required",
+            (
+                f"A política da empresa exige atendimento humano para mensagens de {classification}. "
+                "Assuma a conversa ou oriente a resposta ao cliente."
+            ),
+        )
+
+    # Intenção com confiança suficiente, mas que a empresa não liberou para
+    # resposta automática: sem pendência, a mensagem ficaria sem resposta e
+    # sem ninguém sabendo dela.
+    if (
+        not low_confidence
+        and classification not in policy.auto_reply_intents
+        and classification not in {"agendamento", "workflow"}
+    ):
+        return _handoff_result(
+            True,
+            "auto_reply_not_allowed",
+            (
+                f"A política da empresa não autoriza resposta automática para mensagens de {classification}. "
+                "Como a equipe deve responder?"
+            ),
+        )
 
     return _handoff_result(False)
 
@@ -166,7 +202,7 @@ def build_customer_reply_from_owner_resolution(
 ) -> str:
     fallback_text = _fallback_customer_facing_text(owner_answer)
 
-    if settings.classification_provider != "openai":
+    if settings.classification_provider not in {"openai", "ollama"}:
         return fallback_text
 
     context = company_context or {}
@@ -174,10 +210,8 @@ def build_customer_reply_from_owner_resolution(
     brand_tone = context.get("brand_tone", {}) if isinstance(context, dict) else {}
 
     try:
-        provider = OpenAIProvider()
-        response = provider.client.responses.create(
-            model=provider.model,
-            input=(
+        provider = get_llm_provider(openai_factory=OpenAIProvider)
+        response = provider.generate_text((
                 "Você é um assistente de atendimento que reescreve instruções internas do responsável da empresa "
                 "como mensagem final para o cliente. "
                 "Responda em português do Brasil. "
@@ -194,7 +228,7 @@ def build_customer_reply_from_owner_resolution(
                 "Retorne apenas a mensagem final que deve ser enviada ao cliente."
             ),
         )
-        rewritten_text = (response.output_text or "").strip()
+        rewritten_text = (response or "").strip()
         return rewritten_text or fallback_text
     except Exception:
         return fallback_text

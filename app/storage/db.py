@@ -13,6 +13,8 @@ from app.core.config import settings
 
 DB_PATH = Path("project_wapp.db")
 SQLITE_ID_TABLES = {
+    "inbound_jobs",
+    "booking_operations",
     "messages",
     "pending_questions",
     "knowledge_entries",
@@ -2757,6 +2759,27 @@ MIGRATIONS.extend(AUTOMATION_MIGRATIONS)
 # Por último: a guarda de integridade precisa que todas as tabelas já
 # existam para poder referenciá-las.
 MIGRATIONS.extend(TENANT_INTEGRITY_MIGRATIONS)
+from app.storage.migrations_inbound import INBOUND_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(INBOUND_MIGRATIONS)
+from app.storage.migrations_operations import OPERATION_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(OPERATION_MIGRATIONS)
+from app.storage.migrations_booking_capacity import (  # noqa: E402
+    BOOKING_CAPACITY_ID_TABLES,
+    BOOKING_CAPACITY_MIGRATIONS,
+)
+
+MIGRATIONS.extend(BOOKING_CAPACITY_MIGRATIONS)
+from app.storage.migrations_channel import CHANNEL_ID_TABLES, CHANNEL_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(CHANNEL_MIGRATIONS)
+from app.storage.migrations_ownership import OWNERSHIP_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(OWNERSHIP_MIGRATIONS)
+from app.storage.migrations_recovery import RECOVERY_MIGRATIONS  # noqa: E402
+
+MIGRATIONS.extend(RECOVERY_MIGRATIONS)
 
 # Tabelas com PK autoincremental precisam de `RETURNING id` no PostgreSQL para
 # que `cursor.lastrowid` funcione — no SQLite ele vem de graça, no PostgreSQL
@@ -2767,6 +2790,8 @@ MIGRATIONS.extend(TENANT_INTEGRITY_MIGRATIONS)
 SQLITE_ID_TABLES.update(PLATFORM_ID_TABLES)
 SQLITE_ID_TABLES.update(IDENTITY_ID_TABLES)
 SQLITE_ID_TABLES.update(AUTOMATION_ID_TABLES)
+SQLITE_ID_TABLES.update(BOOKING_CAPACITY_ID_TABLES)
+SQLITE_ID_TABLES.update(CHANNEL_ID_TABLES)
 
 
 def _assert_migration_versions_are_ordered() -> None:

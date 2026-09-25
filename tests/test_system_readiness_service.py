@@ -1,3 +1,5 @@
+import pytest
+
 from app.core.config import settings
 from app.services import system_readiness_service
 
@@ -193,6 +195,12 @@ def test_get_system_readiness_blocks_placeholder_secrets_in_production(monkeypat
         "get_postgres_target_summary",
         lambda: {"configured": True, "backend": "postgres", "support_level": "active"},
     )
+    # URL de banco fictícia neste cenário: a sonda que consulta o banco é stubada.
+    monkeypatch.setattr(
+        system_readiness_service,
+        "_legacy_context_drift_status",
+        lambda: {"ok": True, "detail": "legacy ok"},
+    )
     monkeypatch.setattr(
         system_readiness_service,
         "get_company_context_status",
@@ -293,6 +301,12 @@ def test_get_system_readiness_blocks_placeholder_postgres_and_calendar_in_produc
         "get_postgres_target_summary",
         lambda: {"configured": True, "backend": "postgres", "support_level": "active"},
     )
+    # URL de banco fictícia neste cenário: a sonda que consulta o banco é stubada.
+    monkeypatch.setattr(
+        system_readiness_service,
+        "_legacy_context_drift_status",
+        lambda: {"ok": True, "detail": "legacy ok"},
+    )
     monkeypatch.setattr(
         system_readiness_service,
         "get_company_context_status",
@@ -319,3 +333,11 @@ def test_get_system_readiness_blocks_placeholder_postgres_and_calendar_in_produc
     assert readiness["overall_status"] == "blocked"
     assert checks_by_code["postgres_credentials"]["status"] == "fail"
     assert checks_by_code["calendar_provider"]["status"] == "fail"
+
+
+@pytest.fixture(autouse=True)
+def isolate_new_worker_probes(monkeypatch):
+    # These readiness unit tests replace DB connectivity with fake URLs.
+    # Worker probe behavior is exercised against a real DB in its own tests.
+    monkeypatch.setattr("app.services.local_runtime_readiness.worker_is_alive", lambda _: False)
+    monkeypatch.setattr("app.services.local_runtime_readiness.review_count", lambda: 0)

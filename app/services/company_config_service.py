@@ -6,20 +6,28 @@ para o banco e deixam de ser a fonte mutável.
 
 Nunca há queda silenciosa para o contexto global genérico em produção: uma
 empresa sem contexto próprio responderia com identidade errada.
+
+É a única leitura de contexto em runtime (orquestrador, workflow, agenda,
+lembretes, respostas) — ver D12 em `docs/piloto/DECISOES.md`. Ordem de
+resolução: versão publicada → linha legada `company_contexts` da própria
+empresa → seed da própria empresa (fora de produção) → template global
+marcado (fora de produção). Rascunho nunca é lido.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.company_context import (
     CompanyContextError,
+    context_storage_key,
     get_seed_company_context,
     has_seed_company_context,
+    seed_contexts_enabled,
     validate_company_context,
 )
 from app.core.config import is_production_like
@@ -30,17 +38,28 @@ from app.core.vertical_packs import (
     merge_policies,
     resolve_vertical_pack,
 )
+from app.services.company_policy_service import (
+    CompanyPolicyError,
+    validate_context_policy_fields,
+    validate_policies,
+)
 from app.storage import company_config_repository as config_repository
 from app.storage.repository import RuntimeRepository
 
 logger = get_logger(__name__)
 repository = RuntimeRepository()
 
+# Mantido por compatibilidade de importação. O cache não expira mais por
+# tempo: cada leitura confere o marcador da versão publicada no banco.
 CACHE_TTL_SECONDS = 30
 
 
 class CompanyConfigError(Exception):
     pass
+
+
+class CompanyConfigInvalidError(CompanyConfigError):
+    """Versão existe, mas não passa na validação para publicação."""
 
 
 @dataclass(frozen=True)
@@ -64,7 +83,8 @@ class CompanyConfig:
         return self.policies.get(name, default)
 
 
-_CACHE: dict[int, tuple[float, CompanyConfig]] = {}
+# company_id -> (marcador da versão publicada, config)
+_CACHE: dict[int, tuple[str, CompanyConfig]] = {}
 _CACHE_LOCK = threading.Lock()
 
 
@@ -77,22 +97,41 @@ def invalidate_company_config(company_id: int | None = None) -> None:
         _CACHE.pop(int(company_id), None)
 
 
-def _cached(company_id: int) -> CompanyConfig | None:
+def _cached(company_id: int, marker: str | None) -> CompanyConfig | None:
+    if marker is None:
+        return None
     with _CACHE_LOCK:
         entry = _CACHE.get(company_id)
     if not entry:
         return None
-    stored_at, config = entry
-    # TTL curto porque o banco é compartilhado entre réplicas: invalidação
-    # local sozinha não alcançaria os outros workers.
-    if time.monotonic() - stored_at > CACHE_TTL_SECONDS:
+    cached_marker, config = entry
+    # O banco é compartilhado entre API e workers: invalidação local não
+    # alcança os outros processos, então a validade é o marcador publicado.
+    if cached_marker != marker:
         return None
     return config
 
 
-def _store(company_id: int, config: CompanyConfig) -> None:
+def _store(company_id: int, marker: str, config: CompanyConfig) -> None:
     with _CACHE_LOCK:
-        _CACHE[company_id] = (time.monotonic(), config)
+        _CACHE[company_id] = (marker, config)
+
+
+def _marker_for(version_row: dict[str, Any]) -> str:
+    return f"{int(version_row['id'])}:{version_row.get('content_hash') or ''}"
+
+
+def validate_company_config_input(
+    context: dict[str, Any],
+    policies: dict[str, Any] | None = None,
+) -> None:
+    """Valida contexto e override de política antes de qualquer escrita."""
+    try:
+        validate_company_context(context)
+        validate_context_policy_fields(context)
+        validate_policies(policies if policies is not None else context.get("policies"))
+    except (CompanyContextError, CompanyPolicyError) as exc:
+        raise CompanyConfigError(str(exc)) from exc
 
 
 def _build_config(
@@ -200,12 +239,65 @@ def _config_from_version(
     )
 
 
+def _legacy_context_for(company: dict[str, Any]) -> dict[str, Any] | None:
+    """Contexto gravado pela API legada para esta empresa, se houver.
+
+    Só a linha da própria empresa: a linha global (`__global__`) nunca
+    empresta identidade a um tenant por este caminho.
+    """
+    company_slug = str(company.get("slug") or "").strip()
+    if not company_slug:
+        return None
+    try:
+        storage_key = context_storage_key(company_slug)
+    except CompanyContextError:
+        return None
+    row = repository.get_company_context_record(storage_key)
+    if not row:
+        return None
+    # A chave legada é o slug normalizado, e slugs distintos colidem nela
+    # ("Acme" e "acme", "acme.co" e "acme-co"). Só vale a linha gravada para
+    # esta empresa, ou uma linha sem vínculo cujo slug é exatamente o dela.
+    row_company_id = row.get("company_id")
+    belongs_to_company = (
+        int(row_company_id) == int(company["id"])
+        if row_company_id is not None
+        else storage_key == company_slug
+    )
+    if not belongs_to_company:
+        log_event(
+            logger,
+            logging.WARNING,
+            "company_config.legacy_context_slug_collision",
+            company_id=company["id"],
+        )
+        return None
+    try:
+        data = json.loads(row["context_json"])
+    except (TypeError, ValueError) as exc:
+        raise CompanyConfigError(
+            f"Legacy company context for company_id={company['id']} is not valid JSON."
+        ) from exc
+    if not isinstance(data, dict):
+        raise CompanyConfigError(
+            f"Legacy company context for company_id={company['id']} must be a JSON object."
+        )
+    try:
+        validate_company_context(data)
+    except CompanyContextError as exc:
+        raise CompanyConfigError(str(exc)) from exc
+    return data
+
+
 def get_company_config(company_id: int, *, use_cache: bool = True) -> CompanyConfig:
     """Configuração publicada da empresa."""
     resolved_company_id = require_company_id(company_id, context="company config read")
 
     if use_cache:
-        cached = _cached(resolved_company_id)
+        cached = _cached(
+            resolved_company_id,
+            config_repository.get_published_marker(company_id=resolved_company_id),
+        )
         if cached is not None:
             return cached
 
@@ -216,13 +308,34 @@ def get_company_config(company_id: int, *, use_cache: bool = True) -> CompanyCon
     published = config_repository.get_published_context(company_id=resolved_company_id)
     if published:
         config = _config_from_version(company, published, "database")
-        _store(resolved_company_id, config)
+        _store(resolved_company_id, _marker_for(published), config)
         return config
 
+    legacy_context = _legacy_context_for(company)
+    if legacy_context is not None:
+        # Compatibilidade: empresa configurada antes das versões. Sem escrita
+        # na leitura e sem cache — a próxima escrita legada publica versão.
+        log_event(
+            logger,
+            logging.WARNING,
+            "company_config.legacy_context_used",
+            company_id=resolved_company_id,
+        )
+        return _build_config(
+            company=company,
+            version_row=None,
+            context=legacy_context,
+            capabilities_override=legacy_context.get("capabilities"),
+            policies_override=legacy_context.get("policies"),
+            source="legacy_context",
+        )
+
     company_slug = str(company.get("slug") or "") or None
-    if company_slug and has_seed_company_context(company_slug):
+    if company_slug and seed_contexts_enabled() and has_seed_company_context(company_slug):
         config = bootstrap_company_config(company_id=resolved_company_id)
-        _store(resolved_company_id, config)
+        published = config_repository.get_published_context(company_id=resolved_company_id)
+        if published:
+            _store(resolved_company_id, _marker_for(published), config)
         return config
 
     if is_production_like():
@@ -251,7 +364,7 @@ def get_company_config(company_id: int, *, use_cache: bool = True) -> CompanyCon
             "No global company context template is available. "
             "Publish a context version for this company before serving traffic."
         )
-    config = _build_config(
+    return _build_config(
         company=company,
         version_row=None,
         context=context,
@@ -259,13 +372,20 @@ def get_company_config(company_id: int, *, use_cache: bool = True) -> CompanyCon
         policies_override=None,
         source="global_template",
     )
-    _store(resolved_company_id, config)
-    return config
 
 
 def get_company_context_for(company_id: int | None) -> dict[str, Any]:
     """Contexto publicado de uma empresa, para consumidores legados."""
+    return get_runtime_company_context(company_id)
+
+
+def get_runtime_company_context(company_id: int | None) -> dict[str, Any]:
+    """Contexto de runtime de uma empresa (ver ordem no docstring do módulo)."""
     if company_id is None:
+        if is_production_like():
+            raise CompanyConfigError(
+                "Runtime company context requires a company in production."
+            )
         template = get_seed_company_context(None)
         if template is None:
             raise CompanyConfigError("No global company context template is available.")
@@ -289,10 +409,7 @@ def save_company_config(
     if not company:
         raise CompanyConfigError(f"Company {resolved_company_id} not found.")
 
-    try:
-        validate_company_context(context)
-    except CompanyContextError as exc:
-        raise CompanyConfigError(str(exc)) from exc
+    validate_company_config_input(context, policies)
 
     business_type = str(company.get("business_type") or "") or None
     merged_capabilities = merge_capabilities(
@@ -320,6 +437,36 @@ def save_company_config(
     return stored
 
 
+def publish_legacy_context_write(
+    *,
+    company_slug: str | None,
+    context: dict[str, Any],
+    author: str | None,
+    change_note: str,
+) -> dict[str, Any] | None:
+    """Publica como versão um contexto recebido por um caminho de escrita legado.
+
+    Mantém capacidades e políticas da versão publicada atual: a API legada só
+    conhece o contexto e não pode zerar a política da empresa por omissão.
+    Contexto global (sem empresa) não gera versão.
+    """
+    if not company_slug:
+        return None
+    company = repository.get_company_by_slug(company_slug)
+    if not company:
+        return None
+    current = config_repository.get_published_context(company_id=int(company["id"]))
+    return save_company_config(
+        company_id=int(company["id"]),
+        context=context,
+        capabilities=current["capabilities"] if current else None,
+        policies=current["policies"] if current else None,
+        author=author,
+        change_note=change_note,
+        publish=True,
+    )
+
+
 def publish_company_config(
     *,
     company_id: int,
@@ -327,6 +474,23 @@ def publish_company_config(
     author: str | None = None,
 ) -> dict[str, Any]:
     resolved_company_id = require_company_id(company_id, context="company config publish")
+    candidate = config_repository.get_context_version(
+        company_id=resolved_company_id,
+        version_id=version_id,
+    )
+    if candidate is None:
+        raise CompanyConfigError(
+            f"Context version {version_id} not found for company_id={resolved_company_id}."
+        )
+    # Rascunho gravado antes da validação existir não entra em produção sem
+    # passar por ela.
+    try:
+        validate_company_context(candidate["context"])
+        validate_context_policy_fields(candidate["context"])
+        validate_policies(candidate.get("policies"))
+    except (CompanyContextError, CompanyPolicyError) as exc:
+        raise CompanyConfigInvalidError(str(exc)) from exc
+
     stored = config_repository.publish_context_version(
         company_id=resolved_company_id,
         version_id=version_id,

@@ -1,0 +1,98 @@
+{
+  "probe": {
+    "ok": true,
+    "detail": "Modelo local disponível."
+  },
+  "cases": [
+    {
+      "case": "classification",
+      "ok": true,
+      "seconds": 3.08,
+      "output": {
+        "classification": "financeiro",
+        "confidence": 1.0,
+        "reason": "A solicitação de 'segunda via do boleto' refere-se diretamente a um documento de cobrança."
+      }
+    },
+    {
+      "case": "booking_interpretation",
+      "ok": true,
+      "seconds": 1.59,
+      "output": {
+        "intent": "cancel_booking",
+        "confidence": 1.0,
+        "reason": "Cliente expressou explicitamente o desejo de cancelar a consulta."
+      }
+    },
+    {
+      "case": "http_enqueue",
+      "ok": true,
+      "seconds": 0.02,
+      "output": {
+        "accepted": true,
+        "processed": false,
+        "payload_mode": "normalized",
+        "queued_count": 1,
+        "jobs": [
+          {
+            "job_id": 1,
+            "status": "pending",
+            "duplicate": false
+          }
+        ]
+      }
+    },
+    {
+      "case": "worker_generation",
+      "ok": true,
+      "seconds": 14.46,
+      "output": {
+        "processed": true,
+        "job_id": 1,
+        "recovered": 0
+      }
+    },
+    {
+      "case": "worker_delivery_mock",
+      "ok": true,
+      "seconds": 0.02,
+      "output": {
+        "processed": true,
+        "job_id": 1,
+        "recovered": 0
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "id": 1,
+      "company_id": 1,
+      "provider_message_id": "synthetic-real-qwen-1",
+      "status": "completed",
+      "outbound_message_id": 1,
+      "last_error": null,
+      "created_at": "2026-09-08T10:53:26.147059+00:00",
+      "updated_at": "2026-09-08T10:53:40.624427+00:00"
+    }
+  ],
+  "conversation_result": {
+    "contact_id": "synthetic-customer",
+    "company_id": 1,
+    "company_slug": "synthetic-local-smoke",
+    "classification": "lead_novo",
+    "classification_reason": "O usuário demonstra interesse inicial em conhecer os serviços da empresa para uma possível contratação futura.",
+    "classification_confidence": 0.95,
+    "reply": "Olá! Tudo bem? Aqui é da equipe da Empresa Sintética.\n\nPara te ajudar melhor, você tem algum projeto específico em mente ou gostaria de conhecer nossas opções principais? Temos serviços, produtos e também soluções sob medida para diferentes necessidades. O que mais te interessa hoje?",
+    "source": "ollama",
+    "auto_reply": true,
+    "action": "auto_reply",
+    "priority": "high",
+    "pipeline_stage": "novo_lead",
+    "next_action": "Aguardar resposta do cliente sobre o foco de interesse.",
+    "lead_temperature": "cold",
+    "handoff_required": false,
+    "pending_question_id": null,
+    "question_type": null,
+    "customer_followup_question": null
+  }
+}

@@ -1,11 +1,14 @@
 import hashlib
 import hmac
 import logging
+import re
+from datetime import UTC, datetime
 from typing import Any, TypedDict
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from app.api.ingress_security import (
     INTERNAL_INGRESS_HEADER,
@@ -22,14 +25,11 @@ from app.core.config import settings
 from app.core.logging import get_logger, log_event
 from app.core.orchestrator import (
     process_incoming_message,
-    process_whatsapp_webhook,
 )
 from app.services.admin_auth_service import secrets_match
-from app.services.outbound_dispatch_service import (
-    OutboundDispatchError,
-    dispatch_outbound_message,
-)
 from app.services.realtime_service import publish_incoming_message_event
+from app.storage.channel_delivery_repository import record_delivery_status
+from app.storage.inbound_repository import enqueue_batch
 from app.storage.repository import RuntimeRepository
 
 router = APIRouter(tags=["chat"])
@@ -88,14 +88,15 @@ def _resolve_request_company(
     }
 
 
-def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | None:
+def _extract_meta_whatsapp_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if payload.get("object") != "whatsapp_business_account":
-        return None
+        return []
 
     entries = payload.get("entry")
     if not isinstance(entries, list):
-        return None
+        return []
 
+    extracted: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -123,38 +124,151 @@ def _extract_meta_whatsapp_message(payload: dict[str, Any]) -> dict[str, Any] | 
             if isinstance(metadata, dict):
                 phone_number_id = str(metadata.get("phone_number_id") or "").strip() or None
 
-            contact_name = None
-            contact_wa_id = None
-            if isinstance(contacts, list) and contacts:
-                first_contact = contacts[0]
-                if isinstance(first_contact, dict):
-                    contact_wa_id = first_contact.get("wa_id")
-                    profile = first_contact.get("profile")
-                    if isinstance(profile, dict):
-                        contact_name = profile.get("name")
+            names_by_sender = {}
+            for contact in contacts if isinstance(contacts, list) else []:
+                if isinstance(contact, dict) and isinstance(contact.get("profile"), dict):
+                    names_by_sender[str(contact.get("wa_id") or "")] = contact["profile"].get("name")
 
             for message in messages:
                 if not isinstance(message, dict):
                     continue
-                if str(message.get("type") or "").strip().lower() != "text":
+                from_number = str(message.get("from") or "").strip()
+                if not from_number:
                     continue
-                text_payload = message.get("text")
-                if not isinstance(text_payload, dict):
+                content = _normalize_meta_message_content(message)
+                if content is None:
                     continue
-                body = str(text_payload.get("body") or "").strip()
-                from_number = str(message.get("from") or contact_wa_id or "").strip()
-                if not body or not from_number:
-                    continue
-                return {
+                context = message.get("context")
+                raw_timestamp = str(message.get("timestamp") or "").strip()
+                received_at = _unix_timestamp_iso(raw_timestamp)
+                extracted.append({
+                    "received_at": received_at,
                     "event": "message.received",
                     "from_number": from_number,
-                    "from_name": str(contact_name or "").strip() or None,
-                    "text": body,
+                    "from_name": str(names_by_sender.get(from_number) or "").strip() or None,
+                    "text": content["text"],
+                    "content_type": content["content_type"],
+                    "reply_id": content.get("reply_id"),
+                    "media_type": content.get("media_type"),
+                    "context_message_id": (
+                        str(context.get("id") or "").strip() or None if isinstance(context, dict) else None
+                    ),
                     "provider_message_id": str(message.get("id") or "").strip() or None,
                     "phone_number_id": phone_number_id,
-                }
+                })
 
-    return None
+    return extracted
+
+
+_META_DELIVERY_STATUSES = frozenset({"sent", "delivered", "read", "failed"})
+
+
+def _unix_timestamp_iso(raw_timestamp: str) -> str | None:
+    """Timestamp Unix do payload em ISO UTC; valor absurdo vira None, nunca 500."""
+    if not raw_timestamp.isdigit():
+        return None
+    try:
+        return datetime.fromtimestamp(int(raw_timestamp), UTC).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _extract_meta_whatsapp_statuses(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Callbacks de status de mensagens enviadas (W05), só de payload Meta assinado."""
+    if payload.get("object") != "whatsapp_business_account":
+        return []
+    extracted: list[dict[str, Any]] = []
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            value = change.get("value") if isinstance(change, dict) else None
+            if not isinstance(value, dict) or not isinstance(value.get("statuses"), list):
+                continue
+            metadata = value.get("metadata")
+            phone_number_id = (
+                str(metadata.get("phone_number_id") or "").strip() or None if isinstance(metadata, dict) else None
+            )
+            for status_event in value["statuses"]:
+                if not isinstance(status_event, dict):
+                    continue
+                status = str(status_event.get("status") or "").strip().lower()
+                provider_message_id = str(status_event.get("id") or "").strip()
+                if status not in _META_DELIVERY_STATUSES or not provider_message_id:
+                    continue
+                error_code = None
+                errors = status_event.get("errors")
+                if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+                    raw_code = errors[0].get("code")
+                    error_code = int(str(raw_code)) if str(raw_code or "").isdigit() else None
+                raw_timestamp = str(status_event.get("timestamp") or "").strip()
+                extracted.append({
+                    "phone_number_id": phone_number_id,
+                    "provider_message_id": provider_message_id,
+                    "status": status,
+                    "provider_timestamp": _unix_timestamp_iso(raw_timestamp),
+                    # Só o código: `error_data` pode carregar dado do destinatário.
+                    "error_code": error_code,
+                })
+    return extracted
+
+
+def _resolve_status_company(phone_number_id: str | None) -> int | None:
+    """Empresa do callback pelo binding ativo; sem binding, o callback é ignorado."""
+    normalized = str(phone_number_id or "").strip()
+    if not normalized:
+        return None
+    binding = repository.get_whatsapp_binding_by_phone_number_id(normalized)
+    if not binding or not int(binding.get("company_active") or 0):
+        return None
+    return int(binding["company_id"])
+
+
+# Eventos sem pedido do cliente: não viram job nem resposta.
+_IGNORED_META_MESSAGE_TYPES = frozenset({"reaction", "system", "ephemeral", "request_welcome"})
+
+
+def _unsupported_content(message_type: str) -> dict[str, Any]:
+    media_type = re.sub(r"[^a-z_]", "", message_type)[:32] or "unknown"
+    return {"content_type": "unsupported", "text": f"[{media_type}]", "media_type": media_type}
+
+
+def _normalize_meta_message_content(message: dict[str, Any]) -> dict[str, Any] | None:
+    """Texto utilizável de uma mensagem Meta, ou None para eventos ignorados.
+
+    Áudio, imagem e outros tipos não somem mais em silêncio: entram como
+    `unsupported` para o orquestrador orientar o cliente (W07).
+    """
+    message_type = str(message.get("type") or "").strip().lower()
+    if message_type == "text":
+        text_payload = message.get("text")
+        body = str(text_payload.get("body") or "").strip() if isinstance(text_payload, dict) else ""
+        return {"content_type": "text", "text": body} if body else None
+
+    if message_type == "interactive":
+        interactive = message.get("interactive")
+        reply = None
+        if isinstance(interactive, dict):
+            reply = interactive.get("button_reply") or interactive.get("list_reply")
+        if isinstance(reply, dict):
+            reply_id = str(reply.get("id") or "").strip() or None
+            title = str(reply.get("title") or "").strip() or reply_id
+            if title:
+                return {"content_type": "interactive", "text": title, "reply_id": reply_id}
+        return _unsupported_content(message_type)
+
+    if message_type == "button":
+        button = message.get("button")
+        if isinstance(button, dict):
+            payload = str(button.get("payload") or "").strip() or None
+            label = str(button.get("text") or "").strip() or payload
+            if label:
+                return {"content_type": "button", "text": label, "reply_id": payload}
+        return _unsupported_content(message_type)
+
+    if not message_type or message_type in _IGNORED_META_MESSAGE_TYPES:
+        return None
+    return _unsupported_content(message_type)
 
 
 def _is_normalized_whatsapp_payload(payload: dict[str, Any]) -> bool:
@@ -174,6 +288,10 @@ def _parse_normalized_whatsapp_payload(payload: dict[str, Any]) -> dict[str, Any
             from_name=str(payload.get("from_name") or "").strip() or None,
             text=normalized_text,
             provider_message_id=str(payload.get("provider_message_id") or "").strip() or None,
+            content_type=str(payload.get("content_type") or "text"),
+            reply_id=str(payload.get("reply_id") or "").strip() or None,
+            media_type=str(payload.get("media_type") or "").strip() or None,
+            context_message_id=str(payload.get("context_message_id") or "").strip() or None,
         )
     except ValidationError as exc:
         # Report which field failed and why, never the offending value itself.
@@ -264,85 +382,6 @@ def _validate_meta_signature(raw_body: bytes, signature_header: str | None) -> N
 
     if not hmac.compare_digest(expected_signature, received_signature):
         raise HTTPException(status_code=403, detail="Invalid WhatsApp webhook signature.")
-
-
-def _dispatch_whatsapp_auto_reply(result: dict[str, Any]) -> dict[str, Any] | None:
-    if not result.get("auto_reply") or not str(result.get("reply") or "").strip():
-        return None
-
-    outbound_message_id = repository.create_outbound_message(
-        contact_id=str(result["contact_id"]),
-        company_id=result.get("company_id"),
-        message=str(result["reply"]),
-        source="whatsapp_auto_reply",
-        status="pending",
-    )
-    try:
-        dispatch_result = dispatch_outbound_message(
-            outbound_message_id=outbound_message_id,
-            channel="whatsapp",
-            company_id=result.get("company_id"),
-        )
-        return {
-            "outbound_message_id": outbound_message_id,
-            "delivery_status": dispatch_result.get("delivery_status"),
-            "provider_message_id": dispatch_result.get("provider_message_id"),
-            "provider_response": dispatch_result.get("provider_response"),
-            "error": None,
-        }
-    except OutboundDispatchError as exc:
-        log_event(
-            logger,
-            logging.WARNING,
-            "api.whatsapp.auto_reply.dispatch_failed",
-            outbound_message_id=outbound_message_id,
-            error_type=type(exc).__name__,
-        )
-        return {
-            "outbound_message_id": outbound_message_id,
-            "delivery_status": "failed",
-            "provider_message_id": None,
-            "provider_response": None,
-            "error": str(exc),
-        }
-
-
-def _begin_whatsapp_idempotent_processing(
-    *,
-    normalized_payload: dict[str, Any],
-    request_company: RequestCompanyScope,
-    payload_mode: str,
-) -> tuple[bool, dict[str, Any] | None]:
-    provider_message_id = str(normalized_payload.get("provider_message_id") or "").strip()
-    if not provider_message_id:
-        return True, None
-
-    status = repository.begin_inbound_message_processing(
-        provider="whatsapp",
-        provider_message_id=provider_message_id,
-        company_id=request_company.get("company_id"),
-        contact_id=str(normalized_payload.get("from_number") or "").strip() or None,
-        payload_mode=payload_mode,
-    )
-    if status == "started":
-        return True, None
-
-    log_event(
-        logger,
-        logging.INFO,
-        "api.whatsapp.webhook.duplicate_ignored",
-        provider_message_id=provider_message_id,
-        duplicate_status=status,
-        company_id=request_company.get("company_id"),
-        company_slug=request_company.get("company_slug"),
-    )
-    return False, {
-        "processed": False,
-        "reason": "duplicate_provider_message_id",
-        "duplicate_status": status,
-        "payload_mode": payload_mode,
-        "provider_message_id": provider_message_id,
-    }
 
 
 @router.post("/messages/incoming", response_model=IncomingMessageResponse)
@@ -458,105 +497,64 @@ async def whatsapp_webhook(
             authorization=authorization,
         )
 
-    normalized_payload: dict[str, Any] | None = None
-    # Kept out of the validated message model: it is Meta-only tenant metadata,
-    # never a field a normalized-ingress caller can supply.
-    meta_phone_number_id: str | None = None
-    if payload_mode == "normalized":
-        normalized_payload = _parse_normalized_whatsapp_payload(payload)
-    elif payload_mode == "meta":
-        meta_message = _extract_meta_whatsapp_message(payload)
-        if meta_message:
-            meta_phone_number_id = meta_message.get("phone_number_id")
-            normalized_payload = _parse_normalized_whatsapp_payload(meta_message)
+    # Validate the entire batch before committing any item. Invalid signatures,
+    # fields or bindings never result in a partially accepted batch.
+    def persist_batch() -> dict[str, Any]:
+        candidates = _extract_meta_whatsapp_messages(payload) if payload_mode == "meta" else (
+            [payload] if payload_mode == "normalized" else []
+        )
+        items = []
+        rejected_count = 0
+        first_rejection: HTTPException | None = None
+        for candidate in candidates:
+            try:
+                message = _parse_normalized_whatsapp_payload(candidate)
+                if not message.get("provider_message_id"):
+                    raise HTTPException(status_code=422, detail="provider_message_id is required for durable webhook ingress.")
+                scope = _resolve_meta_company(candidate.get("phone_number_id")) if payload_mode == "meta" else _resolve_request_company(
+                    company_id=company_id, company_slug=company_slug,
+                    x_company_id=x_company_id, x_company_slug=x_company_slug,
+                )
+                if scope["company_id"] is None:
+                    raise HTTPException(status_code=422, detail="Select a company for normalized webhook ingress.")
+            except HTTPException as exc:
+                # Payload Meta assinado pode trazer vários números: um item de
+                # número não vinculado ou inválido não derruba os demais (a Meta
+                # reenviaria o lote inteiro até desistir). Nada é gravado para
+                # o item recusado; lote sem nenhum item válido continua falhando.
+                if payload_mode != "meta":
+                    raise
+                rejected_count += 1
+                first_rejection = first_rejection or exc
+                log_event(logger, logging.WARNING, "api.whatsapp.webhook.item_rejected", status_code=exc.status_code)
+                continue
+            items.append({**message, "received_at": candidate.get("received_at"), **scope, "payload_mode": payload_mode})
+        # Status de números vinculados são gravados antes de uma eventual recusa
+        # do lote de mensagens; senão um item inválido descartaria todos eles.
+        status_updates = 0
+        if payload_mode == "meta":
+            for status_event in _extract_meta_whatsapp_statuses(payload):
+                status_company_id = _resolve_status_company(status_event["phone_number_id"])
+                if status_company_id is None:
+                    continue
+                recorded = record_delivery_status(
+                    company_id=status_company_id,
+                    provider_message_id=status_event["provider_message_id"],
+                    status=status_event["status"],
+                    provider_timestamp=status_event["provider_timestamp"],
+                    error_code=status_event["error_code"],
+                )
+                status_updates += int(bool(recorded["recorded"]))
+        if candidates and not items and first_rejection is not None:
+            raise first_rejection
+        if not items:
+            return {"processed": False, "reason": "unsupported_or_non_message_event", "payload_mode": payload_mode,
+                    "status_updates": status_updates}
+        jobs = enqueue_batch(items)
+        return {"accepted": True, "processed": False, "payload_mode": payload_mode,
+                "queued_count": sum(not job["duplicate"] for job in jobs), "jobs": jobs,
+                "status_updates": status_updates, "rejected_count": rejected_count}
 
-    if not normalized_payload:
-        log_event(
-            logger,
-            logging.INFO,
-            "api.whatsapp.webhook.ignored",
-            payload_mode=payload_mode,
-        )
-        return {
-            "processed": False,
-            "reason": "unsupported_or_non_message_event",
-            "payload_mode": payload_mode,
-        }
-
-    if payload_mode == "meta":
-        # Meta mode ignores caller-supplied company selectors entirely: the
-        # tenant comes from the signed payload's phone_number_id binding.
-        request_company = _resolve_meta_company(meta_phone_number_id)
-    else:
-        # Normalized mode is authenticated by the internal ingress secret, whose
-        # holder is a trusted internal component, so it may select a tenant
-        # explicitly. The company must still exist (404 otherwise).
-        request_company = _resolve_request_company(
-            company_id=company_id,
-            company_slug=company_slug,
-            x_company_id=x_company_id,
-            x_company_slug=x_company_slug,
-        )
-    resolved_company_id = request_company["company_id"]
-    resolved_company_slug = request_company["company_slug"]
-    log_event(
-        logger,
-        logging.INFO,
-        "api.whatsapp.webhook.received",
-        whatsapp_event=normalized_payload["event"],
-        company_id=resolved_company_id,
-        company_slug=resolved_company_slug,
-        payload_mode=payload_mode,
-        tenant_source="channel_binding" if payload_mode == "meta" else "request_scope",
-        has_from_name=bool(normalized_payload.get("from_name")),
-    )
-    should_process, duplicate_response = _begin_whatsapp_idempotent_processing(
-        normalized_payload=normalized_payload,
-        request_company=request_company,
-        payload_mode=payload_mode,
-    )
-    if not should_process:
-        return duplicate_response
-
-    provider_message_id = str(normalized_payload.get("provider_message_id") or "").strip()
-    try:
-        result = process_whatsapp_webhook(
-            from_number=str(normalized_payload["from_number"]),
-            from_name=normalized_payload.get("from_name"),
-            text=str(normalized_payload["text"]),
-            company_id=resolved_company_id,
-            company_slug=resolved_company_slug,
-        )
-        auto_reply_dispatch = _dispatch_whatsapp_auto_reply(result)
-        log_event(
-            logger,
-            logging.INFO,
-            "api.whatsapp.webhook.completed",
-            company_id=result.get("company_id"),
-            company_slug=result.get("company_slug"),
-            classification=result.get("classification"),
-            auto_reply=result.get("auto_reply"),
-            handoff_required=result.get("handoff_required"),
-            auto_reply_dispatched=bool(auto_reply_dispatch),
-        )
-        if provider_message_id:
-            repository.mark_inbound_message_processing_completed(
-                provider="whatsapp",
-                provider_message_id=provider_message_id,
-                company_id=resolved_company_id,
-            )
-        return {
-            **result,
-            "payload_mode": payload_mode,
-            "provider_message_id": normalized_payload.get("provider_message_id"),
-            "auto_reply_dispatch": auto_reply_dispatch,
-        }
-    except Exception as exc:
-        if provider_message_id:
-            repository.mark_inbound_message_processing_failed(
-                provider="whatsapp",
-                provider_message_id=provider_message_id,
-                error=f"{type(exc).__name__}: {exc}",
-                company_id=resolved_company_id,
-            )
-        raise
+    # The small DB transaction runs off the event loop. No LLM or delivery work
+    # occurs here; a successful response means the messages are durably stored.
+    return await run_in_threadpool(persist_batch)

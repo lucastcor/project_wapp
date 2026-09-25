@@ -1,4 +1,7 @@
+from types import SimpleNamespace
+
 from app.core.config import settings
+from app.llm.providers.business_provider import BusinessLLMProvider
 from app.services import reply_services
 from app.services.reply_services import generate_business_reply
 
@@ -50,6 +53,42 @@ def test_reply_service_fallback_for_non_auto_reply_case(monkeypatch) -> None:
 
     assert result["source"] == "none"
     assert result["reply"] == ""
+
+
+def test_business_prompt_uses_fixed_catalog_price_as_authoritative_source() -> None:
+    class CapturingProvider(BusinessLLMProvider):
+        model = "test-model"
+
+        def __init__(self) -> None:
+            self.prompt = ""
+
+        def _generate(self, *, model, input, text=None):
+            self.prompt = input
+            return SimpleNamespace(output_text="A consulta custa R$ 150,00.")
+
+    provider = CapturingProvider()
+    reply = provider.generate_business_reply(
+        classification="lead_novo",
+        message="Quanto custa a consulta?",
+        company_context={
+            "catalog": {
+                "items": [
+                    {
+                        "name": "Consulta inicial",
+                        "description": "Consulta presencial",
+                        "price": 150.0,
+                        "price_mode": "fixed",
+                    }
+                ]
+            }
+        },
+        require_source_for_facts=True,
+        has_relevant_source=False,
+    )
+
+    assert reply == "A consulta custa R$ 150,00."
+    assert "Preço cadastrado: R$ 150,00" in provider.prompt
+    assert "catálogo disponível acima também são fontes autorizadas" in provider.prompt
 
 
 def test_reply_service_returns_openai_source_when_finetuned_flag_is_disabled(monkeypatch) -> None:

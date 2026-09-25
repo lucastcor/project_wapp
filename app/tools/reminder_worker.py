@@ -5,7 +5,11 @@ import time
 
 from app.core.config import settings
 from app.core.logging import configure_logging, get_logger, log_event
-from app.services.appointment_queue_service import process_due_queue_offers
+from app.services.appointment_queue_service import (
+    process_due_queue_offers,
+    recover_deferred_queue_offers,
+)
+from app.services.calendar_service import reconcile_pending_reservations
 from app.services.reminder_service import dispatch_due_reminders
 from app.services.runtime_guard_service import validate_runtime_environment
 from app.storage.db import (
@@ -14,6 +18,7 @@ from app.storage.db import (
     close_postgres_pool,
     init_db,
 )
+from app.storage.operation_repository import fail_stale_confirmations
 from app.storage.repository import RuntimeRepository
 
 configure_logging()
@@ -58,6 +63,14 @@ def run_worker_iteration() -> list[dict]:
                 )
             )
         processed.extend(process_due_queue_offers())
+        # Encaixe adiado quando falhou logo após um cancelamento (P04, R02).
+        processed.extend(recover_deferred_queue_offers())
+        # Reserva `pending` órfã: confirma pelo evento externo ou libera (P04).
+        processed.extend(reconcile_pending_reservations())
+        # Aceite sem execução (queda entre aceite e claim) não fica pendurado.
+        stale_confirmations = fail_stale_confirmations()
+        if stale_confirmations:
+            processed.append({"action": "stale_confirmations_failed", "count": stale_confirmations})
         return processed
     finally:
         repository.release_worker_lease(

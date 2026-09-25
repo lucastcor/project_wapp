@@ -2,6 +2,7 @@ import json
 import logging
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import PlainTextResponse
 
 from app.api.admin_security import (
@@ -26,6 +27,7 @@ from app.api.schemas import (
     CompanyCreatePayload,
     CompanyResponse,
     ContactUpdatePayload,
+    ConversationOwnershipRequest,
     IncomingMessageRequest,
     IncomingMessageResponse,
     InternalReminderPayload,
@@ -61,8 +63,12 @@ from app.services.appointment_queue_service import (
     respond_to_queue_offer,
 )
 from app.services.calendar_service import (
+    BookingConflictError,
+    BookingNotFoundError,
+    BookingPolicyError,
     CalendarProviderError,
     cancel_calendar_booking,
+    check_calendar_connection,
     create_calendar_booking,
     create_calendar_integration,
     get_calendar_bookings,
@@ -111,6 +117,10 @@ from app.services.training_export_service import (
 from app.services.training_import_service import (
     TrainingImportError,
     import_training_records,
+)
+from app.services.whatsapp_provider import (
+    check_whatsapp_connection,
+    get_whatsapp_channel_status,
 )
 from app.storage.repository import RuntimeRepository
 
@@ -411,6 +421,30 @@ def read_calendar_profile(company_id: int | None = Query(default=None)) -> dict:
     return profile
 
 
+@admin_router.post(
+    "/calendar/test-connection",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def test_calendar_connection_endpoint(
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    result = check_calendar_connection(company_id=company_id)
+    _record_audit_event(
+        request=request,
+        action="connection_test",
+        resource_type="calendar_integration",
+        company_id=company_id,
+        status="success" if result["connected"] else "failure",
+        metadata={
+            "provider": result["provider"],
+            "connected": result["connected"],
+            "error_kind": result.get("error_kind"),
+        },
+    )
+    return result
+
+
 @admin_router.get("/calendar/timeline")
 def read_calendar_timeline(
     company_id: int | None = Query(default=None),
@@ -581,7 +615,7 @@ def create_calendar_booking_endpoint(
             customer_profile=payload.customer_profile,
         )
     except CalendarProviderError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _booking_http_error(exc) from exc
 
     confirmation_outbound_id: int | None = None
     if payload.request_bot_confirmation:
@@ -638,7 +672,9 @@ def create_calendar_booking_endpoint(
         resource_type="appointment_booking",
         resource_id=str(booking["id"]),
         company_id=company_id,
-        metadata={
+        # No PostgreSQL `starts_at`/`ends_at` chegam como datetime; o JSON da
+        # auditoria e do evento precisa de texto ISO.
+        metadata=jsonable_encoder({
             "provider": booking["provider"],
             "starts_at": booking["starts_at"],
             "ends_at": booking["ends_at"],
@@ -647,16 +683,16 @@ def create_calendar_booking_endpoint(
             "customer_profile": booking.get("customer_profile"),
             "request_bot_confirmation": payload.request_bot_confirmation,
             "confirmation_outbound_message_id": confirmation_outbound_id,
-        },
+        }),
     )
     broadcast_event(
         "new_booking",
-        {
+        jsonable_encoder({
             "booking_id": booking.get("id"),
             "title": booking.get("title"),
             "starts_at": booking.get("starts_at"),
             "contact_id": mask_identifier(str(booking.get("contact_id") or "")) or None,
-        },
+        }),
         company_id=booking.get("company_id") or company_id,
     )
     if confirmation_outbound_id is not None:
@@ -684,6 +720,7 @@ def reschedule_calendar_booking_endpoint(
                 description=payload.description,
                 scheduling_profile_key=payload.scheduling_profile_key,
                 customer_profile=payload.customer_profile,
+                actor="operator",
             )
             if company_id is None
             else reschedule_calendar_booking(
@@ -696,10 +733,11 @@ def reschedule_calendar_booking_endpoint(
                 scheduling_profile_key=payload.scheduling_profile_key,
                 customer_profile=payload.customer_profile,
                 company_id=company_id,
+                actor="operator",
             )
         )
     except CalendarProviderError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _booking_http_error(exc) from exc
 
     _record_audit_event(
         request=request,
@@ -707,15 +745,37 @@ def reschedule_calendar_booking_endpoint(
         resource_type="appointment_booking",
         resource_id=str(booking_id),
         company_id=booking.get("company_id"),
-        metadata={
+        metadata=jsonable_encoder({
             "starts_at": booking.get("starts_at"),
             "ends_at": booking.get("ends_at"),
             "scheduling_profile_key": booking.get("scheduling_profile_key"),
             "customer_profile": booking.get("customer_profile"),
             "external_sync_status": booking.get("external_sync", {}).get("status"),
-        },
+            "policy_decision": booking.get("policy_decision"),
+        }),
     )
     return booking
+
+
+def _booking_http_error(exc: Exception) -> HTTPException:
+    """Traduz erros de agenda para HTTP sem expor dados do cliente.
+
+    A fila embrulha o erro de agenda em `AppointmentQueueError`; a causa
+    original decide o status.
+    """
+    cause: BaseException | None = exc
+    while isinstance(cause, AppointmentQueueError) and cause.__cause__ is not None:
+        cause = cause.__cause__
+    if isinstance(cause, BookingNotFoundError):
+        return HTTPException(status_code=404, detail=str(cause))
+    if isinstance(cause, BookingConflictError):
+        return HTTPException(status_code=409, detail=str(cause))
+    if isinstance(cause, BookingPolicyError):
+        return HTTPException(
+            status_code=422,
+            detail={"message": str(cause), "outcome": cause.outcome, "reason": cause.reason},
+        )
+    return HTTPException(status_code=400, detail=str(exc))
 
 
 @admin_router.post(
@@ -728,19 +788,21 @@ def cancel_calendar_booking_endpoint(
     request: Request,
     company_id: int | None = Query(default=None),
 ) -> dict:
+    policy_decision: dict | None = None
     try:
         if payload.trigger_queue_recovery:
             result = (
-                release_booking_slot(booking_id=booking_id)
+                release_booking_slot(booking_id=booking_id, actor="operator")
                 if company_id is None
-                else release_booking_slot(booking_id=booking_id, company_id=company_id)
+                else release_booking_slot(booking_id=booking_id, company_id=company_id, actor="operator")
             )
         else:
             result = (
-                cancel_calendar_booking(booking_id=booking_id)
+                cancel_calendar_booking(booking_id=booking_id, actor="operator")
                 if company_id is None
-                else cancel_calendar_booking(booking_id=booking_id, company_id=company_id)
+                else cancel_calendar_booking(booking_id=booking_id, company_id=company_id, actor="operator")
             )
+            policy_decision = result.get("policy_decision")
             result = {
                 "booking": result["booking"],
                 "cancelled_reminders": result["cancelled_reminders"],
@@ -752,7 +814,7 @@ def cancel_calendar_booking_endpoint(
                 },
             }
     except (AppointmentQueueError, CalendarProviderError) as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise _booking_http_error(exc) from exc
 
     _record_audit_event(
         request=request,
@@ -763,6 +825,8 @@ def cancel_calendar_booking_endpoint(
         metadata={
             "trigger_queue_recovery": payload.trigger_queue_recovery,
             "reason": payload.reason,
+            "actor": "operator",
+            "policy_decision": policy_decision,
             "external_sync_status": result.get("external_sync", {}).get("status"),
             "created_offer_id": (
                 result["queue_recovery"]["created_offer"]["id"]
@@ -1073,6 +1137,20 @@ def update_company_context(
     request: Request,
     company_slug: str | None = Query(default=None),
 ) -> dict:
+    from app.services.company_config_service import (
+        CompanyConfigError,
+        publish_legacy_context_write,
+        validate_company_config_input,
+    )
+
+    # Mesma validação da versão publicada, antes de gravar o legado: um
+    # contexto aceito aqui e recusado na publicação deixaria as duas fontes
+    # divergentes.
+    try:
+        validate_company_config_input(payload.data)
+    except CompanyConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         record = save_company_context_record(
             payload.data,
@@ -1104,6 +1182,17 @@ def update_company_context(
         company_id=record["company_id"],
         revision=record["revision"],
     )
+    # D12: o runtime lê a versão publicada; a API legada publica versão para
+    # continuar tendo efeito imediato.
+    try:
+        published_version = publish_legacy_context_write(
+            company_slug=company_slug,
+            context=payload.data,
+            author=getattr(request.state, "admin_actor", None),
+            change_note="Atualização pela API legada /admin/company-context",
+        )
+    except CompanyConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     _record_audit_event(
         request=request,
         action="update",
@@ -1115,6 +1204,7 @@ def update_company_context(
             "revision": record["revision"],
             "schema_version": record["schema_version"],
             "top_level_keys": sorted(payload.data.keys()),
+            "published_version": published_version["version"] if published_version else None,
         },
     )
     return record["data"]
@@ -2237,6 +2327,51 @@ def check_billing_limit(
 # ── WhatsApp channel bindings ─────────────────────────────────────────
 
 
+@admin_router.get("/whatsapp/channel-status")
+def read_whatsapp_channel_status(
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    scope = get_authorized_scope(request)
+    resolved_company_id = scope.company_id if scope is not None else None
+    if resolved_company_id is None:
+        resolved_company_id = _resolve_company_scope(company_id=company_id, required=True)
+    if resolved_company_id is None:  # pragma: no cover - guarded by required=True
+        raise HTTPException(status_code=400, detail="A company scope is required.")
+    return get_whatsapp_channel_status(int(resolved_company_id))
+
+
+@admin_router.post(
+    "/whatsapp/test-connection",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def test_whatsapp_connection_endpoint(
+    request: Request,
+    company_id: int | None = Query(default=None),
+) -> dict:
+    scope = get_authorized_scope(request)
+    resolved_company_id = scope.company_id if scope is not None else None
+    if resolved_company_id is None:
+        resolved_company_id = _resolve_company_scope(company_id=company_id, required=True)
+    if resolved_company_id is None:  # pragma: no cover - guarded by required=True
+        raise HTTPException(status_code=400, detail="A company scope is required.")
+    result = check_whatsapp_connection(int(resolved_company_id))
+    _record_audit_event(
+        request=request,
+        action="connection_test",
+        resource_type="whatsapp_channel",
+        company_id=int(resolved_company_id),
+        status="success" if result["connected"] else "failure",
+        metadata={
+            "provider": result["provider"],
+            "connected": result["connected"],
+            "error_kind": result.get("error_kind"),
+            "provider_code": result.get("provider_code"),
+        },
+    )
+    return result
+
+
 @admin_router.get("/whatsapp/bindings", response_model=list[WhatsAppBindingResponse])
 def read_whatsapp_bindings(
     company_id: int | None = Query(default=None),
@@ -2407,3 +2542,194 @@ def simulate_incoming_message(
     )
     publish_incoming_message_event(result, contact_id=payload.contact_id)
     return IncomingMessageResponse(**result)
+
+
+@admin_router.get("/inbound/jobs")
+def read_inbound_jobs(
+    company_id: int = Query(..., gt=0),
+    status: str | None = Query(default=None, max_length=20),
+    limit: int = Query(default=100, ge=1, le=500),
+) -> dict:
+    from app.storage.inbound_repository import list_jobs
+    try:
+        return {"jobs": list_jobs(company_id, status=status, limit=limit)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@admin_router.post("/inbound/jobs/{job_id}/resolve", dependencies=[Depends(require_admin_role("operator"))])
+def resolve_inbound_review(job_id: int, request: Request, company_id: int = Query(..., gt=0)) -> dict:
+    """Acknowledge manual handling; never replay uncertain external effects.
+
+    A resposta do bot vinculada ao job e ainda não enviada sai de circulação na
+    mesma transação: desbloquear a conversa não pode liberar uma resposta velha,
+    fora de ordem e talvez com humano no atendimento (revisão P06).
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from app.core.config import settings
+    from app.storage.inbound_repository import now_iso
+    from app.storage.sql_support import transaction
+
+    now = datetime.now(UTC)
+    outbound_outcome = "none"
+    with transaction() as cursor:
+        cursor.execute(
+            "SELECT outbound_message_id FROM inbound_jobs WHERE id = ? AND company_id = ? AND status = 'review'",
+            (job_id, company_id),
+        )
+        job = cursor.fetchone()
+        if job is None:
+            raise HTTPException(status_code=409, detail="Job not found in this company or not awaiting review.")
+        if job["outbound_message_id"] is not None:
+            cursor.execute(
+                "SELECT status, claimed_at FROM outbound_messages WHERE id = ? AND company_id = ?",
+                (job["outbound_message_id"], company_id),
+            )
+            outbound = cursor.fetchone()
+            status = str(outbound["status"]) if outbound else "missing"
+            stale_processing = False
+            if status == "processing":
+                try:
+                    claimed_at = datetime.fromisoformat(str(outbound["claimed_at"]))
+                    if claimed_at.tzinfo is None:
+                        claimed_at = claimed_at.replace(tzinfo=UTC)
+                    stale_processing = now - claimed_at > timedelta(seconds=max(30, settings.outbound_claim_ttl_seconds))
+                except (TypeError, ValueError):
+                    stale_processing = True
+                if not stale_processing:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="O envio desta resposta ainda está em andamento; tente de novo em alguns minutos.",
+                    )
+            if status in {"pending", "retry"} or stale_processing:
+                cursor.execute(
+                    """
+                    UPDATE outbound_messages
+                    SET status = 'dead_letter', last_error = ?, failed_at = ?, claim_token = NULL, next_attempt_at = NULL
+                    WHERE id = ? AND company_id = ? AND status = ?
+                    """,
+                    ("permanent:-:blocked:resolved_manually", now.isoformat(), job["outbound_message_id"], company_id,
+                     status),
+                )
+                outbound_outcome = "withdrawn"
+            else:
+                outbound_outcome = status
+        cursor.execute(
+            "UPDATE inbound_jobs SET status = 'completed', updated_at = ? WHERE id = ? AND company_id = ? AND status = 'review'",
+            (now_iso(), job_id, company_id),
+        )
+    _record_audit_event(request=request, action="inbound.review.resolved", resource_type="inbound_job",
+                        resource_id=str(job_id), company_id=company_id, metadata={"outbound": outbound_outcome})
+    return {"resolved": True, "replayed": False, "outbound": outbound_outcome}
+
+
+# ── posse humana da conversa e resumo operacional (P06) ────────────────
+
+
+@admin_router.get("/conversations/ownership")
+def read_conversation_ownerships(company_id: int = Query(..., gt=0)) -> dict:
+    from app.storage.ownership_repository import list_human_owned
+
+    return {"conversations": list_human_owned(company_id=company_id)}
+
+
+def _normalized_contact_id(contact_id: str) -> str:
+    # "+55 (11) 90000-0001" e "5511900000001" são o mesmo contato do WhatsApp;
+    # identificador de outro canal (sem formato de telefone) fica como veio.
+    value = (contact_id or "").strip()
+    if value and all(char in "0123456789 +-()." for char in value):
+        value = "".join(char for char in value if char in "0123456789")
+    if not value:
+        raise HTTPException(status_code=422, detail="Informe o telefone do contato com DDI e DDD.")
+    return value
+
+
+def _ownership_user_id(request: Request) -> int:
+    # Posse é de uma pessoa: token de serviço/break-glass não assume conversa.
+    user_id = getattr(request.state, "admin_user_id", None)
+    if not user_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Assumir ou devolver conversa exige um usuário identificado por sessão.",
+        )
+    return int(user_id)
+
+
+@admin_router.post(
+    "/conversations/{contact_id}/take",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def take_conversation(
+    contact_id: str,
+    request: Request,
+    payload: ConversationOwnershipRequest | None = None,
+    company_id: int = Query(..., gt=0),
+) -> dict:
+    from app.storage.ownership_repository import take_ownership
+
+    contact_id = _normalized_contact_id(contact_id)
+    result = take_ownership(
+        company_id=company_id,
+        contact_id=contact_id,
+        user_id=_ownership_user_id(request),
+        reason=payload.reason if payload else None,
+    )
+    _record_audit_event(
+        request=request,
+        action="conversation.ownership.take",
+        resource_type="conversation",
+        resource_id=mask_identifier(contact_id),
+        company_id=company_id,
+        status="conflict" if result.outcome == "owned_by_other" else "success",
+        metadata={"outcome": result.outcome},
+    )
+    if result.outcome == "owned_by_other":
+        raise HTTPException(status_code=409, detail="A conversa já está com outro operador.")
+    return {"outcome": result.outcome, "ownership": result.ownership}
+
+
+@admin_router.post(
+    "/conversations/{contact_id}/release",
+    dependencies=[Depends(require_admin_role("operator"))],
+)
+def release_conversation(
+    contact_id: str,
+    request: Request,
+    payload: ConversationOwnershipRequest | None = None,
+    company_id: int = Query(..., gt=0),
+) -> dict:
+    from app.storage.ownership_repository import release_ownership
+
+    contact_id = _normalized_contact_id(contact_id)
+    force = bool(payload and payload.force)
+    if force and getattr(request.state, "admin_role", None) != "superadmin":
+        raise HTTPException(
+            status_code=403,
+            detail="Somente o administrador da empresa devolve a conversa de outro operador.",
+        )
+    result = release_ownership(
+        company_id=company_id,
+        contact_id=contact_id,
+        user_id=_ownership_user_id(request),
+        allow_other_owner=force,
+    )
+    _record_audit_event(
+        request=request,
+        action="conversation.ownership.release",
+        resource_type="conversation",
+        resource_id=mask_identifier(contact_id),
+        company_id=company_id,
+        status="conflict" if result.outcome == "owned_by_other" else "success",
+        metadata={"outcome": result.outcome, "forced": force},
+    )
+    if result.outcome == "owned_by_other":
+        raise HTTPException(status_code=409, detail="A conversa está com outro operador.")
+    return {"outcome": result.outcome, "ownership": result.ownership}
+
+
+@admin_router.get("/operations/summary")
+def read_operations_summary(company_id: int = Query(..., gt=0)) -> dict:
+    from app.services.operations_summary_service import get_operations_summary
+
+    return get_operations_summary(company_id)

@@ -6,7 +6,10 @@ from typing import Any
 from app.core.config import settings
 from app.core.logging import get_logger, log_event, mask_identifier
 from app.services.billing_service import BillingLimitError, require_usage_capacity
+from app.services.whatsapp_delivery_policy import decide_whatsapp_delivery
 from app.services.whatsapp_provider import WhatsAppProvider, WhatsAppProviderError
+from app.storage.channel_delivery_repository import link_orphan_delivery_events
+from app.storage.ownership_repository import is_human_owned
 from app.storage.repository import RuntimeRepository
 
 repository = RuntimeRepository()
@@ -16,7 +19,27 @@ VALID_OUTBOUND_CHANNELS = {"whatsapp", "instagram", "generic"}
 
 
 class OutboundDispatchError(Exception):
-    pass
+    """Falha de envio. `kind` decide se repetir é seguro.
+
+    `transient` e `configuration` voltam com backoff; `permanent` não muda com
+    retry; `uncertain` pode já ter sido aceita pela Meta, e repetir duplicaria
+    a mensagem — as duas últimas vão direto para dead letter.
+    """
+
+    RETRYABLE_KINDS = frozenset({"transient", "configuration"})
+
+    def __init__(self, message: str, *, kind: str = "transient", code: int | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.code = code
+
+    @property
+    def retryable(self) -> bool:
+        return self.kind in self.RETRYABLE_KINDS
+
+    @property
+    def diagnostic(self) -> str:
+        return f"{self.kind}:{self.code if self.code is not None else '-'}:{self}"
 
 
 def _normalize_channel(channel: str | None) -> str:
@@ -47,7 +70,35 @@ def _build_dispatch_result(
     }
 
 
+# Envio automático (resposta do bot, lembrete, fila de encaixe, automação) não sai
+# para conversa assumida por uma pessoa (P06, H01). Texto escrito pelo operador
+# (`owner_resolution`, `manual_booking_confirmation`) e confirmação de SAIR/VOLTAR
+# saem normalmente.
+_AUTOMATIC_SOURCES = frozenset({"whatsapp_auto_reply", "reminder_customer"})
+_AUTOMATIC_SOURCE_PREFIXES = ("appointment_queue_", "automation:")
+
+
+def is_automatic_source(source: Any) -> bool:
+    normalized = str(source or "").strip()
+    return normalized in _AUTOMATIC_SOURCES or normalized.startswith(_AUTOMATIC_SOURCE_PREFIXES)
+
+
+def _withheld_by_human_ownership(outbound_message: dict[str, Any]) -> bool:
+    company_id = outbound_message.get("company_id")
+    if company_id is None or not is_automatic_source(outbound_message.get("source")):
+        return False
+    try:
+        return is_human_owned(company_id=int(company_id), contact_id=str(outbound_message["contact_id"]))
+    except Exception as exc:
+        # Sem saber se há humano na conversa, a mensagem não sai agora.
+        raise OutboundDispatchError(
+            f"ownership_check_unavailable:{type(exc).__name__}", kind="transient"
+        ) from exc
+
+
 def _send_via_provider(channel: str, outbound_message: dict[str, Any]) -> dict[str, Any]:
+    if _withheld_by_human_ownership(outbound_message):
+        raise OutboundDispatchError("blocked:human_owned", kind="permanent")
     provider_name = (settings.outbound_provider or "mock").strip().lower()
 
     if provider_name == "mock":
@@ -65,8 +116,22 @@ def _send_via_provider(channel: str, outbound_message: dict[str, Any]) -> dict[s
     if provider_name == "whatsapp":
         if channel != "whatsapp":
             raise OutboundDispatchError(
-                f"Outbound provider 'whatsapp' does not support channel '{channel}'."
+                f"Outbound provider 'whatsapp' does not support channel '{channel}'.",
+                kind="configuration",
             )
+        # Janela de 24 h, template, opt-out e consentimento são decididos aqui,
+        # no envio efetivo: uma recusa registrada depois do enfileiramento
+        # ainda barra a mensagem (P05, W03/W06).
+        try:
+            decision = decide_whatsapp_delivery(outbound_message, now=datetime.now(UTC))
+        except Exception as exc:
+            # Sem decisão de janela/opt-out não há envio; a falha entra no
+            # retry controlado em vez de deixar a mensagem presa em processing.
+            raise OutboundDispatchError(
+                f"delivery_policy_unavailable:{type(exc).__name__}", kind="transient"
+            ) from exc
+        if decision.mode == "blocked":
+            raise OutboundDispatchError(f"blocked:{decision.reason}", kind="permanent")
         try:
             # The sending number is bound to the message's own company, so a
             # reply never leaves through another tenant's WhatsApp number.
@@ -74,15 +139,33 @@ def _send_via_provider(channel: str, outbound_message: dict[str, Any]) -> dict[s
             provider = WhatsAppProvider(
                 company_id=int(message_company_id) if message_company_id is not None else None,
             )
+            if decision.mode == "template" and decision.template is not None:
+                result = provider.send_template(
+                    str(outbound_message["contact_id"]),
+                    template_name=str(decision.template["name"]),
+                    language_code=str(decision.template["language_code"]),
+                    parameters=decision.parameters,
+                )
+                result["provider_response"] = {
+                    "response": result.get("provider_response"),
+                    "template": {
+                        "id": decision.template["id"],
+                        "name": decision.template["name"],
+                        "language_code": decision.template["language_code"],
+                        "purpose": decision.purpose,
+                    },
+                }
+                return result
             return provider.send_message(
                 contact_id=str(outbound_message["contact_id"]),
                 message=str(outbound_message["message"]),
             )
         except WhatsAppProviderError as exc:
-            raise OutboundDispatchError(str(exc)) from exc
+            raise OutboundDispatchError(str(exc), kind=exc.kind, code=exc.code) from exc
 
     raise OutboundDispatchError(
-        f"Unsupported outbound provider: {provider_name}."
+        f"Unsupported outbound provider: {provider_name}.",
+        kind="configuration",
     )
 
 
@@ -107,7 +190,7 @@ def dispatch_outbound_message(
     )
 
     if not outbound_message:
-        raise OutboundDispatchError("Outbound message not found.")
+        raise OutboundDispatchError("Outbound message not found.", kind="permanent")
 
     if outbound_message.get("status") == "sent":
         log_event(
@@ -145,9 +228,9 @@ def dispatch_outbound_message(
                     delivery_status="already_sent",
                 )
             if current and current.get("status") == "dead_letter":
-                raise OutboundDispatchError("Outbound message exhausted its retry policy.")
+                raise OutboundDispatchError("Outbound message exhausted its retry policy.", kind="permanent")
             if current and current.get("status") == "retry":
-                raise OutboundDispatchError("Outbound message is waiting for its next retry.")
+                raise OutboundDispatchError("Outbound message is waiting for its next retry.", kind="transient")
             if current and current.get("status") == "processing":
                 return _build_dispatch_result(
                     outbound_message=current,
@@ -169,7 +252,7 @@ def dispatch_outbound_message(
                 claimed_message.get("max_attempts") or settings.outbound_max_attempts
             )
             retry_at = None
-            if attempt_count < max_attempts:
+            if exc.retryable and attempt_count < max_attempts:
                 base_seconds = max(1, settings.outbound_retry_base_seconds)
                 capped_seconds = min(
                     max(base_seconds, settings.outbound_retry_max_seconds),
@@ -182,7 +265,7 @@ def dispatch_outbound_message(
             final_status = repository.mark_outbound_message_failed(
                 outbound_message_id,
                 claim_token=str(claimed_message["claim_token"]),
-                error=str(exc),
+                error=exc.diagnostic,
                 retry_at=retry_at,
             )
             log_event(
@@ -195,6 +278,8 @@ def dispatch_outbound_message(
                 retry_at=retry_at,
                 final_status=final_status,
                 error_type=type(exc).__name__,
+                error_kind=exc.kind,
+                error_code=exc.code,
             )
         raise
 
@@ -213,6 +298,22 @@ def dispatch_outbound_message(
             provider_message_id=provider_result.get("provider_message_id"),
             provider_response=provider_result.get("provider_response"),
         )
+        if outbound_company_id is not None and provider_result.get("provider_message_id"):
+            # Callback de status que chegou antes deste registro ganha vínculo agora.
+            try:
+                link_orphan_delivery_events(
+                    company_id=int(outbound_company_id),
+                    provider_message_id=str(provider_result["provider_message_id"]),
+                    outbound_message_id=int(outbound_message_id),
+                )
+            except Exception as exc:
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "outbound.dispatch.delivery_event_link_failed",
+                    outbound_message_id=outbound_message_id,
+                    error_type=type(exc).__name__,
+                )
     updated_outbound_message = repository.get_outbound_message(
         outbound_message_id,
         company_id=outbound_company_id,

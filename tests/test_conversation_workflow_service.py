@@ -1,4 +1,24 @@
 from app.services import conversation_workflow_service as workflow_service
+from app.storage.repository import RuntimeRepository
+
+# Fluxos e agenda seguem falsos nestes testes de unidade, mas desde P02 toda
+# confirmação passa por proposta persistida em `booking_operations`, cuja FK
+# exige empresa real e, para cancelamento/remarcação/conclusão, booking real
+# da mesma empresa. Por isso os testes que confirmam ações usam
+# `company_factory` e gravam o booking de verdade (sem enfraquecer a FK).
+real_repository = RuntimeRepository()
+
+
+def _real_booking(company_id: int, contact_id: str, starts_at: str, ends_at: str) -> int:
+    return real_repository.create_appointment_booking(
+        provider="mock",
+        title="Consultoria inicial",
+        starts_at=starts_at,
+        ends_at=ends_at,
+        timezone="America/Sao_Paulo",
+        company_id=company_id,
+        contact_id=contact_id,
+    )
 
 COMPANY_CONTEXT = {
     "enabled_modules": {
@@ -70,6 +90,16 @@ class FakeRepository:
             bookings = [booking for booking in bookings if booking.get("status") == status]
         return bookings
 
+    def get_appointment_booking(self, booking_id: int, *, company_id: int | None = None):
+        return next(
+            (
+                booking
+                for booking in self.bookings
+                if int(booking["id"]) == int(booking_id) and (company_id is None or booking.get("company_id") == company_id)
+            ),
+            None,
+        )
+
     def search_contacts(self, *, query: str, company_id: int | None = None, limit: int = 10):
         normalized_query = query.lower()
         matches = [
@@ -80,9 +110,10 @@ class FakeRepository:
         ]
         return matches[:limit]
 
-def test_scheduling_workflow_books_after_confirmation(monkeypatch) -> None:
+def test_scheduling_workflow_books_after_confirmation(monkeypatch, company_factory) -> None:
     fake_repository = FakeRepository()
     created_booking = {}
+    company_id = company_factory("wf-schedule")
 
     monkeypatch.setattr(workflow_service, "repository", fake_repository)
     monkeypatch.setattr(workflow_service, "process_queue_contact_message", lambda **kwargs: None)
@@ -108,8 +139,12 @@ def test_scheduling_workflow_books_after_confirmation(monkeypatch) -> None:
 
     def fake_create_calendar_booking(**kwargs):
         created_booking.update(kwargs)
+        booking_id = _real_booking(
+            company_id, kwargs["contact_id"], "2026-04-08T13:00:00+00:00", "2026-04-08T14:00:00+00:00"
+        )
+        created_booking["booking_id"] = booking_id
         return {
-            "id": 77,
+            "id": booking_id,
             "starts_at": "2026-04-08T13:00:00+00:00",
             "ends_at": "2026-04-08T14:00:00+00:00",
             "provider": "mock",
@@ -121,7 +156,7 @@ def test_scheduling_workflow_books_after_confirmation(monkeypatch) -> None:
         contact_id="5511999999999",
         contact_name="Cliente Teste",
         message="Quero agendar a Consultoria inicial amanhã às 10h",
-        company_id=1,
+        company_id=company_id,
         company_context=COMPANY_CONTEXT,
     )
 
@@ -134,13 +169,13 @@ def test_scheduling_workflow_books_after_confirmation(monkeypatch) -> None:
         contact_id="5511999999999",
         contact_name="Cliente Teste",
         message="sim, pode confirmar",
-        company_id=1,
+        company_id=company_id,
         company_context=COMPANY_CONTEXT,
     )
 
     assert second.handled is True
     assert second.action == "schedule_confirmed"
-    assert second.metadata["booking_id"] == 77
+    assert second.metadata["booking_id"] == created_booking["booking_id"]
     assert created_booking["contact_id"] == "5511999999999"
     assert "Cliente Teste" in created_booking["title"]
     assert fake_repository.closed_flow["status"] == "completed"
@@ -160,6 +195,41 @@ def test_customer_message_for_reminder_is_not_handled_as_customer_workflow(monke
     )
 
     assert result.handled is False
+
+
+def test_catalog_question_does_not_start_scheduling_workflow(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(workflow_service, "repository", fake_repository)
+    monkeypatch.setattr(workflow_service, "process_queue_contact_message", lambda **kwargs: None)
+
+    result = workflow_service.handle_conversation_workflow(
+        contact_id="5511888888888",
+        contact_name="Cliente Teste",
+        message="Quais serviços vocês oferecem e quanto custa a consulta inicial?",
+        company_id=1,
+        company_context=COMPANY_CONTEXT,
+    )
+
+    assert result.handled is False
+    assert fake_repository.flow is None
+
+
+def test_service_request_without_booking_verb_can_start_scheduling(monkeypatch) -> None:
+    fake_repository = FakeRepository()
+    monkeypatch.setattr(workflow_service, "repository", fake_repository)
+    monkeypatch.setattr(workflow_service, "process_queue_contact_message", lambda **kwargs: None)
+
+    result = workflow_service.handle_conversation_workflow(
+        contact_id="5511888888888",
+        contact_name="Cliente Teste",
+        message="Quero uma consulta inicial",
+        company_id=1,
+        company_context=COMPANY_CONTEXT,
+    )
+
+    assert result.handled is True
+    assert result.classification == "agendamento"
+    assert fake_repository.flow is not None
 
 
 def test_queue_offer_response_is_handled_before_regular_scheduling(monkeypatch) -> None:
@@ -189,12 +259,13 @@ def test_queue_offer_response_is_handled_before_regular_scheduling(monkeypatch) 
     assert result.workflow_type == "appointment_queue"
 
 
-def test_customer_can_cancel_booking_via_natural_conversation(monkeypatch) -> None:
+def test_customer_can_cancel_booking_via_natural_conversation(monkeypatch, company_factory) -> None:
+    company_id = company_factory("wf-cancel")
     fake_repository = FakeRepository()
     fake_repository.bookings = [
         {
-            "id": 51,
-            "company_id": 1,
+            "id": _real_booking(company_id, "5511999999999", "2030-04-08T13:00:00+00:00", "2030-04-08T14:00:00+00:00"),
+            "company_id": company_id,
             "contact_id": "5511999999999",
             "title": "Consultoria inicial",
             "starts_at": "2030-04-08T13:00:00+00:00",
@@ -215,7 +286,8 @@ def test_customer_can_cancel_booking_via_natural_conversation(monkeypatch) -> No
     monkeypatch.setattr(
         workflow_service,
         "release_booking_slot",
-        lambda booking_id: {
+        # `company_id` agora é repassado: o cancelamento fica no escopo da empresa.
+        lambda booking_id, company_id=None: {
             "booking": {"id": booking_id, "status": "cancelled"},
             "queue_recovery": {"created_offer": None},
         },
@@ -225,7 +297,7 @@ def test_customer_can_cancel_booking_via_natural_conversation(monkeypatch) -> No
         contact_id="5511999999999",
         contact_name="Cliente Teste",
         message="Oi, preciso cancelar meu agendamento",
-        company_id=1,
+        company_id=company_id,
         company_context=COMPANY_CONTEXT,
     )
     assert first.handled is True
@@ -235,19 +307,20 @@ def test_customer_can_cancel_booking_via_natural_conversation(monkeypatch) -> No
         contact_id="5511999999999",
         contact_name="Cliente Teste",
         message="sim, pode cancelar",
-        company_id=1,
+        company_id=company_id,
         company_context=COMPANY_CONTEXT,
     )
     assert second.handled is True
     assert second.action == "booking_cancelled"
 
 
-def test_customer_can_reschedule_booking_via_natural_conversation(monkeypatch) -> None:
+def test_customer_can_reschedule_booking_via_natural_conversation(monkeypatch, company_factory) -> None:
+    company_id = company_factory("wf-reschedule")
     fake_repository = FakeRepository()
     fake_repository.bookings = [
         {
-            "id": 52,
-            "company_id": 1,
+            "id": _real_booking(company_id, "5511888888888", "2030-04-08T13:00:00+00:00", "2030-04-08T14:00:00+00:00"),
+            "company_id": company_id,
             "contact_id": "5511888888888",
             "title": "Consultoria inicial",
             "description": "Consulta original",
@@ -294,7 +367,7 @@ def test_customer_can_reschedule_booking_via_natural_conversation(monkeypatch) -
         contact_id="5511888888888",
         contact_name="Cliente Teste",
         message="Quero remarcar meu horário para amanhã às 15h",
-        company_id=1,
+        company_id=company_id,
         company_context=COMPANY_CONTEXT,
     )
     assert first.handled is True
@@ -304,14 +377,15 @@ def test_customer_can_reschedule_booking_via_natural_conversation(monkeypatch) -
         contact_id="5511888888888",
         contact_name="Cliente Teste",
         message="sim",
-        company_id=1,
+        company_id=company_id,
         company_context=COMPANY_CONTEXT,
     )
     assert second.handled is True
     assert second.action == "booking_rescheduled"
 
 
-def test_operator_can_start_booking_flow_for_existing_customer(monkeypatch) -> None:
+def test_operator_can_start_booking_flow_for_existing_customer(monkeypatch, company_factory) -> None:
+    company_id = company_factory("wf-operator")
     fake_repository = FakeRepository()
     fake_repository.contacts = [
         {
@@ -362,7 +436,9 @@ def test_operator_can_start_booking_flow_for_existing_customer(monkeypatch) -> N
         workflow_service,
         "create_calendar_booking",
         lambda **kwargs: {
-            "id": 300,
+            "id": _real_booking(
+                company_id, kwargs["contact_id"], "2030-04-08T13:00:00+00:00", "2030-04-08T14:00:00+00:00"
+            ),
             "starts_at": "2030-04-08T13:00:00+00:00",
             "ends_at": "2030-04-08T14:00:00+00:00",
         },
@@ -372,7 +448,7 @@ def test_operator_can_start_booking_flow_for_existing_customer(monkeypatch) -> N
         contact_id="5511666666666",
         contact_name="Dono",
         message="Marque o cliente Maria Silva amanhã às 10h para consultoria inicial",
-        company_id=1,
+        company_id=company_id,
         company_context=operator_context,
     )
     assert first.handled is True
@@ -382,7 +458,7 @@ def test_operator_can_start_booking_flow_for_existing_customer(monkeypatch) -> N
         contact_id="5511666666666",
         contact_name="Dono",
         message="sim",
-        company_id=1,
+        company_id=company_id,
         company_context=operator_context,
     )
     assert second.handled is True
@@ -392,11 +468,12 @@ def test_operator_can_start_booking_flow_for_existing_customer(monkeypatch) -> N
         contact_id="5511666666666",
         contact_name="Dono",
         message="sim, pode confirmar",
-        company_id=1,
+        company_id=company_id,
         company_context=operator_context,
     )
     assert third.handled is True
     assert third.action == "operator_booking_created"
+    assert third.metadata["contact_id"] == "5511777777777"
 
 
 def test_operator_flow_requires_disambiguation_when_multiple_contacts_match(monkeypatch) -> None:
