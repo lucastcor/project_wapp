@@ -97,30 +97,34 @@ const FLOW_NODE_TEMPLATES = [
   },
 ]
 
+// Seis itens para o dia a dia de quem opera o negócio; o resto fica em
+// "Mais", recolhido. Quem nunca teve um bot precisa de um caminho, não de
+// catorze módulos com nome de produto.
 const NAV_ITEMS = [
-  { key: "dashboard", label: "Control Tower", caption: "Readiness e postura operacional", icon: "dashboard" },
-  { key: "analytics", label: "Analytics", caption: "No-show, lembretes e funil", icon: "target" },
-  { key: "studio", label: "Bot Studio", caption: "Teste conversas antes de publicar", icon: "studio" },
-  { key: "flows", label: "Flow Studio", caption: "Pipelines, playbooks e respostas", icon: "flow" },
+  { key: "dashboard", label: "Início", caption: "Primeiros passos e visão geral", icon: "dashboard" },
+  { key: "onboarding", label: "Configuração", caption: "Dados, horários, serviços e regras", icon: "spark" },
+  { key: "studio", label: "Testar o bot", caption: "Converse como cliente antes de publicar", icon: "studio" },
+  { key: "operations", label: "Atendimento", caption: "Revisões, conversas com a equipe e alertas", icon: "bell" },
+  { key: "agenda", label: "Agenda", caption: "Calendário, reservas e fila de encaixe", icon: "calendar" },
+  { key: "channel", label: "WhatsApp", caption: "Conexão do número e templates", icon: "send" },
+  { key: "analytics", label: "Análises", caption: "Faltas, lembretes e funil", icon: "target", advanced: true },
+  { key: "flows", label: "Fluxos de conversa", caption: "Etapas, playbooks e respostas aprovadas", icon: "flow", advanced: true },
   // O Automation Studio é um app separado, servido na mesma origem. `href`
   // marca o item como navegação de saída: sem ele, o operador não teria
   // como descobrir o editor visual a partir da plataforma.
   {
     key: "automations",
-    label: "Automation Studio",
+    label: "Automações",
     caption: "Fluxos visuais, execuções e aprovações",
     icon: "flow",
     href: "/platform/automations",
+    advanced: true,
   },
-  { key: "operations", label: "Operação", caption: "Revisões, conversas com humano e alertas", icon: "bell" },
-  { key: "policy", label: "Política", caption: "Mensagens, regras de agenda e versões", icon: "tag" },
-  { key: "channel", label: "Canal WhatsApp", caption: "Templates aprovados e consentimento", icon: "send" },
-  { key: "agenda", label: "Agenda Console", caption: "Calendário, bookings e fila", icon: "calendar" },
-  { key: "contacts", label: "Contacts Desk", caption: "Perfil, busca e notas", icon: "contacts" },
-  { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
-  { key: "team", label: "Equipe", caption: "Acessos, papéis e convites", icon: "contacts" },
-  { key: "billing", label: "Billing", caption: "Planos, uso e assinatura", icon: "tag" },
-  { key: "onboarding", label: "Configuração", caption: "Dados, horários, serviços e regras do bot", icon: "spark" },
+  { key: "policy", label: "Mensagens e regras", caption: "Textos do bot, cancelamento e versões", icon: "tag", advanced: true },
+  { key: "contacts", label: "Contatos", caption: "Perfil, busca e notas", icon: "contacts", advanced: true },
+  { key: "training", label: "Treinamento", caption: "Importação, curadoria e ajuste fino", icon: "training", advanced: true },
+  { key: "team", label: "Equipe", caption: "Acessos, papéis e convites", icon: "contacts", advanced: true },
+  { key: "billing", label: "Plano", caption: "Assinatura, uso e limites", icon: "tag", advanced: true },
 ]
 
 const DEFAULT_PIPELINES = [
@@ -255,6 +259,18 @@ const state = {
       custom_rules: "",
       services: [],
     },
+  },
+  servicesEditor: {
+    companyId: null,
+    available: false,
+    reason: "",
+    revision: null,
+    context: null,
+    items: [],
+    rules: "",
+    brandStyle: "",
+    dirty: false,
+    busy: false,
   },
   billingPlans: null,
   billingUsage: null,
@@ -788,6 +804,234 @@ async function loadOnboardingData() {
   if (!state.onboardingPresets) {
     state.onboardingPresets = await apiRequest("/admin/onboarding/presets")
   }
+  await loadServicesEditor()
+}
+
+// Serviços, preços, regras e tom do bot vivem no contexto publicado da
+// empresa. O editor lê o registro com revisão para gravar com concorrência
+// otimista: duas pessoas editando ao mesmo tempo não se sobrescrevem em
+// silêncio.
+async function loadServicesEditor() {
+  const editor = state.servicesEditor
+  const company = getSelectedCompany()
+  if (!company) {
+    editor.available = false
+    editor.reason = "Selecione uma empresa para editar serviços."
+    editor.companyId = null
+    return
+  }
+  if (editor.dirty && String(editor.companyId) === String(company.id)) return
+  try {
+    const record = await apiRequest("/admin/company-context/record", {
+      params: { company_slug: company.slug, company_id: company.id },
+    })
+    const context = record.data || {}
+    const catalog = context.catalog || {}
+    editor.companyId = company.id
+    editor.available = true
+    editor.reason = ""
+    editor.revision = record.revision ?? null
+    editor.context = context
+    editor.items = (Array.isArray(catalog.items) ? catalog.items : []).map(serviceRowFromItem)
+    editor.rules = Array.isArray(context.business_rules) ? context.business_rules.join("\n") : ""
+    editor.brandStyle = context.brand_tone?.style || ""
+    editor.dirty = false
+  } catch (error) {
+    editor.companyId = company.id
+    editor.available = false
+    editor.items = []
+    editor.reason = error?.status === 400
+      ? "Conclua os cinco passos acima e publique: o editor de serviços aparece em seguida."
+      : summarizeError(error)
+  }
+}
+
+function serviceRowFromItem(item) {
+  const durationMatch = String(item.duration || "").match(/(\d+)/)
+  const price = item.price ?? item.starting_price
+  return {
+    original: item,
+    name: String(item.name || ""),
+    duration: durationMatch ? Number(durationMatch[1]) : "",
+    price: price === null || price === undefined ? "" : String(price),
+    description: item.description && item.description !== item.name ? String(item.description) : "",
+  }
+}
+
+function serviceItemFromRow(row, index) {
+  const name = String(row.name || "").trim()
+  const duration = Number.parseInt(row.duration, 10)
+  const priceText = String(row.price || "").trim().replace(",", ".")
+  const price = priceText ? Number(priceText) : null
+  const base = row.original && typeof row.original === "object" ? { ...row.original } : {
+    sku: `SVC-${String(index + 1).padStart(3, "0")}`,
+    category: "servicos",
+    type: "service",
+    transaction_modes: ["service", "scheduling"],
+    schedule_required: true,
+    professional_selection_allowed: false,
+    availability: "sob agendamento",
+    delivery_mode: "presencial",
+    customizable: false,
+    subscription_details: null,
+    rental_details: null,
+    stock_info: null,
+    variants: [],
+  }
+  base.name = name
+  base.description = String(row.description || "").trim() || name
+  base.duration = `${Number.isFinite(duration) && duration > 0 ? duration : 60} minutos`
+  if (price !== null && Number.isFinite(price) && price > 0) {
+    base.price = price
+    base.starting_price = price
+    base.price_mode = "fixed"
+  } else {
+    delete base.price
+    delete base.starting_price
+    base.price_mode = "under_consultation"
+  }
+  return base
+}
+
+function validateServiceRows(rows) {
+  for (const [index, row] of rows.entries()) {
+    if (!String(row.name || "").trim()) return `Informe o nome do serviço ${index + 1}.`
+    const duration = Number.parseInt(row.duration, 10)
+    if (!Number.isFinite(duration) || duration <= 0) return `Informe a duração em minutos do serviço "${row.name}".`
+    const priceText = String(row.price || "").trim().replace(",", ".")
+    if (priceText && !(Number(priceText) > 0)) return `O preço de "${row.name}" precisa ser um número maior que zero (ou vazio para "sob consulta").`
+  }
+  return null
+}
+
+function renderServicesEditorCard() {
+  const editor = state.servicesEditor
+  const canEdit = currentAdminRole() === "superadmin"
+  if (!getSelectedCompany()) return ""
+  if (!editor.available) {
+    return `
+      <section class="grid-one">
+        <article class="card">
+          <div class="section-header"><div>
+            <h3 class="section-title">Serviços e preços</h3>
+            <p class="section-copy">${escapeHtml(editor.reason || "Editor indisponível.")}</p>
+          </div></div>
+        </article>
+      </section>`
+  }
+  const rows = editor.items
+  return `
+    <section class="grid-one">
+      <article class="card" id="services-editor">
+        <div class="section-header">
+          <div>
+            <h3 class="section-title">Serviços e preços</h3>
+            <p class="section-copy">O que o bot oferece e agenda. Preço vazio significa "sob consulta"; o bot nunca inventa valores.</p>
+          </div>
+          ${canEdit ? '<button class="button-ghost" type="button" data-service-add>Adicionar serviço</button>' : ""}
+        </div>
+        ${rows.length ? `
+        <div class="services-table">
+          <div class="services-row services-head">
+            <span>Serviço</span><span>Duração (min)</span><span>Preço (R$)</span><span>Descrição</span><span></span>
+          </div>
+          ${rows.map((row, index) => `
+            <div class="services-row">
+              <input type="text" data-service-field="name" data-service-index="${index}" value="${escapeHtml(row.name)}" placeholder="Ex.: Limpeza de pele" ${canEdit ? "" : "disabled"} />
+              <input data-service-field="duration" data-service-index="${index}" type="number" min="5" step="5" value="${escapeHtml(String(row.duration))}" ${canEdit ? "" : "disabled"} />
+              <input type="text" data-service-field="price" data-service-index="${index}" inputmode="decimal" value="${escapeHtml(row.price)}" placeholder="sob consulta" ${canEdit ? "" : "disabled"} />
+              <input type="text" data-service-field="description" data-service-index="${index}" value="${escapeHtml(row.description)}" placeholder="Opcional" ${canEdit ? "" : "disabled"} />
+              ${canEdit ? `<button class="chip chip-danger" type="button" data-service-remove="${index}">Remover</button>` : "<span></span>"}
+            </div>
+          `).join("")}
+        </div>` : '<div class="empty-state">Nenhum serviço cadastrado. Adicione o primeiro para o bot poder agendar.</div>'}
+        <div class="form-grid-two" style="margin-top:16px;">
+          <div class="field">
+            <label for="services-brand-style">Tom do bot</label>
+            <input type="text" id="services-brand-style" data-service-brand value="${escapeHtml(editor.brandStyle)}" placeholder="Ex.: acolhedor, direto e sem gírias" ${canEdit ? "" : "disabled"} />
+          </div>
+          <div class="field">
+            <label for="services-rules">Regras do bot (uma por linha)</label>
+            <textarea id="services-rules" data-service-rules rows="4" placeholder="Não inventar preços&#10;Sempre confirmar horário antes de agendar" ${canEdit ? "" : "disabled"}>${escapeHtml(editor.rules)}</textarea>
+          </div>
+        </div>
+        ${canEdit ? `
+        <div class="toolbar-row" style="margin-top:12px;">
+          <button class="button" type="button" data-service-save ${editor.busy ? "disabled" : ""}>${editor.busy ? "Publicando…" : "Salvar e publicar"}</button>
+          ${editor.dirty ? '<span class="tag tag-warn">Alterações não publicadas</span>' : '<span class="tag tag-success">Publicado</span>'}
+        </div>` : '<p class="card-copy" style="margin-top:12px;">Somente o dono ou administrador da empresa pode editar.</p>'}
+      </article>
+    </section>`
+}
+
+function bindServicesEditorEvents() {
+  const card = document.getElementById("services-editor")
+  if (!card) return
+  const editor = state.servicesEditor
+  card.querySelectorAll("[data-service-field]").forEach((input) => {
+    input.addEventListener("input", (event) => {
+      const index = Number(event.target.dataset.serviceIndex)
+      const field = event.target.dataset.serviceField
+      if (!editor.items[index]) return
+      editor.items[index][field] = event.target.value
+      editor.dirty = true
+    })
+  })
+  const brand = card.querySelector("[data-service-brand]")
+  if (brand) brand.addEventListener("input", (event) => { editor.brandStyle = event.target.value; editor.dirty = true })
+  const rules = card.querySelector("[data-service-rules]")
+  if (rules) rules.addEventListener("input", (event) => { editor.rules = event.target.value; editor.dirty = true })
+  const add = card.querySelector("[data-service-add]")
+  if (add) add.addEventListener("click", () => {
+    editor.items.push({ original: null, name: "", duration: 60, price: "", description: "" })
+    editor.dirty = true
+    renderApp()
+    const last = document.querySelector(`[data-service-field="name"][data-service-index="${editor.items.length - 1}"]`)
+    if (last) last.focus()
+  })
+  card.querySelectorAll("[data-service-remove]").forEach((button) => {
+    button.addEventListener("click", () => {
+      editor.items.splice(Number(button.dataset.serviceRemove), 1)
+      editor.dirty = true
+      renderApp()
+    })
+  })
+  const save = card.querySelector("[data-service-save]")
+  if (save) save.addEventListener("click", async () => {
+    const problem = validateServiceRows(editor.items)
+    if (problem) { pushToast(problem, "error"); return }
+    const company = getSelectedCompany()
+    if (!company || String(company.id) !== String(editor.companyId)) { pushToast("Selecione a empresa antes de salvar.", "error"); return }
+    const context = JSON.parse(JSON.stringify(editor.context || {}))
+    context.catalog = { ...(context.catalog || {}), items: editor.items.map(serviceItemFromRow) }
+    const ruleLines = String(editor.rules || "").split("\n").map((line) => line.trim()).filter(Boolean)
+    if (ruleLines.length) context.business_rules = ruleLines
+    if (String(editor.brandStyle || "").trim()) {
+      context.brand_tone = { ...(context.brand_tone || {}), style: String(editor.brandStyle).trim() }
+    }
+    editor.busy = true
+    renderApp()
+    try {
+      await apiRequest("/admin/company-context", {
+        method: "PUT",
+        params: { company_slug: company.slug, company_id: company.id },
+        body: { data: context, expected_revision: editor.revision },
+      })
+      editor.dirty = false
+      state.companyContext = null
+      pushToast("Serviços publicados. O bot já responde com a lista nova.")
+      await loadServicesEditor()
+    } catch (error) {
+      if (error?.status === 409) {
+        pushToast("Outra pessoa publicou uma versão enquanto você editava. Recarregue a tela e refaça a alteração.", "error")
+      } else {
+        pushToast(summarizeError(error), "error")
+      }
+    } finally {
+      editor.busy = false
+      renderApp()
+    }
+  })
 }
 
 async function loadBillingData() {
@@ -1364,36 +1608,44 @@ function renderSidebar() {
         </p>
       </div>
 
-      <div class="nav-section-label">Workspace</div>
+      <div class="nav-section-label">Principal</div>
       <nav class="nav-list">
-        ${NAV_ITEMS.map(
-          (item) => item.href
-            ? `
-            <a class="nav-button" href="${item.href}">
-              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
-              <span>
-                <span class="nav-label">${escapeHtml(item.label)}</span>
-                <span class="nav-caption">${escapeHtml(item.caption)}</span>
-              </span>
-            </a>
-          `
-            : `
-            <button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">
-              <span class="nav-icon">${ICONS[item.icon] || ""}</span>
-              <span>
-                <span class="nav-label">${escapeHtml(item.label)}</span>
-                <span class="nav-caption">${escapeHtml(item.caption)}</span>
-              </span>
-            </button>
-          `
-        ).join("")}
+        ${NAV_ITEMS.filter((item) => !item.advanced).map(renderNavItem).join("")}
       </nav>
+      <button class="nav-more-toggle" type="button" data-nav-more aria-expanded="${isNavMoreOpen() ? "true" : "false"}">
+        <span>Mais</span>
+        <span class="nav-more-caret">${isNavMoreOpen() ? "▾" : "▸"}</span>
+      </button>
+      ${isNavMoreOpen() ? `
+      <nav class="nav-list nav-list-advanced">
+        ${NAV_ITEMS.filter((item) => item.advanced).map(renderNavItem).join("")}
+      </nav>` : ""}
 
       <div class="sidebar-footnote">
         v1.0 · Superfície principal <span class="mono">/platform</span>
       </div>
     </aside>
   `
+}
+
+function renderNavItem(item) {
+  const inner = `
+      <span class="nav-icon">${ICONS[item.icon] || ""}</span>
+      <span>
+        <span class="nav-label">${escapeHtml(item.label)}</span>
+        <span class="nav-caption">${escapeHtml(item.caption)}</span>
+      </span>`
+  if (item.href) {
+    return `<a class="nav-button" href="${item.href}">${inner}</a>`
+  }
+  return `<button class="nav-button ${state.view === item.key ? "active" : ""}" data-view="${item.key}">${inner}</button>`
+}
+
+// O grupo "Mais" abre sozinho quando a tela atual está dentro dele; a escolha
+// do operador fica guardada com o resto da configuração local.
+function isNavMoreOpen() {
+  if (state.config.navMoreOpen) return true
+  return NAV_ITEMS.some((item) => item.advanced && !item.href && item.key === state.view)
 }
 
 function renderMetricCard(label, value, caption, tone = "default", iconKey = "dashboard") {
@@ -1830,6 +2082,17 @@ function renderBillingView() {
   `
 }
 
+const WIZARD_TYPE_ICONS = {
+  clinica: "target",
+  salao: "spark",
+  estetica: "spark",
+  escritorio: "tag",
+  academia: "refresh",
+  pet: "contacts",
+  aulas: "training",
+  outro: "dashboard",
+}
+
 const ONBOARDING_STEPS = [
   { key: "business", label: "Dados do negócio", icon: "tag" },
   { key: "hours", label: "Horário de atendimento", icon: "clock" },
@@ -1865,7 +2128,7 @@ function renderOnboardingStep0() {
       <div class="wizard-type-grid">
         ${typeEntries.map(([key, info]) => `
           <button class="wizard-type-card ${d.business_type_key === key ? 'selected' : ''}" data-onboarding-type="${key}">
-            <span class="wizard-type-icon">${ICONS[key === "clinica" ? "target" : key === "salao" ? "spark" : key === "escritorio" ? "tag" : key === "academia" ? "refresh" : "dashboard"]}</span>
+            <span class="wizard-type-icon">${ICONS[WIZARD_TYPE_ICONS[key] || "dashboard"]}</span>
             <span class="wizard-type-label">${escapeHtml(info.label)}</span>
           </button>
         `).join("")}
@@ -5876,7 +6139,7 @@ function renderCurrentView() {
   if (state.view === "training") return renderTrainingView()
   if (state.view === "team") return renderTeamView()
   if (state.view === "billing") return renderBillingView()
-  if (state.view === "onboarding") return renderOnboardingView()
+  if (state.view === "onboarding") return renderOnboardingView() + renderServicesEditorCard()
   return ""
 }
 
@@ -6215,6 +6478,8 @@ function bindEvents() {
     })
   }
 
+  bindServicesEditorEvents()
+
   const wizardSubmit = document.getElementById("wizard-submit")
   if (wizardSubmit) {
     wizardSubmit.addEventListener("click", async () => {
@@ -6283,6 +6548,8 @@ function bindEvents() {
           // O simulador e o Flow Studio leem `state.companyContext`; sem
           // invalidar, continuariam mostrando o contexto anterior à publicação.
           state.companyContext = null
+          state.servicesEditor.dirty = false
+          await loadServicesEditor().catch(() => null)
         }
       } catch (error) {
         pushToast(summarizeError(error), "error")
@@ -6775,6 +7042,8 @@ function bindEvents() {
       }
       persistConfig()
       state.companyContext = null
+      state.servicesEditor.dirty = false
+      state.servicesEditor.available = false
       state.trainingImportResult = null
       state.calendarConnectionTest = null
       state.whatsappConnectionTest = null
@@ -7903,6 +8172,13 @@ root.addEventListener("click", async (e) => {
     return
   }
 
+  const navMore = e.target.closest("[data-nav-more]")
+  if (navMore) {
+    state.config.navMoreOpen = !isNavMoreOpen()
+    persistConfig()
+    renderApp()
+    return
+  }
   const jumpBtn = e.target.closest("[data-jump-view]")
   if (jumpBtn) {
     state.view = jumpBtn.dataset.jumpView

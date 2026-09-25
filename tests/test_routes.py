@@ -40,8 +40,8 @@ def test_platform_shell() -> None:
     assert "/platform/assets/app.js" in response.text
     # Cache-bust dos assets: a versão muda junto com o painel para o navegador
     # não servir um app.js antigo contra um backend novo.
-    assert "/platform/assets/app.js?v=20260925-p08b" in response.text
-    assert "/platform/assets/styles.css?v=20260925-p08b" in response.text
+    assert "/platform/assets/app.js?v=20260925-p08c" in response.text
+    assert "/platform/assets/styles.css?v=20260925-p08c" in response.text
 
 
 def test_platform_asset() -> None:
@@ -64,6 +64,10 @@ def test_platform_asset() -> None:
     assert "/admin/calendar/google/authorize" in response.text
     assert "google=connected" in response.text
     assert "no_refresh_token" in response.text
+    # Navegação em dois grupos e editor de serviços fora do wizard (P08).
+    assert "data-nav-more" in response.text
+    assert "data-service-field" in response.text
+    assert "/admin/company-context/record" in response.text
     # Revisão P08: a lista de calendários é carregada à parte (com "Tentar de
     # novo"), a conta do ambiente é avisada em vez de parecer conectada, o
     # popup da Meta tem saída e a volta do Google pelo bfcache destrava o botão.
