@@ -34,7 +34,7 @@ CLIENT_ID = "client-id-sintetico.apps.googleusercontent.com"
 CLIENT_SECRET = "client-secret-sintetico-XYZ"
 PUBLIC_URL = "https://painel.example.invalid"
 CALLBACK = "/platform/integrations/google/callback"
-REFRESH_TOKEN = "refresh-sintetico-1//ABC987"
+REFRESH_TOKEN = "refresh-sintetico-primeiro"
 ACCOUNT_EMAIL = "dona@example.invalid"
 SUPERADMIN_TOKEN = "oauth-superadmin-token"
 VIEWER_TOKEN = "oauth-viewer-token"
@@ -431,7 +431,7 @@ def test_reconnection_updates_the_same_integration_row(monkeypatch, google_env, 
         first_id = _active_google_id(company_id)
         oauth_service.set_calendar(company_id, "equipe@group.calendar.google.com", actor="Tenant Owner")
 
-        fake_google.refresh_token = "refresh-sintetico-2//DEF654"
+        fake_google.refresh_token = "refresh-sintetico-segundo"
         _url, state = _authorize(client, company_id, csrf_token)
         _status, query, _ = _callback(client, code="segundo", state=state)
 
