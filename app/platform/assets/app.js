@@ -120,7 +120,7 @@ const NAV_ITEMS = [
   { key: "training", label: "Training Ops", caption: "Importação, curadoria, fine-tune", icon: "training" },
   { key: "team", label: "Equipe", caption: "Acessos, papéis e convites", icon: "contacts" },
   { key: "billing", label: "Billing", caption: "Planos, uso e assinatura", icon: "tag" },
-  { key: "onboarding", label: "Setup Wizard", caption: "Configurar nova empresa", icon: "spark" },
+  { key: "onboarding", label: "Configuração", caption: "Dados, horários, serviços e regras do bot", icon: "spark" },
 ]
 
 const DEFAULT_PIPELINES = [
@@ -977,6 +977,45 @@ function viewLoadingLabel(view) {
   return "Carregando..."
 }
 
+const STUDIO_ACTION_LABELS = {
+  auto_reply: "Bot respondeu",
+  greeting: "Saudação",
+  schedule_options_presented: "Horários oferecidos",
+  booking_confirmation_requested: "Aguardando confirmação",
+  booking_created: "Agendamento criado",
+  booking_rescheduled: "Agendamento remarcado",
+  booking_cancelled: "Agendamento cancelado",
+  handoff: "Encaminhado à equipe",
+  human_review: "Enviado para revisão",
+  pending_review: "Enviado para revisão",
+  human_owned: "Atendimento com a equipe",
+  workflow: "Fluxo de agendamento",
+  review: "Enviado para revisão",
+  pending_needs_review: "Enviado para revisão",
+  request_customer_clarification: "Pediu esclarecimento",
+  schedule_confirmation_requested: "Aguardando confirmação",
+  schedule_confirmed: "Agendamento confirmado",
+  scheduling_abandoned: "Agendamento abandonado",
+  booking_cancel_confirmation_requested: "Confirmando cancelamento",
+  booking_reschedule_date_requested: "Pediu nova data",
+  booking_change_requires_human: "Encaminhado à equipe",
+  after_hours: "Fora do horário",
+  opt_out: "Cliente pediu para sair",
+  opt_in: "Cliente voltou a receber avisos",
+}
+
+function describeStudioAction(action) {
+  if (!action) return "Resposta do bot"
+  const key = String(action).toLowerCase()
+  if (STUDIO_ACTION_LABELS[key]) return STUDIO_ACTION_LABELS[key]
+  return key.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase())
+}
+
+function generateStudioContactId() {
+  const digits = Array.from({ length: 8 }, () => Math.floor(Math.random() * 10)).join("")
+  return `5511${digits}`
+}
+
 function getReadinessTone(status) {
   if (status === "pass" || status === "ready") return "tag-success"
   if (status === "warn" || status === "warning") return "tag-warn"
@@ -1039,10 +1078,10 @@ function renderTopbar() {
 }
 
 function renderViewTitle() {
-  if (state.view === "dashboard") return "Uma camada premium para operar o bot como produto"
+  if (state.view === "dashboard") return "Seu atendimento no WhatsApp em um só lugar"
   if (state.view === "analytics") return "Analytics de no-show, lembretes e funil de agendamento"
   if (state.view === "billing") return "Billing — planos, assinatura e consumo"
-  if (state.view === "onboarding") return "Setup Wizard — configure uma nova empresa passo a passo"
+  if (state.view === "onboarding") return "Configuração — dados, horários, serviços e regras do bot"
   if (state.view === "studio") return "Bot Studio para testar conversa real antes de publicar"
   if (state.view === "flows") return "Flow Studio para lapidar regras, playbooks e respostas"
   if (state.view === "agenda") return "Agenda Console com controle manual e visão operacional"
@@ -1056,10 +1095,10 @@ function renderViewTitle() {
 }
 
 function renderViewCopy() {
-  if (state.view === "dashboard") return "Readiness, observabilidade, onboarding e comando central da operação."
+  if (state.view === "dashboard") return "Configure, teste, conecte e acompanhe o bot da sua empresa."
   if (state.view === "analytics") return "Meça impacto real: taxa de no-show, eficácia dos lembretes e recuperação via fila."
   if (state.view === "billing") return "Gerencie plano, acompanhe limites de uso e controle sua assinatura."
-  if (state.view === "onboarding") return "Preencha os dados, configure horários e ative o bot em minutos."
+  if (state.view === "onboarding") return "Cinco passos para o bot atender com os dados da sua empresa."
   if (state.view === "studio") return "Simule cliente, operador e fluxos de agendamento na mesma interface."
   if (state.view === "flows") return "Desenhe a experiência do bot, organize pipelines e promova mensagens aprovadas."
   if (state.view === "agenda") return "Monitore disponibilidade, bookings, remanejamento e ajustes manuais."
@@ -1156,17 +1195,19 @@ function renderDashboardView() {
 
   return `
     <section class="hero">
-      <span class="brand-eyebrow">Command Center</span>
-      <h2 class="hero-title">A operação inteira do bot em uma camada visual própria.</h2>
+      <span class="brand-eyebrow">Visão geral</span>
+      <h2 class="hero-title">Tudo o que o bot faz pela sua empresa, em um só painel.</h2>
       <p class="hero-copy">
-        Aqui você mede maturidade, readiness e tração real. A ideia é sair de um painel utilitário e entrar numa experiência de produto, com capacidade de teste, curadoria, agenda e controle.
+        Configure em minutos, teste como cliente, conecte o WhatsApp e acompanhe agendamentos, conversas e o que precisa da sua atenção.
       </p>
       <div class="hero-actions">
         <button class="button" data-jump-view="studio">Testar conversa agora</button>
-        <button class="button-ghost" data-jump-view="agenda">Abrir agenda operacional</button>
-        <button class="button-ghost" data-refresh-view>Atualizar panorama</button>
+        <button class="button-ghost" data-jump-view="agenda">Abrir agenda</button>
+        <button class="button-ghost" data-refresh-view>Atualizar</button>
       </div>
     </section>
+
+    ${renderFirstStepsCard()}
 
     <section class="grid-four">
       ${renderMetricCard("Mensagens", formatNumber(totals.messages), "Volume já tratado pelo runtime atual.", "default", "studio")}
@@ -1263,8 +1304,8 @@ function renderDashboardView() {
       <article class="card">
         <div class="section-header">
           <div>
-            <h3 class="section-title">Quick actions</h3>
-            <p class="section-copy">Atalhos para os módulos que viram rotina operacional.</p>
+            <h3 class="section-title">Atalhos</h3>
+            <p class="section-copy">Os módulos que viram rotina depois que o bot está no ar.</p>
           </div>
         </div>
         <div class="grid-two">
@@ -1834,6 +1875,38 @@ function renderOnboardingStep4() {
   `
 }
 
+// Quem acabou de criar a conta precisa de um caminho, não de um painel de
+// métricas zeradas. A ordem é a que leva ao vivo com menos atrito.
+function renderFirstStepsCard() {
+  if (!getSelectedCompany()) return ""
+  const steps = [
+    { view: "onboarding", title: "1. Configurar a empresa", copy: "Horários, serviços, preços e regras em cinco passos." },
+    { view: "studio", title: "2. Testar o bot", copy: "Converse como cliente e ajuste o que não gostar." },
+    { view: "channel", title: "3. Conectar o WhatsApp", copy: "Vincule o número da empresa para atender de verdade." },
+    { view: "agenda", title: "4. Conectar a agenda", copy: "Google Agenda ou agenda interna para marcar horários." },
+  ]
+  return `
+    <section class="grid-one">
+      <article class="card">
+        <div class="section-header">
+          <div>
+            <h3 class="section-title">Primeiros passos</h3>
+            <p class="section-copy">Siga a ordem para colocar o bot no ar. Você pode voltar a qualquer passo depois.</p>
+          </div>
+        </div>
+        <div class="first-steps-grid">
+          ${steps.map((step) => `
+            <button class="card card-muted first-step" type="button" data-jump-view="${step.view}">
+              <strong>${escapeHtml(step.title)}</strong>
+              <span class="card-copy">${escapeHtml(step.copy)}</span>
+            </button>
+          `).join("")}
+        </div>
+      </article>
+    </section>
+  `
+}
+
 function renderOnboardingSuccess() {
   const result = state.onboardingWizard.result
   const company = result?.company || {}
@@ -1841,13 +1914,14 @@ function renderOnboardingSuccess() {
 
   return `
     <section class="hero" style="text-align:center">
-      <span class="brand-eyebrow" style="color:var(--brand)">Setup completo</span>
-      <h2 class="hero-title">${escapeHtml(company.name || "Empresa")} está pronta para operar.</h2>
-      <p class="hero-copy">O contexto foi gerado, os módulos ativados e a empresa já está na plataforma.</p>
+      <span class="brand-eyebrow" style="color:var(--brand)">Configuração publicada</span>
+      <h2 class="hero-title">${escapeHtml(company.name || "Empresa")} está pronta para testar.</h2>
+      <p class="hero-copy">O bot já conhece seus horários, serviços e regras. Teste uma conversa e depois conecte o WhatsApp para atender clientes reais.</p>
       <div class="hero-actions" style="justify-content:center">
         <button class="button" data-jump-view="studio">Testar o bot agora</button>
+        <button class="button-ghost" data-jump-view="channel">Conectar WhatsApp</button>
         <button class="button-ghost" data-jump-view="agenda">Abrir agenda</button>
-        <button class="button-ghost" id="onboarding-reset">Configurar outra empresa</button>
+        ${getWizardTargetCompany() ? '<button class="button-ghost" id="onboarding-reset">Revisar configuração</button>' : '<button class="button-ghost" id="onboarding-reset">Configurar outra empresa</button>'}
       </div>
     </section>
 
@@ -1879,9 +1953,23 @@ function renderOnboardingSuccess() {
   `
 }
 
+// A empresa selecionada no escopo é a que o wizard configura. Só sem escopo
+// (token de plataforma em "Escopo global") o wizard cria uma empresa nova:
+// quem entra pelo cadastro self-service já tem a sua e não pode criar outra.
+function getWizardTargetCompany() {
+  return getSelectedCompany() || null
+}
+
 function renderOnboardingView() {
   if (state.onboardingWizard.completed && state.onboardingWizard.result) {
     return renderOnboardingSuccess()
+  }
+
+  const target = getWizardTargetCompany()
+  const draft = state.onboardingWizard.draft
+  if (target && !draft.company_name && !state.onboardingWizard.prefilledFor) {
+    draft.company_name = target.name || ""
+    state.onboardingWizard.prefilledFor = target.id
   }
 
   const step = state.onboardingWizard.step
@@ -1896,11 +1984,18 @@ function renderOnboardingView() {
   else if (step === 3) stepContent = renderOnboardingStep3()
   else if (step === 4) stepContent = renderOnboardingStep4()
 
+  const heroTitle = target
+    ? `Configure ${escapeHtml(target.name)} em minutos.`
+    : "Configure uma nova empresa em minutos."
+  const heroCopy = target
+    ? "Responda em cinco passos e o bot passa a atender com os seus dados: horários, serviços, preços e regras. Nada é enviado ao WhatsApp até você conectar o canal."
+    : "Preencha os dados e o bot será configurado automaticamente com contexto, agenda, lembretes e catálogo."
+
   return `
     <section class="hero">
-      <span class="brand-eyebrow">Setup Wizard</span>
-      <h2 class="hero-title">Configure uma nova empresa em minutos.</h2>
-      <p class="hero-copy">Preencha os dados e o bot será configurado automaticamente com contexto, agenda, lembretes e catálogo.</p>
+      <span class="brand-eyebrow">Configuração</span>
+      <h2 class="hero-title">${heroTitle}</h2>
+      <p class="hero-copy">${heroCopy}</p>
     </section>
 
     <section class="grid-one">
@@ -1914,7 +2009,7 @@ function renderOnboardingView() {
         <div class="wizard-nav">
           ${!isFirst ? '<button class="button-ghost" id="wizard-prev">Voltar</button>' : '<span></span>'}
           ${isLast
-            ? '<button class="button" id="wizard-submit">Ativar empresa</button>'
+            ? `<button class="button" id="wizard-submit">${target ? "Salvar e publicar" : "Criar e ativar empresa"}</button>`
             : '<button class="button" id="wizard-next">Próximo</button>'
           }
         </div>
@@ -2360,8 +2455,8 @@ function renderStudioView() {
             <input id="studio-new-label" name="label" value="${escapeHtml(draftNew.label)}" placeholder="Ex.: Cliente Premium" />
           </div>
           <div class="field">
-            <label for="studio-new-contact-id">Contact ID</label>
-            <input id="studio-new-contact-id" name="contactId" value="${escapeHtml(draftNew.contactId)}" placeholder="5511999999999" />
+            <label for="studio-new-contact-id">Telefone do cliente de teste (opcional)</label>
+            <input id="studio-new-contact-id" name="contactId" value="${escapeHtml(draftNew.contactId)}" placeholder="Deixe vazio para gerar um número fictício" />
           </div>
           <div class="field">
             <label for="studio-new-contact-name">Nome exibido</label>
@@ -2386,11 +2481,11 @@ function renderStudioView() {
           <div class="section-header">
             <div>
               <h3 class="section-title">${escapeHtml(activeSession.label || activeSession.contact_id)}</h3>
-              <p class="section-copy">Contact ID: ${escapeHtml(activeSession.contact_id)}${activeSession.contact_name ? " · " + escapeHtml(activeSession.contact_name) : ""}</p>
+              <p class="section-copy">Telefone de teste: ${escapeHtml(activeSession.contact_id)}${activeSession.contact_name ? " · " + escapeHtml(activeSession.contact_name) : ""}</p>
             </div>
             ${
               activeSession.last_result
-                ? `<span class="tag ${getReadinessTone(activeSession.last_result.action === "auto_reply" ? "ready" : "warning")}">${escapeHtml(activeSession.last_result.action)}</span>`
+                ? `<span class="tag ${getReadinessTone(activeSession.last_result.action === "auto_reply" ? "ready" : "warning")}">${escapeHtml(describeStudioAction(activeSession.last_result.action))}</span>`
                 : ""
             }
           </div>
@@ -2408,28 +2503,30 @@ function renderStudioView() {
                       const ts = formatSessionTimestamp(item.at)
                       if (item.role === "user") {
                         return `
-                          <div class="bubble bubble-user">
-                            ${escapeHtml(item.text)}
-                            ${ts ? `<div class="bubble-meta"><span class="meta-chip">${escapeHtml(ts)}</span></div>` : ""}
-                          </div>
+                          <div class="bubble bubble-user"><span class="bubble-text">${escapeHtml(item.text)}</span>${ts ? `<div class="bubble-meta"><span class="meta-chip">${escapeHtml(ts)}</span></div>` : ""}</div>
                         `
                       }
                       const meta = item.meta || {}
                       return `
-                        <div class="bubble bubble-assistant">
-                          ${escapeHtml(item.text)}
+                        <div class="bubble bubble-assistant"><span class="bubble-text">${escapeHtml(item.text)}</span>
                           <div class="bubble-meta">
                             ${ts ? `<span class="meta-chip">${escapeHtml(ts)}</span>` : ""}
-                            <span class="meta-chip">Classificação: ${escapeHtml(meta.classification || "—")}</span>
-                            <span class="meta-chip">Ação: ${escapeHtml(meta.action || "—")}</span>
-                            <span class="meta-chip">Pipeline: ${escapeHtml(meta.pipeline_stage || "—")}</span>
-                            <span class="meta-chip">Fonte: ${escapeHtml(meta.source || "—")}</span>
+                            <span class="meta-chip">${escapeHtml(describeStudioAction(meta.action))}</span>
+                            <details class="bubble-details">
+                              <summary>Detalhes técnicos</summary>
+                              <div class="bubble-details-body">
+                                <span class="meta-chip">Classificação: ${escapeHtml(meta.classification || "—")}</span>
+                                <span class="meta-chip">Ação: ${escapeHtml(meta.action || "—")}</span>
+                                <span class="meta-chip">Etapa: ${escapeHtml(meta.pipeline_stage || "—")}</span>
+                                <span class="meta-chip">Origem: ${escapeHtml(meta.source || "—")}</span>
+                              </div>
+                            </details>
                           </div>
                         </div>
                       `
                     })
                     .join("")
-                : '<div class="empty-state">Envie uma mensagem para ver o comportamento do bot dentro do runtime real.</div>'
+                : '<div class="empty-state">Escreva a primeira mensagem como cliente para ver como o bot responde.</div>'
             }
           </div>
           <form id="studio-form" class="form-grid" style="margin-top:12px;">
@@ -2438,7 +2535,7 @@ function renderStudioView() {
               <textarea id="studio-message" name="message" placeholder="Ex.: Quero remarcar meu atendimento para sexta às 15h">${escapeHtml(state.studio.draftMessage)}</textarea>
             </div>
             <div class="toolbar-row">
-              <button class="button" type="submit">${ICONS.send}<span>Enviar para o runtime</span></button>
+              <button class="button" type="submit">${ICONS.send}<span>Enviar</span></button>
               <button class="button-ghost" type="button" id="clear-studio-log">Limpar histórico</button>
             </div>
           </form>
@@ -2453,9 +2550,9 @@ function renderStudioView() {
   return `
     <section class="hero">
       <span class="brand-eyebrow">Bot Studio</span>
-      <h2 class="hero-title">Teste conversa real antes de colocar para rodar.</h2>
+      <h2 class="hero-title">Converse com o seu bot antes de colocar para rodar.</h2>
       <p class="hero-copy">
-        Crie sessões de teste por contato, mantenha o histórico e valide o fluxo natural sem reinformar telefone a cada mensagem. Toda troca passa pelo mesmo runtime, através da rota autenticada /admin/simulator/messages.
+        Escreva como se fosse um cliente. As respostas vêm do mesmo motor que atende no WhatsApp, com os dados publicados da empresa. Nada é enviado a clientes reais.
       </p>
     </section>
 
@@ -5139,7 +5236,7 @@ function renderSettingsModal() {
             </div>
             <div class="field">
               <label>Slug da empresa</label>
-              <input name="companySlug" required pattern="[a-z0-9][a-z0-9-]{1,61}[a-z0-9]" placeholder="minha-empresa" />
+              <input name="companySlug" required pattern="[a-z0-9][a-z0-9\\-]{1,61}[a-z0-9]" placeholder="minha-empresa" />
             </div>
             <div class="field">
               <label>Senha</label>
@@ -5437,14 +5534,26 @@ function bindEvents() {
           })) : undefined,
         }
 
-        const result = await apiRequest("/admin/onboarding/setup", {
-          method: "POST",
-          body: payload,
-        })
+        const target = getWizardTargetCompany()
+        const result = target
+          ? await apiRequest("/admin/onboarding/configure", {
+              method: "POST",
+              params: { company_id: target.id },
+              body: payload,
+            })
+          : await apiRequest("/admin/onboarding/setup", {
+              method: "POST",
+              body: payload,
+            })
         state.onboardingWizard.result = result
         state.onboardingWizard.completed = true
-        pushToast("Empresa configurada com sucesso!")
+        pushToast(target ? "Configuração publicada. O bot já usa os novos dados." : "Empresa configurada com sucesso!")
         await loadCompanies()
+        if (target) {
+          // O simulador e o Flow Studio leem `state.companyContext`; sem
+          // invalidar, continuariam mostrando o contexto anterior à publicação.
+          state.companyContext = null
+        }
       } catch (error) {
         pushToast(summarizeError(error), "error")
       } finally {
@@ -5985,7 +6094,7 @@ function bindStudioEvents() {
       persistStudioSessions()
 
       state.loading = true
-      state.loadingMessage = "Enviando mensagem para o runtime..."
+      state.loadingMessage = "O bot está pensando na resposta..."
       renderApp()
       try {
         const result = await apiRequest("/admin/simulator/messages", {
@@ -6018,7 +6127,7 @@ function bindStudioEvents() {
           pipeline_stage: result.pipeline_stage,
         }
         persistStudioSessions()
-        pushToast("Mensagem processada pelo runtime real.")
+        pushToast("O bot respondeu.")
       } catch (error) {
         pushToast(summarizeError(error), "error")
       } finally {
@@ -6092,12 +6201,11 @@ function bindStudioEvents() {
     newSessionForm.addEventListener("submit", (event) => {
       event.preventDefault()
       const label = String(state.studio.newSession.label || "").trim()
-      const contactId = String(state.studio.newSession.contactId || "").trim()
+      const typedContactId = String(state.studio.newSession.contactId || "").replace(/\D/g, "")
       const contactName = String(state.studio.newSession.contactName || "").trim()
-      if (!contactId) {
-        pushToast("Informe o contact_id para criar a sessão.", "error")
-        return
-      }
+      // Um telefone fictício basta para testar: o dono do negócio não deve
+      // precisar saber o que é um "contact id" para conversar com o bot.
+      const contactId = typedContactId || generateStudioContactId()
       const now = new Date().toISOString()
       const session = {
         id: window.crypto.randomUUID(),

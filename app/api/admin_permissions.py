@@ -96,6 +96,7 @@ ADMIN_ENDPOINT_PERMISSIONS: Final[dict[tuple[str, str], str]] = {
     ("POST", "/admin/companies"): SUPERADMIN,
     ("PUT", "/admin/company-context"): SUPERADMIN,
     ("POST", "/admin/onboarding/setup"): SUPERADMIN,
+    ("POST", "/admin/onboarding/configure"): SUPERADMIN,
     ("POST", "/admin/calendar/integrations"): SUPERADMIN,
     ("POST", "/admin/calendar/test-connection"): SUPERADMIN,
     ("PUT", "/admin/whatsapp/bindings"): SUPERADMIN,

@@ -890,7 +890,60 @@ select:focus {
   line-height: 1.5;
   color: var(--text);
   box-shadow: var(--shadow-sm);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.bubble-text {
+  display: block;
   white-space: pre-wrap;
+}
+
+.bubble-details {
+  width: 100%;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.bubble-details summary {
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+
+.bubble-details summary::-webkit-details-marker { display: none; }
+
+.bubble-details summary::before {
+  content: "▸ ";
+}
+
+.bubble-details[open] summary::before {
+  content: "▾ ";
+}
+
+.bubble-details-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.first-steps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.first-step {
+  display: grid;
+  gap: 6px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.first-step strong {
+  color: var(--text);
+  font-size: 14px;
 }
 
 .bubble-user {

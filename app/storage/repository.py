@@ -2829,6 +2829,36 @@ class RuntimeRepository:
 
         return int(company_id)
 
+    def update_company_profile(
+        self,
+        company_id: int,
+        *,
+        name: str,
+        business_type: str | None = None,
+    ) -> bool:
+        """Rename an existing company and record its business type.
+
+        The slug is deliberately left untouched: it is the public identifier
+        of the tenant and changing it would break bindings and links.
+        """
+        connection = get_connection()
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE companies
+            SET
+                name = ?,
+                business_type = COALESCE(?, business_type),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (name, business_type, int(company_id)),
+        )
+        updated = int(cursor.rowcount) > 0
+        connection.commit()
+        connection.close()
+        return updated
+
     def get_companies(self) -> list[dict[str, Any]]:
         connection = get_connection()
         cursor = connection.cursor()

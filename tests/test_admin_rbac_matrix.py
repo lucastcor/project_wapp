@@ -173,6 +173,7 @@ def _sample_request(method: str, path: str) -> tuple[str, str, dict[str, Any] | 
         "/admin/companies": {"slug": "rbac-co", "name": "RBAC Co"},
         "/admin/company-context": {"data": {}},
         "/admin/onboarding/setup": {"company_name": "RBAC Co", "business_type_key": "generic"},
+        "/admin/onboarding/configure": {"company_name": "RBAC Co", "business_type_key": "generic"},
         "/admin/calendar/integrations": {"provider": "mock"},
         "/admin/billing/activate": {"plan_key": "starter"},
         "/admin/billing/cancel": {"reason": "test"},

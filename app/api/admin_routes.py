@@ -10,7 +10,7 @@ from app.api.admin_security import (
     build_require_admin_role,
 )
 from app.api.admin_support import build_prometheus_metrics, record_audit_event
-from app.api.company_scope import get_authorized_scope
+from app.api.company_scope import get_authorized_scope, require_authorized_company_id
 from app.api.schemas import (
     AppointmentBookingCancellationPayload,
     AppointmentBookingPayload,
@@ -1972,6 +1972,72 @@ def run_onboarding_setup(
         return result
     except OnboardingError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@admin_router.post(
+    "/onboarding/configure",
+    dependencies=[Depends(require_admin_role("superadmin"))],
+)
+def run_onboarding_configure(
+    payload: OnboardingSetupPayload,
+    request: Request,
+) -> dict:
+    """Apply the wizard to the company the caller already belongs to.
+
+    Tenant-scoped, unlike ``/onboarding/setup``: an identity owner/admin can
+    configure their own company (the one created at signup) and a
+    break-glass operator must name the company explicitly. No company is
+    created here, so the slug-squatting risk of ``setup`` does not apply.
+    """
+    company_id = require_authorized_company_id(request)
+    from app.services.onboarding_service import OnboardingError, configure_company
+
+    try:
+        result = configure_company(
+            company_id=company_id,
+            company_name=payload.company_name,
+            business_type_key=payload.business_type_key,
+            segment=payload.segment,
+            company_description=payload.company_description,
+            phone=payload.phone,
+            email=payload.email,
+            instagram=payload.instagram,
+            website=payload.website,
+            timezone=payload.timezone,
+            weekday_hours=payload.weekday_hours,
+            saturday_hours=payload.saturday_hours,
+            sunday_hours=payload.sunday_hours,
+            slot_duration_minutes=payload.slot_duration_minutes,
+            minimum_notice_minutes=payload.minimum_notice_minutes,
+            reminder_offsets_days=payload.reminder_offsets_days,
+            brand_style=payload.brand_style,
+            custom_rules=payload.custom_rules,
+            services=[s.model_dump() for s in payload.services] if payload.services else None,
+            calendar_provider=payload.calendar_provider,
+            calendar_config=payload.calendar_config,
+        )
+    except OnboardingError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _record_audit_event(
+        request=request,
+        action="onboarding_configure",
+        resource_type="company",
+        resource_id=str(company_id),
+        company_id=company_id,
+        metadata={
+            "company_name": payload.company_name,
+            "business_type_key": payload.business_type_key,
+        },
+    )
+    log_event(
+        logger,
+        logging.INFO,
+        "admin.onboarding.configured",
+        company_id=company_id,
+        business_type_key=payload.business_type_key,
+    )
+    return result
 
 
 @admin_router.get("/onboarding/setup-status/{company_id}")
