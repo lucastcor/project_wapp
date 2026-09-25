@@ -180,11 +180,13 @@ Existe um painel Streamlit em `app/admin_app.py` para operacao minima, com foco 
 
 Agora existe tambem uma interface dedicada servida pelo proprio FastAPI em `/platform`, com foco em:
 
-- `Control Tower` para readiness, onboarding e observabilidade;
-- `Bot Studio` para simular cliente ou operador dentro do runtime real;
-- `Flow Studio` para editar playbooks e mensagens aprovadas;
-- `Agenda Console` para controlar bookings e fila;
-- `Training Ops` para importar base historica e acompanhar fine-tuning.
+- `Início` para primeiros passos, readiness e visão geral;
+- `Configuração` para o assistente de cinco passos e o editor de serviços, preços e regras;
+- `Testar o bot` para simular cliente ou operador dentro do runtime real;
+- `Atendimento` para revisões, conversas com a equipe e falhas de envio;
+- `Agenda` para reservas, fila e a conexão do Google Agenda por OAuth por empresa;
+- `WhatsApp` para a conexão do número por Embedded Signup da Meta (token cifrado por empresa) e templates;
+- no grupo "Mais": Fluxos de conversa, Automações, Mensagens e regras, Contatos, Treinamento, Análises, Equipe e Plano.
 
 ### Observabilidade
 

@@ -64,7 +64,9 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 
 ## Como cada área da interface funciona
 
-### 1. Control Tower
+Em 25/09/2026 a navegação passou a ter seis itens principais (Início, Configuração, Testar o bot, Atendimento, Agenda, WhatsApp) e um grupo "Mais" recolhido; as chaves internas das views (`dashboard`, `studio`, `flows`, `agenda`, `contacts`, `training`, `channel`, `onboarding`, `operations`, …) não mudaram. A tela Configuração ganhou o editor de serviços e preços (`renderServicesEditorCard`), e as telas WhatsApp e Agenda ganharam os fluxos de conexão por empresa (Embedded Signup da Meta e OAuth do Google), descritos em `docs/piloto/CONTRATOS.md`.
+
+### 1. Início (view `dashboard`, antes "Control Tower")
 
 **O que faz**
 
@@ -85,7 +87,7 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 - Não grava dados.
 - É uma tela de leitura operacional.
 
-### 2. Bot Studio
+### 2. Testar o bot (view `studio`, antes "Bot Studio")
 
 **O que faz**
 
@@ -107,7 +109,7 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 
 - Pode criar/atualizar contatos, mensagens, bookings, pending questions, outbounds e memória, dependendo do cenário testado.
 
-### 3. Flow Studio
+### 3. Fluxos de conversa (view `flows`, antes "Flow Studio")
 
 **O que faz**
 
@@ -135,7 +137,7 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 - Vai para os JSONs de contexto da empresa em `app/data/company_contexts/`.
 - Respostas aprovadas vão para `message_examples` no banco.
 
-### 4. Agenda Console
+### 4. Agenda (view `agenda`, antes "Agenda Console")
 
 **O que faz**
 
@@ -168,7 +170,7 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 - Bookings, integrações, fila e ofertas ficam no banco via `repository.py` / `db.py`.
 - Se houver provider externo configurado, cancelamento e reagendamento também tentam sincronizar o evento real.
 
-### 5. Contacts Desk
+### 5. Contatos (view `contacts`, antes "Contacts Desk")
 
 **O que faz**
 
@@ -187,7 +189,7 @@ O `app/platform/assets/app.js` é a aplicação principal. Ele está dividido em
 
 - Atualiza a tabela `contacts`.
 
-### 6. Training Ops
+### 6. Treinamento (view `training`, antes "Training Ops")
 
 **O que faz**
 
