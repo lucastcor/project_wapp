@@ -1,0 +1,18 @@
+# Proxy reverso com TLS automático (Let's Encrypt) para o Project WAPP.
+#
+# Caddy obtém e renova o certificado sozinho quando o domínio aponta para o
+# servidor e as portas 80/443 estão abertas. A API só escuta na rede interna
+# do compose; nada chega a ela sem passar por aqui.
+{$WAPP_DOMAIN} {
+	encode zstd gzip
+
+	# O webhook da Meta e o painel passam pelo mesmo host. Cabeçalhos
+	# X-Forwarded-* são preenchidos pelo Caddy; a API só os usa quando
+	# TRUST_PROXY_HEADERS=true (ver deploy/env.minimal.example).
+	reverse_proxy api:8000 {
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# O painel administrativo legado (Streamlit) fica fora da internet por
+	# padrão; exponha por VPN ou túnel se realmente precisar dele.
+}
