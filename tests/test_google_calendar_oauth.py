@@ -739,7 +739,7 @@ def test_manual_integration_secrets_are_encrypted_at_rest_and_legacy_rows_still_
     assert REFRESH_TOKEN not in row["config_json"]
     assert CLIENT_SECRET not in row["config_json"]
     assert created["config"]["refresh_token_present"] is True
-    assert REFRESH_TOKEN not in json.dumps(created)
+    assert REFRESH_TOKEN not in json.dumps(created, default=str)
     internal = calendar_service._resolve_calendar_integration(company_id=company_id)
     assert internal["config"]["refresh_token"] == REFRESH_TOKEN
     assert internal["config"]["client_secret"] == CLIENT_SECRET
