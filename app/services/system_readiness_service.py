@@ -3,7 +3,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 from app.core.company_context import get_company_context_status
-from app.core.config import is_missing_or_placeholder, settings
+from app.core.config import is_missing_or_placeholder, is_production_like, settings
+from app.core.credential_vault import vault_is_configured
 from app.services.calendar_service import get_calendar_profile
 from app.services.ingress_auth_service import (
     get_configured_internal_ingress_secret,
@@ -13,7 +14,7 @@ from app.services.ingress_auth_service import (
 )
 from app.services.rate_limit_service import check_shared_state_connection
 from app.services.training_export_service import get_finetuning_readiness_report
-from app.storage import company_config_repository
+from app.storage import company_config_repository, whatsapp_credentials_repository
 from app.storage.db import (
     check_postgres_target_connection,
     check_runtime_database_connection,
@@ -78,7 +79,7 @@ def _configured_admin_tokens_are_real() -> bool:
     return all(_has_real_secret(value) for value in configured_values if value is not None)
 
 
-def _whatsapp_provider_credentials_are_real() -> bool:
+def _global_whatsapp_credentials_are_real() -> bool:
     return all(
         _has_real_secret(value)
         for value in [
@@ -86,6 +87,32 @@ def _whatsapp_provider_credentials_are_real() -> bool:
             settings.whatsapp_api_token,
             settings.whatsapp_phone_number_id,
         ]
+    )
+
+
+def _embedded_signup_is_configured() -> bool:
+    """A instalação pode conectar números pelo painel (Embedded Signup).
+
+    Exige o cofre com chave explícita: sem ela o token de negócio de cada
+    empresa não teria onde ser guardado com segurança.
+    """
+    return (
+        _has_real_secret(settings.meta_app_id)
+        and _has_real_secret(settings.meta_embedded_signup_config_id)
+        and _has_real_secret(settings.whatsapp_app_secret)
+        and vault_is_configured()
+    )
+
+
+def _whatsapp_provider_credentials_are_real() -> bool:
+    """Há um caminho real para enviar: credencial global ou conexão por empresa."""
+    return _global_whatsapp_credentials_are_real() or _embedded_signup_is_configured()
+
+
+def _credential_vault_is_required() -> bool:
+    """Produção com app da Meta ou projeto Google configurado guarda segredos por empresa."""
+    return is_production_like() and (
+        _has_real_secret(settings.meta_app_id) or _has_real_secret(settings.google_calendar_client_id)
     )
 
 
@@ -221,10 +248,7 @@ def _whatsapp_channel_binding_status() -> dict[str, Any]:
     """
     configured_phone_number_id = str(settings.whatsapp_phone_number_id or "").strip()
     if not configured_phone_number_id:
-        return {
-            "ok": False,
-            "detail": "WHATSAPP_PHONE_NUMBER_ID não configurado; eventos do Meta não resolvem empresa.",
-        }
+        return _company_connection_binding_status()
 
     try:
         bindings = repository.get_whatsapp_bindings(active_only=True)
@@ -258,6 +282,36 @@ def _whatsapp_channel_binding_status() -> dict[str, Any]:
         "detail": (
             f"phone_number_id {_mask_phone_number_id(configured_phone_number_id)} vinculado à "
             f"empresa {matching[0]['company_id']}."
+        ),
+    }
+
+
+def _company_connection_binding_status() -> dict[str, Any]:
+    """Sem número global, o canal prova-se pelas empresas que conectaram.
+
+    Nenhuma conexão ainda é um aviso, não um bloqueio: uma instalação nova
+    com Embedded Signup configurado está pronta para o primeiro cliente
+    conectar o próprio número pela tela Canal. `warn_only` diz ao check
+    para não escalar isso a `fail` mesmo quando o canal é obrigatório.
+    """
+    try:
+        connected = whatsapp_credentials_repository.count_connected_companies()
+    except Exception as exc:  # pragma: no cover - defensive readiness probe
+        return {"ok": False, "detail": f"Falha ao ler as conexões WhatsApp por empresa: {type(exc).__name__}."}
+
+    if connected > 0:
+        return {
+            "ok": True,
+            "detail": (
+                f"{connected} empresa(s) com número conectado pelo painel; "
+                "eventos do Meta resolvem a empresa pelo phone_number_id de cada vínculo."
+            ),
+        }
+    return {
+        "ok": False,
+        "warn_only": True,
+        "detail": (
+            "WHATSAPP_PHONE_NUMBER_ID não configurado e nenhuma empresa conectou um número ainda."
         ),
     }
 
@@ -343,6 +397,8 @@ def get_system_profile() -> dict[str, Any]:
             "outbound_provider": settings.outbound_provider,
             "default_channel": settings.outbound_default_channel,
             "whatsapp_configured": _whatsapp_provider_credentials_are_real(),
+            "whatsapp_embedded_signup_configured": _embedded_signup_is_configured(),
+            "credential_vault_configured": vault_is_configured(),
             "whatsapp_webhook_verification_configured": _has_real_secret(settings.whatsapp_webhook_verify_token),
             "whatsapp_signature_validation_configured": _has_real_secret(settings.whatsapp_app_secret),
             "calendar_provider": settings.calendar_provider,
@@ -799,18 +855,57 @@ def get_system_readiness() -> dict[str, Any]:
     )
     binding_status = _whatsapp_channel_binding_status()
     binding_required = settings.outbound_provider == "whatsapp" or production_guard_enabled
+    binding_warn_only = bool(binding_status.get("warn_only"))
+    binding_check_status = (
+        "pass"
+        if binding_status["ok"]
+        else ("warn" if binding_warn_only or not binding_required else "fail")
+    )
     checks.append(
         _make_check(
             code="whatsapp_channel_binding",
             title="Vínculo do número WhatsApp",
-            status="pass" if binding_status["ok"] else ("fail" if binding_required else "warn"),
-            severity="blocker" if binding_required else "warning",
+            status=binding_check_status,
+            severity="blocker" if binding_required and not binding_warn_only else "warning",
             detail=str(binding_status["detail"]),
             recommendation=(
-                "Vincular o WHATSAPP_PHONE_NUMBER_ID a exatamente uma empresa ativa via "
-                "PUT /admin/whatsapp/bindings antes de receber eventos reais do Meta."
+                (
+                    "Conecte o número pela tela Canal (Embedded Signup) ou defina "
+                    "WHATSAPP_PHONE_NUMBER_ID e vincule-o via PUT /admin/whatsapp/bindings."
+                )
+                if binding_warn_only
+                else (
+                    "Vincular o WHATSAPP_PHONE_NUMBER_ID a exatamente uma empresa ativa via "
+                    "PUT /admin/whatsapp/bindings antes de receber eventos reais do Meta."
+                )
             )
             if not binding_status["ok"]
+            else None,
+        )
+    )
+    vault_required = _credential_vault_is_required()
+    vault_configured = vault_is_configured()
+    checks.append(
+        _make_check(
+            code="credential_vault",
+            title="Cofre de credenciais",
+            status="pass" if vault_configured else ("fail" if vault_required else "warn"),
+            severity="blocker" if vault_required else "warning",
+            detail=(
+                "CREDENTIALS_ENCRYPTION_KEY configurada; tokens por empresa são cifrados no banco."
+                if vault_configured
+                else (
+                    "CREDENTIALS_ENCRYPTION_KEY ausente ou inválida; conexões WhatsApp/Google por "
+                    "empresa não podem guardar credenciais em produção."
+                    if vault_required
+                    else "CREDENTIALS_ENCRYPTION_KEY ausente; fora de produção uma chave derivada é usada."
+                )
+            ),
+            recommendation=(
+                "Gerar uma chave com app.core.credential_vault.generate_key() e definir "
+                "CREDENTIALS_ENCRYPTION_KEY antes de conectar números ou agendas pelo painel."
+            )
+            if not vault_configured
             else None,
         )
     )

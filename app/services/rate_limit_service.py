@@ -161,6 +161,11 @@ def _resolve_scope_and_limit(request_path: str, method: str | None = None) -> tu
         if method is not None and method.upper() in SAFE_HTTP_METHODS:
             return "platform_auth_read", max(1, settings.rate_limit_admin_requests)
         return "platform_auth", max(1, settings.rate_limit_auth_requests)
+    if request_path.startswith("/platform/integrations/"):
+        # Callbacks OAuth (Google Agenda): navegação de topo com cookie de
+        # sessão. Orçamento administrativo, e escopo próprio para que um
+        # retorno em loop não consuma a cota das chamadas do painel.
+        return "platform_integrations", max(1, settings.rate_limit_admin_requests)
     if request_path.startswith("/admin"):
         return "admin", max(1, settings.rate_limit_admin_requests)
     if request_path == "/messages/incoming":

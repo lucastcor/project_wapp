@@ -177,6 +177,17 @@ const state = {
   connectionTestBusy: null,
   calendarConnectionTest: null,
   whatsappConnectionTest: null,
+  // Conexão do número pelo Embedded Signup da Meta (P08): a configuração
+  // pública do app e o andamento do popup vivem no estado porque a tela é
+  // redesenhada a cada mudança e o popup devolve os ids por `postMessage`.
+  whatsappSignupConfig: null,
+  whatsappSignup: createIdleWhatsappSignup(),
+  channelConfirm: null,
+  // Conexão da Google Agenda por OAuth (P08).
+  googleCalendarConfig: null,
+  googleCalendars: null,
+  googleCalendarBusy: false,
+  calendarConfirm: null,
   bookingCancelConfirm: null,
   loading: false,
   loadingMessage: "",
@@ -614,6 +625,87 @@ function clearAuthActionFromUrl() {
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
 }
 
+// Volta do OAuth do Google e links diretos: o callback do servidor redireciona
+// para `/platform?view=agenda&company_id=<id>&google=connected` (ou
+// `google=error&reason=<código>`). Lido uma vez no bootstrap e removido da
+// URL, como `clearAuthActionFromUrl`, para um F5 não repetir o aviso.
+const URL_NAVIGATION_PARAMS = ["view", "company_id", "google", "reason"]
+
+// Rótulo por chave em mapa literal: `map[key]` direto aceita chaves do
+// protótipo (`constructor`, `toString`) e viraria texto sem sentido no toast
+// quando a chave vem da URL (`?google=error&reason=constructor`).
+function labelFor(map, key, fallback) {
+  const name = String(key ?? "")
+  return name && Object.hasOwn(map, name) ? map[name] : fallback
+}
+
+const GOOGLE_OAUTH_ERROR_MESSAGES = {
+  state_invalid: "A autorização expirou, tente de novo.",
+  forbidden: "Entre com a conta que iniciou a conexão.",
+  exchange_failed: "O Google não confirmou a autorização.",
+  no_refresh_token:
+    "O Google não devolveu permissão permanente. Remova o acesso em myaccount.google.com/permissions e conecte de novo.",
+  vault_unavailable: "O servidor não está configurado para guardar credenciais (CREDENTIALS_ENCRYPTION_KEY).",
+  access_denied: "Você cancelou a autorização.",
+  session_required: "Entre na plataforma e tente de novo.",
+}
+
+function consumeUrlNavigation() {
+  const url = new URL(window.location.href)
+  const navigation = {
+    view: url.searchParams.get("view") || "",
+    companyId: url.searchParams.get("company_id") || "",
+    google: url.searchParams.get("google") || "",
+    reason: url.searchParams.get("reason") || "",
+  }
+  if (URL_NAVIGATION_PARAMS.some((key) => url.searchParams.has(key))) {
+    URL_NAVIGATION_PARAMS.forEach((key) => url.searchParams.delete(key))
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
+  }
+  return navigation
+}
+
+// Só entra em tela conhecida e em empresa que a sessão pode ver: o link não
+// tem autoridade para ampliar o escopo, apenas para posicionar o painel.
+async function applyUrlNavigation(navigation, session) {
+  if (navigation.view && NAV_ITEMS.some((item) => item.key === navigation.view && !item.href)) {
+    state.view = navigation.view
+  }
+  if (!navigation.companyId) return
+  let company = null
+  if (session?.auth_mode === "identity") {
+    const membership = (session.memberships || []).find(
+      (item) => String(item.company_id) === String(navigation.companyId)
+    )
+    company = membership ? { id: membership.company_id, slug: membership.company_slug || "" } : null
+  } else {
+    try {
+      await loadCompanies()
+    } catch {
+      // A tela carrega as empresas de novo e mostra o erro no lugar certo.
+    }
+    company = state.companies.find((item) => String(item.id) === String(navigation.companyId)) || null
+  }
+  if (!company) {
+    pushToast("A empresa indicada no link não está disponível nesta sessão.", "error")
+    return
+  }
+  state.config.companyId = String(company.id)
+  state.config.companySlug = company.slug || ""
+  persistConfig()
+}
+
+function notifyGoogleOAuthResult(navigation) {
+  if (navigation.google === "connected") {
+    pushToast("Google Agenda conectada. As reservas passam a sincronizar com a conta autorizada.")
+  } else if (navigation.google === "error") {
+    pushToast(
+      labelFor(GOOGLE_OAUTH_ERROR_MESSAGES, navigation.reason, "Não foi possível conectar a Google Agenda. Tente de novo."),
+      "error"
+    )
+  }
+}
+
 async function loginPlatformSession() {
   const session = await apiRequest("/platform/auth/session", {
     method: "POST",
@@ -761,7 +853,7 @@ async function loadFlowData() {
 }
 
 async function loadAgendaData() {
-  const [calendarProfile, calendarBookings, queueEntries, queueOffers, calendarTimeline] = await Promise.all([
+  const [calendarProfile, calendarBookings, queueEntries, queueOffers, calendarTimeline, googleCalendarConfig] = await Promise.all([
     apiRequest("/admin/calendar/profile", {
       params: getAdminCompanyParams(),
     }),
@@ -780,12 +872,148 @@ async function loadAgendaData() {
         days: 7,
       },
     }),
+    // Sem empresa: só diz se a conexão pelo painel está habilitada. 404/503
+    // (backend antigo ou sem cofre) viram "não habilitado", nunca erro de tela.
+    apiRequest("/admin/calendar/google/config").catch(() => null),
   ])
   state.calendarProfile = calendarProfile
   state.calendarBookings = Array.isArray(calendarBookings) ? calendarBookings : []
   state.queueEntries = Array.isArray(queueEntries) ? queueEntries : []
   state.queueOffers = Array.isArray(queueOffers) ? queueOffers : []
   state.calendarTimeline = calendarTimeline
+  state.googleCalendarConfig = googleCalendarConfig
+  // `calendarConfirm` não é limpo aqui: um evento SSE no meio do "Confirmar:
+  // desconectar" não pode descartar o passo. A troca de empresa já limpa.
+  scheduleGoogleCalendarsLoad(calendarProfile)
+}
+
+// Conexão feita pelo painel é uma linha da empresa no banco. A integração
+// vinda do ambiente (`GOOGLE_CALENDAR_REFRESH_TOKEN` global, `source:
+// "environment"`, sem `integration_id`) continua valendo para o bot, mas não
+// tem conta, data nem "Desconectar" (o servidor responde 400): a empresa
+// ainda pode conectar a própria conta.
+function isGoogleCalendarConnected(integration) {
+  if (!integration || String(integration.provider || "") !== "google_calendar") return false
+  if (String(integration.source || "") === "environment" || integration.integration_id == null) return false
+  return integration.active !== false && Number(integration.active ?? 1) !== 0
+}
+
+function isGoogleCalendarFromEnvironment(integration) {
+  if (!integration || String(integration.provider || "") !== "google_calendar") return false
+  return String(integration.source || "") === "environment"
+}
+
+// Lista de calendários da conta conectada: só para quem pode trocar o
+// calendário e uma vez por empresa, porque cada chamada renova o token no
+// Google e consulta a calendarList. Não segura a tela: a agenda aparece com
+// os dados internos e o seletor entra quando o Google responde. Refeita só
+// depois de conectar/desconectar (estado zerado) ou por "Tentar de novo".
+function scheduleGoogleCalendarsLoad(profile, { force = false } = {}) {
+  const companyId = String(state.config.companyId || "")
+  if (!companyId || !isGoogleCalendarConnected(profile?.integration) || currentAdminRole() !== "superadmin") {
+    state.googleCalendars = null
+    return
+  }
+  const cached = state.googleCalendars
+  if (!force && cached && String(cached.companyId) === companyId) return
+  state.googleCalendars = { companyId, items: [], error: "", loading: true }
+  void apiRequest("/admin/calendar/google/calendars", { params: getAdminCompanyParams() })
+    .then((items) => ({ companyId, items: Array.isArray(items) ? items : [], error: "", loading: false }))
+    .catch((error) => ({ companyId, items: [], error: summarizeError(error), loading: false }))
+    .then((result) => {
+      // A empresa pode ter mudado (ou a agenda sido desconectada) enquanto
+      // o Google respondia: resposta antiga não entra no estado.
+      if (String(state.config.companyId) !== companyId) return
+      if (!state.googleCalendars || String(state.googleCalendars.companyId) !== companyId) return
+      state.googleCalendars = result
+      if (state.view === "agenda" && !state.loading) renderApp()
+    })
+}
+
+async function startGoogleCalendarAuthorization() {
+  if (!state.config.companyId) {
+    pushToast("Selecione a empresa antes de conectar a Google Agenda.", "error")
+    return
+  }
+  if (state.googleCalendarBusy) return
+  state.googleCalendarBusy = true
+  renderApp()
+  try {
+    const result = await apiRequest("/admin/calendar/google/authorize", {
+      method: "POST",
+      params: getAdminCompanyParams(),
+    })
+    const authorizationUrl = String(result?.authorization_url || "")
+    // O painel só navega para o Google: um endereço diferente é bug do servidor.
+    if (!authorizationUrl.startsWith("https://accounts.google.com/")) {
+      throw new Error("O servidor não devolveu o endereço de autorização do Google.")
+    }
+    window.location.assign(authorizationUrl)
+    // A página sai para o Google; o estado ocupado fica até lá.
+  } catch (error) {
+    state.googleCalendarBusy = false
+    pushToast(summarizeError(error), "error")
+    renderApp()
+  }
+}
+
+// Voltar do consentimento do Google pelo botão do navegador pode restaurar a
+// página do bfcache com o estado em memória: o botão ficaria preso em
+// "Abrindo o Google…" até um F5.
+window.addEventListener("pageshow", (event) => {
+  if (!event.persisted || !state.googleCalendarBusy) return
+  state.googleCalendarBusy = false
+  renderApp()
+})
+
+async function disconnectGoogleCalendar() {
+  if (state.googleCalendarBusy || !state.config.companyId) return
+  state.googleCalendarBusy = true
+  state.calendarConfirm = null
+  renderApp()
+  try {
+    await apiRequest("/admin/calendar/google/disconnect", {
+      method: "POST",
+      params: getAdminCompanyParams(),
+    })
+    state.calendarConnectionTest = null
+    state.googleCalendars = null
+    pushToast("Google Agenda desconectada. As reservas continuam na agenda interna.")
+    await loadAgendaData().catch((error) => pushToast(summarizeError(error), "error"))
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.googleCalendarBusy = false
+    renderApp()
+  }
+}
+
+async function selectGoogleCalendar(calendarId) {
+  if (state.googleCalendarBusy || !state.config.companyId || !calendarId) return
+  state.googleCalendarBusy = true
+  renderApp()
+  try {
+    await apiRequest("/admin/calendar/google/calendar", {
+      method: "PATCH",
+      params: getAdminCompanyParams(),
+      body: { calendar_id: String(calendarId) },
+    })
+    pushToast("Calendário atualizado: as próximas reservas vão para ele.")
+    // A lista em cache só muda a marcação: não precisa perguntar ao Google.
+    const cached = state.googleCalendars
+    if (cached && String(cached.companyId) === String(state.config.companyId)) {
+      state.googleCalendars = {
+        ...cached,
+        items: cached.items.map((item) => ({ ...item, selected: String(item.id) === String(calendarId) })),
+      }
+    }
+    await loadAgendaData().catch((error) => pushToast(summarizeError(error), "error"))
+  } catch (error) {
+    pushToast(summarizeError(error), "error")
+  } finally {
+    state.googleCalendarBusy = false
+    renderApp()
+  }
 }
 
 async function loadOperationsData() {
@@ -3364,7 +3592,114 @@ function describeBookingState(booking) {
   return { key: status || "unknown", label: status || "Sem status", tone: "", detail: "", actionable: false }
 }
 
-const CALENDAR_PROVIDER_LABELS = { mock: "Agenda interna", google_calendar: "Google Calendar", caldav: "CalDAV" }
+const CALENDAR_PROVIDER_LABELS = { mock: "Agenda interna", google_calendar: "Google Agenda", caldav: "CalDAV" }
+
+function calendarProviderLabel(provider) {
+  const key = String(provider || "mock")
+  return CALENDAR_PROVIDER_LABELS[key] || key
+}
+
+// Conexão da Google Agenda (P08): o botão só aparece quando a instalação tem
+// as credenciais do app do Google; sem elas o dono lê o que falta e segue com
+// a agenda interna.
+function renderGoogleCalendarConnect(config, isCompanyAdmin, integration) {
+  // Instalação antiga: a conta Google vem do ambiente e vale para todas as
+  // empresas; a conexão pelo painel substitui isso só para esta empresa.
+  const environmentNote = isGoogleCalendarFromEnvironment(integration)
+    ? '<p class="subtle" data-google-environment-note>Esta empresa usa a conta Google compartilhada da instalação (GOOGLE_CALENDAR_REFRESH_TOKEN) até conectar a própria conta pelo painel.</p>'
+    : ""
+  if (!config?.enabled) {
+    return `
+      ${environmentNote}
+      <p class="subtle" data-google-connect-disabled>
+        A agenda interna continua funcionando; para conectar o Google, o administrador precisa configurar
+        GOOGLE_CALENDAR_CLIENT_ID/SECRET e PLATFORM_PUBLIC_URL.${config?.reason ? ` ${escapeHtml(config.reason)}` : ""}
+      </p>
+    `
+  }
+  if (!isCompanyAdmin) {
+    return `${environmentNote}<p class="subtle">Um administrador da empresa pode conectar a Google Agenda pelo painel.</p>`
+  }
+  const busy = state.googleCalendarBusy ? "disabled" : ""
+  return `
+    ${environmentNote}
+    <div class="hero-actions">
+      <button class="button" type="button" data-connect-google ${busy}>${state.googleCalendarBusy ? "Abrindo o Google…" : "Conectar Google Agenda"}</button>
+    </div>
+    <p class="subtle">Você será levado ao Google para autorizar; ao voltar, o bot passa a consultar e atualizar a agenda da conta.</p>
+  `
+}
+
+// Nome do calendário em uso sem expor o id: o servidor mascara ids reais
+// (podem ser e-mail) e só deixa passar o apelido `primary`. Um id mascarado
+// nunca vira texto na tela.
+function googleCalendarLabel(integration, selected) {
+  if (selected) return selected.summary || selected.id
+  const externalId = String(integration?.external_calendar_id || "")
+  const configId = String(integration?.config?.calendar_id || "")
+  if (!externalId || externalId === "primary" || configId === "primary") return "Calendário principal da conta"
+  if (externalId.startsWith("*")) return "Calendário escolhido pelo administrador"
+  return externalId
+}
+
+function renderGoogleCalendarConnected(integration, isCompanyAdmin) {
+  const calendars =
+    state.googleCalendars && String(state.googleCalendars.companyId) === String(state.config.companyId)
+      ? state.googleCalendars
+      : null
+  const items = calendars?.items || []
+  const selected = items.find((item) => item.selected) || null
+  const facts = [
+    ["Conta Google", integration.connected_account_email || "—"],
+    ["Conectado em", formatDateTime(integration.connected_at)],
+    ["Calendário em uso", googleCalendarLabel(integration, selected)],
+  ]
+  let selector = ""
+  if (isCompanyAdmin && items.length) {
+    const busy = state.googleCalendarBusy ? "disabled" : ""
+    selector = `
+      <div class="field connection-select">
+        <label for="google-calendar-select">Calendário usado pelo bot</label>
+        <select id="google-calendar-select" data-google-calendar-select ${busy}>
+          ${items
+            .map(
+              (item) =>
+                `<option value="${escapeHtml(item.id)}" ${item.selected ? "selected" : ""}>${escapeHtml(item.summary || item.id)}${item.primary ? " (principal)" : ""}</option>`
+            )
+            .join("")}
+        </select>
+        <small>Reservas, remarcações e cancelamentos vão para este calendário.</small>
+      </div>
+    `
+  } else if (isCompanyAdmin && calendars?.loading) {
+    selector = '<p class="subtle" data-google-calendars-loading>Carregando os calendários da conta…</p>'
+  } else if (isCompanyAdmin && calendars?.error) {
+    selector = `
+      <p class="subtle" data-google-calendars-error>Não foi possível listar os calendários: ${escapeHtml(calendars.error)}</p>
+      <div class="hero-actions">
+        <button class="button-ghost" type="button" data-google-calendars-refresh ${state.googleCalendarBusy ? "disabled" : ""}>Tentar de novo</button>
+      </div>
+    `
+  }
+  return `
+    <dl class="connection-facts" data-google-connected>
+      ${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join("")}
+    </dl>
+    ${selector}
+  `
+}
+
+function renderGoogleDisconnectActions() {
+  const busy = state.googleCalendarBusy ? "disabled" : ""
+  if (state.calendarConfirm === "disconnect") {
+    return `
+      <button class="button-danger" type="button" data-disconnect-google-confirm ${busy}>Confirmar: desconectar a Google Agenda</button>
+      <button class="button-ghost" type="button" data-calendar-cancel ${busy}>Cancelar</button>
+      <p class="ops-confirm-note">As reservas passam a ficar só na agenda interna; eventos já criados no Google não são apagados.</p>
+    `
+  }
+  return `<button class="button-ghost" type="button" data-disconnect-google ${busy}>${state.googleCalendarBusy ? "Aguarde…" : "Desconectar"}</button>`
+}
 
 // Integração de agenda da empresa (P07): distingue agenda interna de agenda
 // externa e mostra a prontidão informada pelo provider — nunca a configuração,
@@ -3375,7 +3710,7 @@ function renderCalendarIntegrationCard(profile) {
   const provider = String(integration.provider || readiness.provider || "mock")
   const internal = provider === "mock"
   const ready = Boolean(readiness.ready)
-  const label = CALENDAR_PROVIDER_LABELS[provider] || provider
+  const label = calendarProviderLabel(provider)
   const tone = internal ? "" : ready ? "tag-success" : "tag-danger"
   const status = internal ? "Sem sincronização externa" : ready ? "Credenciais encontradas" : "Configuração incompleta"
   const explanation = internal
@@ -3388,6 +3723,7 @@ function renderCalendarIntegrationCard(profile) {
     : null
   const testing = state.connectionTestBusy === "calendar"
   const canTest = currentAdminRole() === "superadmin"
+  const googleConnected = isGoogleCalendarConnected(integration)
   return `
     <section class="card" data-calendar-integration="${escapeHtml(provider)}">
       <div class="card-header">
@@ -3398,9 +3734,11 @@ function renderCalendarIntegrationCard(profile) {
         <span class="tag ${tone}">${escapeHtml(status)}</span>
       </div>
       ${!internal && readiness.details ? `<p class="subtle">${escapeHtml(readiness.details)}</p>` : ""}
+      ${googleConnected ? renderGoogleCalendarConnected(integration, canTest) : renderGoogleCalendarConnect(state.googleCalendarConfig, canTest, integration)}
       <div class="hero-actions">
-        ${canTest ? `<button class="button-ghost" type="button" data-test-calendar-connection ${testing ? "disabled" : ""}>${testing ? "Testando…" : internal ? "Verificar agenda interna" : "Testar conexão"}</button>` : ""}
+        ${canTest ? `<button class="button-ghost" type="button" data-test-calendar-connection ${testing || state.googleCalendarBusy ? "disabled" : ""}>${testing ? "Testando…" : internal ? "Verificar agenda interna" : "Testar conexão"}</button>` : ""}
         ${test ? `<span class="tag ${test.connected ? "tag-success" : "tag-danger"}">${escapeHtml(test.connected ? "Conexão confirmada" : "Falha na conexão")}</span>` : ""}
+        ${googleConnected && canTest ? renderGoogleDisconnectActions() : ""}
       </div>
       ${test ? `<p class="subtle">${escapeHtml(test.details || "Diagnóstico concluído.")} Verificado em ${escapeHtml(formatDateTime(test.checked_at))}.</p>` : ""}
     </section>
@@ -3435,7 +3773,7 @@ function renderAgendaView() {
     ${renderSchedulingPolicyEditor(context)}
 
     <section class="grid-three">
-      ${renderMetricCard("Provider", integration.provider || "—", "Integração ativa no escopo atual.", "default", "spark")}
+      ${renderMetricCard("Agenda", integration.provider ? calendarProviderLabel(integration.provider) : "—", "Integração ativa no escopo atual.", "default", "spark")}
       ${renderMetricCard("Bookings", formatNumber(bookings.length), "Reservas visíveis no escopo selecionado.", "default", "calendar")}
       ${renderMetricCard("Fila ativa", formatNumber(queueEntries.length), "Clientes esperando encaixe ou antecipação.", "warm", "clock")}
     </section>
@@ -4792,16 +5130,30 @@ async function loadChannelData() {
     return
   }
   const params = getAdminCompanyParams()
-  const [response, status] = await Promise.all([
+  const [response, status, signupConfig] = await Promise.all([
     apiRequest("/admin/whatsapp/templates", { params }),
     // Mesma fonte canônica usada pelo webhook e pelo envio em produção.
     apiRequest("/admin/whatsapp/channel-status", { params }).catch(() => null),
+    // Sem empresa: ids públicos do app da Meta. 404/503 (backend antigo ou
+    // cofre indisponível) viram "não habilitado" em vez de derrubar a tela.
+    apiRequest("/admin/whatsapp/embedded-signup/config").catch(() => null),
   ])
   state.channel = {
     companyId: state.config.companyId,
     language: response?.language_code || "pt_BR",
     templates: Array.isArray(response?.templates) ? response.templates : [],
     status,
+  }
+  state.whatsappSignupConfig = signupConfig
+  state.channelConfirm = null
+  if (!state.whatsappSignup.busy && String(state.whatsappSignup.companyId || "") !== String(state.config.companyId)) {
+    state.whatsappSignup = createIdleWhatsappSignup()
+  }
+  if (signupConfig?.enabled && signupConfig.app_id && currentAdminRole() === "superadmin") {
+    // Pré-carga: o clique em "Conectar" precisa chamar FB.login na hora. Só
+    // para quem vê o botão: operador e visualizador não recebem o script da
+    // Meta (terceiro com acesso à página e `autoLogAppEvents`).
+    ensureFacebookSdk(signupConfig.app_id, signupConfig.graph_api_version)
   }
   if (state.channelContact && String(state.channelContact.companyId) !== String(state.config.companyId)) {
     state.channelContact = null
@@ -4884,29 +5236,403 @@ function renderChannelContact(contact, canOperate) {
   `
 }
 
+// --- Conexão do número pelo Embedded Signup da Meta (P08) --------------------
+//
+// O popup da Meta devolve os identificadores por `postMessage` (evento
+// WA_EMBEDDED_SIGNUP) e o `code` de troca pelo callback de `FB.login`. O
+// `code` vai só para o servidor, que o troca pelo token de negócio da empresa
+// e o guarda cifrado; o painel nunca vê nem registra token ou PIN.
+
+const EMBEDDED_SIGNUP_ORIGINS = new Set(["https://www.facebook.com", "https://web.facebook.com"])
+const EMBEDDED_SIGNUP_FINISH_EVENTS = new Set(["FINISH", "FINISH_ONLY_WABA", "FINISH_WHATSAPP_BUSINESS_APP_ONBOARDING"])
+const FACEBOOK_SDK_SCRIPT_ID = "facebook-jssdk"
+const WHATSAPP_QUALITY_LABELS = {
+  GREEN: "Verde (boa)",
+  YELLOW: "Amarela (atenção)",
+  RED: "Vermelha (restrita)",
+  UNKNOWN: "Sem avaliação",
+  NA: "Sem avaliação",
+}
+const WHATSAPP_SOURCE_LABELS = {
+  embedded_signup: "Conectado pelo painel",
+  embedded_signup_coexistence: "Conectado pelo painel · app WhatsApp Business no celular",
+  manual: "Vínculo manual com credenciais da instalação",
+}
+
+// Passos em que o popup da Meta está aberto ou acabou de fechar: o estado
+// pertence ao popup e não pode ser zerado por outra parte da tela.
+const WHATSAPP_SIGNUP_POPUP_STEPS = new Set(["popup", "finished"])
+
+function companyLabelById(companyId) {
+  const company = state.companies.find((item) => String(item.id) === String(companyId))
+  if (company) return company.name || company.slug || String(companyId)
+  const membership = (state.session?.memberships || []).find((item) => String(item.company_id) === String(companyId))
+  return membership?.company_name || membership?.company_slug || String(companyId)
+}
+
+function createIdleWhatsappSignup() {
+  return {
+    busy: false,
+    companyId: "",
+    step: "idle",
+    error: "",
+    coexistence: false,
+    phoneNumberId: "",
+    wabaId: "",
+    businessId: "",
+    event: "",
+  }
+}
+
+let _facebookSdkRequested = false
+
+// Injeta o SDK uma única vez, em `document.head`: `#platform-root` é
+// reescrito a cada render e perderia a tag. Pré-carregado quando a tela
+// Canal abre com a conexão habilitada, para o clique chamar `FB.login` de
+// forma síncrona (bloqueador de popup) sem esperar download.
+function ensureFacebookSdk(appId, version) {
+  if (_facebookSdkRequested || !appId) return
+  _facebookSdkRequested = true
+  window.fbAsyncInit = function fbAsyncInit() {
+    if (!window.FB) return
+    window.FB.init({
+      appId: String(appId),
+      autoLogAppEvents: true,
+      xfbml: true,
+      version: String(version || "v23.0"),
+    })
+  }
+  if (document.getElementById(FACEBOOK_SDK_SCRIPT_ID)) return
+  const script = document.createElement("script")
+  script.id = FACEBOOK_SDK_SCRIPT_ID
+  script.src = "https://connect.facebook.net/pt_BR/sdk.js"
+  script.async = true
+  script.defer = true
+  script.crossOrigin = "anonymous"
+  // Bloqueador de anúncios ou sem rede: libera uma nova tentativa no próximo
+  // clique em "Conectar", em vez de exigir F5.
+  script.onerror = () => {
+    _facebookSdkRequested = false
+    script.remove()
+  }
+  document.head.appendChild(script)
+}
+
+function handleEmbeddedSignupMessage(event) {
+  if (!EMBEDDED_SIGNUP_ORIGINS.has(event.origin)) return
+  let data = null
+  try {
+    data = typeof event.data === "string" ? JSON.parse(event.data) : event.data
+  } catch {
+    return
+  }
+  if (!data || typeof data !== "object" || data.type !== "WA_EMBEDDED_SIGNUP") return
+  const payload = data.data && typeof data.data === "object" ? data.data : {}
+  const eventName = String(data.event || "")
+  if (EMBEDDED_SIGNUP_FINISH_EVENTS.has(eventName)) {
+    // Os ids chegam antes do `code`; ficam guardados até o callback do login.
+    // Só valem para um popup que esta tela abriu e ainda não cancelou.
+    if (!WHATSAPP_SIGNUP_POPUP_STEPS.has(state.whatsappSignup.step)) return
+    state.whatsappSignup = {
+      ...state.whatsappSignup,
+      step: "finished",
+      phoneNumberId: String(payload.phone_number_id || ""),
+      wabaId: String(payload.waba_id || ""),
+      businessId: String(payload.business_id || ""),
+      event: eventName,
+    }
+    return
+  }
+  if (eventName === "CANCEL") {
+    state.whatsappSignup = { ...state.whatsappSignup, busy: false, step: "cancelled" }
+    pushToast(`Conexão cancelada (passo ${payload.current_step || "não informado"}).`, "error")
+    return
+  }
+  if (eventName === "ERROR") {
+    const message = String(payload.error_message || "sem detalhes")
+    state.whatsappSignup = { ...state.whatsappSignup, busy: false, step: "error", error: message }
+    pushToast(`A Meta informou um erro: ${message}`, "error")
+  }
+}
+
+// Registrado uma vez, fora de qualquer render: sobrevive ao innerHTML e não
+// se duplica.
+window.addEventListener("message", handleEmbeddedSignupMessage)
+
+// Síncrona de propósito: `FB.login` precisa rodar dentro do gesto do clique,
+// senão o navegador bloqueia o popup.
+function startWhatsappSignup(coexistence) {
+  if (!state.config.companyId) {
+    pushToast("Selecione a empresa antes de conectar o WhatsApp.", "error")
+    return
+  }
+  const config = state.whatsappSignupConfig
+  if (!config?.enabled || !config.config_id) {
+    pushToast("A conexão pelo painel não está habilitada nesta instalação.", "error")
+    return
+  }
+  if (state.whatsappSignup.busy) return
+  if (!window.FB || typeof window.FB.login !== "function") {
+    ensureFacebookSdk(config.app_id, config.graph_api_version)
+    pushToast("O componente da Meta ainda não carregou; verifique bloqueador de anúncios e tente de novo (ou atualize a página).", "error")
+    return
+  }
+  // Ocupado desde a abertura do popup: a troca de empresa e o `loadChannelData`
+  // só zeram o estado quando não está ocupado, então a empresa para a qual o
+  // popup abriu fica guardada até o `code` chegar; e um segundo clique não
+  // abre um segundo popup.
+  state.whatsappSignup = {
+    ...createIdleWhatsappSignup(),
+    companyId: String(state.config.companyId),
+    busy: true,
+    step: "popup",
+    coexistence: Boolean(coexistence),
+  }
+  state.channelConfirm = null
+  window.FB.login(
+    (response) => {
+      void finishWhatsappSignup(response)
+    },
+    {
+      config_id: String(config.config_id),
+      response_type: "code",
+      override_default_response_type: true,
+      extras: {
+        setup: {},
+        featureType: coexistence ? "whatsapp_business_app_onboarding" : "",
+        sessionInfoVersion: "3",
+      },
+    }
+  )
+  // Depois do `FB.login` (o popup já abriu dentro do gesto): desabilita os botões.
+  renderApp()
+}
+
+// Saída para um popup que nunca responde (bloqueado pelo navegador, aba da
+// Meta fechada de outro jeito): sem isso a tela ficaria ocupada até um F5.
+// Um `code` que chegue depois é descartado por `whatsappSignupCompanyForCode`.
+function cancelWhatsappSignup() {
+  if (!WHATSAPP_SIGNUP_POPUP_STEPS.has(state.whatsappSignup.step)) return
+  state.whatsappSignup = createIdleWhatsappSignup()
+  pushToast("Conexão do WhatsApp cancelada. Feche a janela da Meta se ela ainda estiver aberta.", "error")
+  renderApp()
+}
+
+// Empresa para a qual o `code` vale: a registrada quando o popup abriu. Sem
+// ela (estado zerado por cancelamento) o código é descartado, nunca aplicado
+// à empresa selecionada agora — o número seria ligado ao tenant errado.
+function whatsappSignupCompanyForCode(signup) {
+  if (!signup || !WHATSAPP_SIGNUP_POPUP_STEPS.has(String(signup.step || ""))) return ""
+  return String(signup.companyId || "")
+}
+
+async function finishWhatsappSignup(response) {
+  const signup = state.whatsappSignup
+  const code = response?.authResponse?.code
+  if (!code) {
+    // Popup fechado sem concluir: CANCEL/ERROR já avisaram pelo postMessage.
+    if (!["cancelled", "error", "idle"].includes(signup.step)) {
+      pushToast("A Meta não devolveu a autorização; tente conectar de novo.", "error")
+    }
+    state.whatsappSignup = { ...signup, busy: false, step: "idle" }
+    renderApp()
+    return
+  }
+  const companyId = whatsappSignupCompanyForCode(signup)
+  if (!companyId) {
+    state.whatsappSignup = createIdleWhatsappSignup()
+    pushToast("A conexão foi cancelada antes de a Meta responder; abra a tela Canal da empresa certa e tente de novo.", "error")
+    renderApp()
+    return
+  }
+  state.whatsappSignup = { ...signup, companyId, busy: true, step: "completing", error: "" }
+  renderApp()
+  try {
+    const status = await apiRequest("/admin/whatsapp/embedded-signup/complete", {
+      method: "POST",
+      params: { company_id: companyId },
+      body: {
+        code,
+        phone_number_id: signup.phoneNumberId || null,
+        waba_id: signup.wabaId || null,
+        business_id: signup.businessId || null,
+        event: signup.event || null,
+        coexistence: Boolean(signup.coexistence),
+      },
+    })
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, step: "done" }
+    state.whatsappConnectionTest = null
+    const label = [status?.verified_name, status?.display_phone_number].filter(Boolean).join(" ")
+    if (String(state.config.companyId) === companyId) {
+      pushToast(label ? `WhatsApp conectado: ${label}` : "WhatsApp conectado.")
+      await loadChannelData().catch((error) => pushToast(summarizeError(error), "error"))
+    } else {
+      // A empresa selecionada mudou enquanto o popup estava aberto: o número
+      // foi ligado à empresa de origem, e a tela precisa dizer qual.
+      pushToast(`WhatsApp conectado${label ? `: ${label}` : ""} na empresa ${companyLabelById(companyId)}.`)
+    }
+  } catch (error) {
+    const message = summarizeError(error)
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, step: "failed", error: message }
+    pushToast(message, "error")
+  } finally {
+    renderApp()
+  }
+}
+
+async function disconnectWhatsapp() {
+  if (state.whatsappSignup.busy || !state.config.companyId) return
+  const companyId = String(state.config.companyId)
+  state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, busy: true, step: "disconnecting" }
+  state.channelConfirm = null
+  renderApp()
+  try {
+    await apiRequest("/admin/whatsapp/embedded-signup/disconnect", {
+      method: "POST",
+      params: { company_id: companyId },
+    })
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId }
+    state.whatsappConnectionTest = null
+    pushToast("WhatsApp desconectado. O bot deixa de enviar e receber por este número.")
+    await loadChannelData().catch((error) => pushToast(summarizeError(error), "error"))
+  } catch (error) {
+    const message = summarizeError(error)
+    state.whatsappSignup = { ...createIdleWhatsappSignup(), companyId, step: "failed", error: message }
+    pushToast(message, "error")
+  } finally {
+    renderApp()
+  }
+}
+
+function renderWhatsappSignupDisabled(config) {
+  const reason =
+    config?.reason ||
+    (config === null
+      ? "O servidor não expôs a configuração da conexão pelo painel; confira se a versão instalada inclui o Embedded Signup."
+      : "")
+  return `
+    <div class="connection-notice" data-whatsapp-signup-disabled>
+      <strong>Conexão pelo painel ainda não habilitada nesta instalação</strong>
+      ${reason ? `<span class="subtle">${escapeHtml(reason)}</span>` : ""}
+      <span class="subtle">O administrador da instalação precisa definir <code>META_APP_ID</code>, <code>META_EMBEDDED_SIGNUP_CONFIG_ID</code>, <code>WHATSAPP_APP_SECRET</code> e <code>CREDENTIALS_ENCRYPTION_KEY</code> no servidor.</span>
+    </div>
+  `
+}
+
+function renderWhatsappConnectActions(signup, label) {
+  const busy = signup.busy ? "disabled" : ""
+  const waitingPopup = WHATSAPP_SIGNUP_POPUP_STEPS.has(signup.step)
+  const busyLabel = waitingPopup ? "Aguardando a janela da Meta…" : "Conectando…"
+  return `
+    <div class="hero-actions">
+      <button class="button" type="button" data-connect-whatsapp ${busy}>${signup.busy ? busyLabel : escapeHtml(label)}</button>
+      <button class="button-ghost" type="button" data-connect-whatsapp-coexistence ${busy}>Já uso o app WhatsApp Business no celular</button>
+      ${waitingPopup ? '<button class="button-ghost" type="button" data-whatsapp-signup-cancel>Cancelar</button>' : ""}
+    </div>
+    <p class="subtle">Abre o login da Meta em uma janela; use a conta do Facebook que administra o negócio. O código de autorização vai direto para o servidor.</p>
+  `
+}
+
+function renderWhatsappConnectedCard(status) {
+  const binding = status.binding || {}
+  const quality = String(status.quality_rating || "").toUpperCase()
+  const facts = [
+    ["Nome verificado", status.verified_name || "—"],
+    ["Número", status.display_phone_number || binding.display_phone_number || "—"],
+    ["Conta WhatsApp Business (WABA)", status.waba_id_masked || "—"],
+    ["Identificador do número", binding.phone_number_id || "—"],
+    ["Conectado em", formatDateTime(status.connected_at || binding.created_at)],
+    ["Qualidade do número", labelFor(WHATSAPP_QUALITY_LABELS, quality, status.quality_rating || "Sem avaliação")],
+  ]
+  return `
+    <div class="ops-list">
+      <div class="ops-alert" data-channel-binding="${escapeHtml(String(binding.id ?? ""))}">
+        <div class="channel-purpose-copy">
+          <strong>${escapeHtml(status.verified_name || status.display_phone_number || "WhatsApp")}</strong>
+          <span class="subtle">${escapeHtml(labelFor(WHATSAPP_SOURCE_LABELS, status.connection_source, "Conectado pelo painel"))}</span>
+        </div>
+        <span class="tag ${status.needs_reconnection ? "tag-danger" : "tag-success"}">${status.needs_reconnection ? "Precisa reconectar" : "Conectado"}</span>
+      </div>
+      ${
+        status.needs_reconnection
+          ? '<div class="ops-alert connection-warning" data-whatsapp-needs-reconnection><span>A Meta recusou o token deste número. Reconecte pelo painel para voltar a enviar e receber.</span></div>'
+          : ""
+      }
+      <dl class="connection-facts">
+        ${facts.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(String(value))}</dd></div>`).join("")}
+      </dl>
+    </div>
+  `
+}
+
+// Desconectar em duas etapas (padrão de `state.policyConfirm`): o botão vira
+// confirmação explícita antes de chamar o servidor.
+function renderWhatsappDisconnectActions(isCompanyAdmin) {
+  if (!isCompanyAdmin) return ""
+  const signup = state.whatsappSignup
+  const busy = signup.busy ? "disabled" : ""
+  if (state.channelConfirm === "disconnect") {
+    return `
+      <button class="button-danger" type="button" data-disconnect-whatsapp-confirm ${busy}>Confirmar: desconectar o número</button>
+      <button class="button-ghost" type="button" data-channel-cancel ${busy}>Cancelar</button>
+      <p class="ops-confirm-note">O bot para de enviar e receber por este número até alguém reconectar. O número continua na sua conta da Meta.</p>
+    `
+  }
+  return `<button class="button-ghost" type="button" data-disconnect-whatsapp ${busy}>${signup.busy && signup.step === "disconnecting" ? "Desconectando…" : "Desconectar"}</button>`
+}
+
 function renderChannelBindingStatus(status) {
   if (status === null) {
     return '<p class="subtle">Não foi possível carregar o vínculo do número agora.</p>'
   }
-  if (!status?.binding) {
+  const config = state.whatsappSignupConfig
+  const signupEnabled = Boolean(config?.enabled)
+  const isCompanyAdmin = currentAdminRole() === "superadmin"
+  const signup = state.whatsappSignup
+  const signupError =
+    signup.step === "failed" && String(signup.companyId) === String(state.config.companyId) ? signup.error : ""
+  const errorBlock = signupError ? `<p class="policy-error" data-whatsapp-signup-error>${escapeHtml(signupError)}</p>` : ""
+  // Conectar quando não dá para enviar; reconectar quando a Meta recusou o token.
+  const offerConnect = !status.can_send || Boolean(status.needs_reconnection)
+  const connectActions =
+    isCompanyAdmin && offerConnect && signupEnabled
+      ? renderWhatsappConnectActions(signup, status.has_company_token || status.needs_reconnection ? "Reconectar WhatsApp" : "Conectar WhatsApp")
+      : ""
+  const disabledNotice = !status.has_company_token && !signupEnabled ? renderWhatsappSignupDisabled(config) : ""
+
+  if (!status.binding) {
+    const guidance = signupEnabled
+      ? isCompanyAdmin
+        ? " Conecte pelo botão abaixo com o login do Facebook do negócio."
+        : " Um administrador da empresa conecta o número pelo painel."
+      : ""
     return `
       <div class="empty-state" data-channel-binding-empty>
-        ${escapeHtml(status?.details || "Nenhum número vinculado: mensagens recebidas no WhatsApp não chegam a esta empresa.")}
-        O vínculo é feito por um administrador com o identificador do número na Meta.
+        ${escapeHtml(status.details || "Nenhum número conectado: mensagens recebidas no WhatsApp não chegam a esta empresa.")}${escapeHtml(guidance)}
       </div>
+      ${disabledNotice}
+      ${connectActions}
+      ${errorBlock}
     `
   }
+  if (status.has_company_token) {
+    return `${renderWhatsappConnectedCard(status)}${connectActions}${errorBlock}`
+  }
+  // Vínculo legado: identificador cadastrado à mão, credenciais da instalação.
   const binding = status.binding
   return `
     <div class="ops-list">
       <div class="ops-alert" data-channel-binding="${escapeHtml(String(binding.id))}">
         <div class="channel-purpose-copy">
           <strong>${escapeHtml(binding.display_phone_number || "WhatsApp")}</strong>
-          <span class="subtle">Identificador canônico ${escapeHtml(binding.phone_number_id || "—")} · desde ${escapeHtml(formatDateTime(binding.created_at))}</span>
+          <span class="subtle">Identificador canônico ${escapeHtml(binding.phone_number_id || "—")} · desde ${escapeHtml(formatDateTime(binding.created_at))} · ${escapeHtml(labelFor(WHATSAPP_SOURCE_LABELS, status.connection_source, WHATSAPP_SOURCE_LABELS.manual))}</span>
         </div>
         <span class="tag ${binding.active ? "tag-success" : "tag-danger"}">${binding.active ? "Ativo" : "Inativo"}</span>
       </div>
     </div>
+    ${disabledNotice}
+    ${connectActions}
+    ${errorBlock}
   `
 }
 
@@ -4962,13 +5688,16 @@ function renderChannelView() {
     <section class="hero">
       <span class="brand-eyebrow">Canal WhatsApp · ${escapeHtml(company.name)}</span>
       <h2 class="hero-title">${
-        missingInUse.length
-          ? "Há mensagens que não vão sair depois de 24 h sem o cliente escrever."
-          : "Lembretes e ofertas de vaga têm template aprovado."
+        status && status.can_send === false
+          ? "Conecte o número do WhatsApp para o bot enviar e receber mensagens."
+          : missingInUse.length
+            ? "Há mensagens que não vão sair depois de 24 h sem o cliente escrever."
+            : "Lembretes e ofertas de vaga têm template aprovado."
       }</h2>
       <p class="hero-copy">
-        Depois de 24 h sem mensagem do cliente, o WhatsApp só entrega template aprovado pela Meta.
-        Cadastre aqui o nome e o idioma exatamente como aprovados no WhatsApp Manager — este painel não envia template para aprovação.
+        Conecte o número da empresa com o login do Facebook do negócio; as credenciais ficam guardadas cifradas no servidor.
+        Depois de 24 h sem mensagem do cliente, o WhatsApp só entrega template aprovado pela Meta: cadastre aqui o nome e o idioma
+        exatamente como aprovados no WhatsApp Manager — este painel não envia template para aprovação.
       </p>
       <div class="hero-actions">
         <span class="tag">Idioma da política: ${escapeHtml(channel.language)}</span>
@@ -4988,8 +5717,9 @@ function renderChannelView() {
       ${renderChannelBindingStatus(status)}
       ${status ? `<p class="subtle">${escapeHtml(status.details || "")}</p>` : ""}
       <div class="hero-actions">
-        ${isCompanyAdmin ? `<button class="button-ghost" type="button" data-test-whatsapp-connection ${testing ? "disabled" : ""}>${testing ? "Testando…" : "Testar conexão com a Meta"}</button>` : ""}
+        ${isCompanyAdmin ? `<button class="button-ghost" type="button" data-test-whatsapp-connection ${testing || state.whatsappSignup.busy ? "disabled" : ""}>${testing ? "Testando…" : "Testar conexão com a Meta"}</button>` : ""}
         ${test ? `<span class="tag ${test.connected ? "tag-success" : "tag-danger"}">${escapeHtml(test.connected ? "Conexão confirmada" : "Falha na conexão")}</span>` : ""}
+        ${status?.has_company_token ? renderWhatsappDisconnectActions(isCompanyAdmin) : ""}
       </div>
       ${test ? `<p class="subtle">${escapeHtml(test.details || "Diagnóstico concluído.")} Verificado em ${escapeHtml(formatDateTime(test.checked_at))}.</p>` : ""}
     </section>
@@ -6048,6 +6778,12 @@ function bindEvents() {
       state.trainingImportResult = null
       state.calendarConnectionTest = null
       state.whatsappConnectionTest = null
+      state.channelConfirm = null
+      state.calendarConfirm = null
+      state.googleCalendars = null
+      if (!state.whatsappSignup.busy) {
+        state.whatsappSignup = createIdleWhatsappSignup()
+      }
       await refreshCurrentView()
     })
   }
@@ -7182,6 +7918,60 @@ root.addEventListener("click", async (e) => {
     return
   }
 
+  // Canal: conexão do número pela Meta. Fica antes de qualquer `await` para o
+  // `FB.login` acontecer ainda dentro do gesto do clique.
+  if (e.target.closest("[data-connect-whatsapp-coexistence]")) {
+    startWhatsappSignup(true)
+    return
+  }
+  if (e.target.closest("[data-connect-whatsapp]")) {
+    startWhatsappSignup(false)
+    return
+  }
+  if (e.target.closest("[data-disconnect-whatsapp]")) {
+    state.channelConfirm = "disconnect"
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-channel-cancel]")) {
+    state.channelConfirm = null
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-disconnect-whatsapp-confirm]")) {
+    await disconnectWhatsapp()
+    return
+  }
+  if (e.target.closest("[data-whatsapp-signup-cancel]")) {
+    cancelWhatsappSignup()
+    return
+  }
+
+  // Agenda: conexão da Google Agenda por OAuth.
+  if (e.target.closest("[data-connect-google]")) {
+    await startGoogleCalendarAuthorization()
+    return
+  }
+  if (e.target.closest("[data-disconnect-google]")) {
+    state.calendarConfirm = "disconnect"
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-calendar-cancel]")) {
+    state.calendarConfirm = null
+    renderApp()
+    return
+  }
+  if (e.target.closest("[data-disconnect-google-confirm]")) {
+    await disconnectGoogleCalendar()
+    return
+  }
+  if (e.target.closest("[data-google-calendars-refresh]")) {
+    scheduleGoogleCalendarsLoad(state.calendarProfile, { force: true })
+    renderApp()
+    return
+  }
+
   const calendarConnectionButton = e.target.closest("[data-test-calendar-connection]")
   if (calendarConnectionButton && !state.connectionTestBusy) {
     state.connectionTestBusy = "calendar"
@@ -7539,6 +8329,15 @@ function handleRealtimeEvent(event) {
   }
 }
 
+// Registrado uma vez: o <select> é recriado a cada render, então a escuta
+// fica no root (delegação), como o clique.
+root.addEventListener("change", (e) => {
+  const calendarSelect = e.target.closest("[data-google-calendar-select]")
+  if (calendarSelect) {
+    void selectGoogleCalendar(calendarSelect.value)
+  }
+})
+
 async function bootstrap() {
   renderApp()
   // Capacidades só ajustam o formulário de login: a falha delas não pode
@@ -7568,18 +8367,25 @@ async function bootstrap() {
     }
   }
 
+  // Lido antes da primeira carga: a volta do Google diz qual tela e empresa
+  // abrir, e o aviso só faz sentido depois que a tela mostrou a conexão.
+  const navigation = consumeUrlNavigation()
+
   if (!session) {
     state.settingsOpen = true
     renderApp()
+    notifyGoogleOAuthResult(navigation)
     return
   }
 
+  await applyUrlNavigation(navigation, session)
   await refreshCurrentView()
   state.settingsOpen = Boolean(
     state.authAction.invitationToken || state.authAction.passwordResetToken
   )
   connectSSE()
   renderApp()
+  notifyGoogleOAuthResult(navigation)
 }
 
 bootstrap()

@@ -28,6 +28,8 @@ BACKUP_TABLES: list[str] = [
     "user_invitations",
     "user_sessions",
     "password_reset_tokens",
+    # Autorizações OAuth em andamento (074): efêmeras, ficam fora do conteúdo.
+    "oauth_states",
     "company_contexts",
     "whatsapp_channel_bindings",
     "contacts",
@@ -178,6 +180,7 @@ EPHEMERAL_BACKUP_TABLES = {
     "user_invitations",
     "user_sessions",
     "password_reset_tokens",
+    "oauth_states",
     "worker_leases",
     "worker_heartbeats",
 }

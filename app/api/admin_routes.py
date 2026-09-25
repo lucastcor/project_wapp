@@ -2459,8 +2459,10 @@ def upsert_whatsapp_binding_endpoint(
     """Bind a Meta phone_number_id to a company (superadmin only)."""
     # O company_id vem do corpo, não da query: sem esta checagem uma sessão
     # de identidade autorizada para a empresa A poderia apontar o número da
-    # empresa B para si.
-    authorize_company(request, payload.company_id)
+    # empresa B para si. Sem escopo resolvido (autenticação administrativa
+    # desligada, só em desenvolvimento/teste) não há principal a conferir.
+    if get_authorized_scope(request) is not None:
+        authorize_company(request, payload.company_id)
     company = repository.get_company(payload.company_id)
     if not company:
         raise HTTPException(status_code=404, detail="Company not found.")
@@ -2477,6 +2479,15 @@ def upsert_whatsapp_binding_endpoint(
             status_code=409,
             detail="This WhatsApp phone number is already actively bound to another company.",
         )
+    if payload.active:
+        # O envio exige um único vínculo ativo por empresa. Um PUT manual
+        # depois de uma conexão pelo painel deixaria dois ativos e bloquearia
+        # o envio; o vínculo antigo sai de cena e perde o token que guardava.
+        from app.storage.whatsapp_credentials_repository import clear_connection
+
+        for other in repository.get_whatsapp_bindings(company_id=payload.company_id, active_only=True):
+            if int(other["id"]) != int(binding["id"]):
+                clear_connection(payload.company_id, int(other["id"]))
 
     _record_audit_event(
         request=request,
@@ -2522,6 +2533,20 @@ def set_whatsapp_binding_state(
     )
     if result == "not_found":
         raise HTTPException(status_code=404, detail="WhatsApp channel binding not found.")
+    if not payload.active and result != "conflict":
+        # Desativar pelo painel de plataforma é desconectar: o token de
+        # negócio daquele número não pode continuar utilizável numa linha
+        # inativa.
+        from app.storage.whatsapp_credentials_repository import clear_connection
+
+        owner_id = company_id
+        if owner_id is None:
+            owner_id = next(
+                (int(row["company_id"]) for row in repository.get_whatsapp_bindings(active_only=False) if int(row["id"]) == binding_id),
+                None,
+            )
+        if owner_id is not None:
+            clear_connection(int(owner_id), binding_id)
     if result == "conflict":
         # Reactivating a historical binding whose number moved to another tenant.
         _record_audit_event(

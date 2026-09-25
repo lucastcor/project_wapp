@@ -90,10 +90,14 @@ O painel agora usa a fonte canônica, mascara identificadores e oferece probes s
   Billing respondia 500 com `STRIPE_PRICE_*` vazios; simulador com texto
   deslocado e jargão; painel inicial sem caminho (cartão "Primeiros passos");
   pattern do slug inválido no cadastro. Evidência em [P08](evidencias/P08.md).
-- Lacunas estruturais confirmadas e ainda abertas: conexão WhatsApp por
-  Embedded Signup (credenciais por empresa), Google Agenda por OAuth, Instagram,
-  áudio, inbox ao vivo, navegação e preço. A ordem recomendada está no
-  roadmap da revisão; não altera a sequência de P08 para G2/G3.
+- Entregues em seguida (mesmo dia): conexão do WhatsApp por Embedded Signup
+  e da agenda Google por OAuth, ambas por empresa e pelo painel, com
+  credenciais cifradas (migration 074; contrato em `CONTRATOS.md`; evidência
+  em [P08](evidencias/P08.md)); guia de implantação barata com Caddy e
+  checklists Meta/Google em [IMPLANTACAO.md](IMPLANTACAO.md). Ainda abertas:
+  Instagram, áudio, inbox ao vivo, navegação simplificada, editor de serviços
+  fora do wizard e preço. Integrações reais continuam pendentes de credenciais
+  (G3).
 
 Warnings conhecidos: três avisos de depreciação de TestClient/cookies. Não são falhas funcionais, mas devem ser tratados quando a pilha Starlette/httpx for atualizada.
 
